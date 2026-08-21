@@ -42,7 +42,7 @@ if (-not [string]::IsNullOrWhiteSpace($Respect)) {
     $Config.respect_display_required = ($Respect -notmatch '^[Nn]')
 }
 
-$Config | ConvertTo-Json | Set-Content $ConfigPath -Encoding UTF8
+$Config | ConvertTo-Json -Depth 5 | Set-Content $ConfigPath -Encoding UTF8
 
 # Stop the current daemon so the hotkey is free for validation.
 if (Test-Path $PidPath) {

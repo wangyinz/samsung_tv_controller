@@ -11,4 +11,5 @@ pkill -f "$CONTROLLER" >/dev/null 2>&1 || true
 rm -f "$PLIST"
 rm -rf "$APP_DIR"
 echo "Uninstalled."
+echo "The shared SmartThings CLI sign-in was left unchanged."
 sleep 1

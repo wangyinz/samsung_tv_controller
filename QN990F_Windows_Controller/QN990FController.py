@@ -912,6 +912,12 @@ class Controller:
                 return True
 
             now = time.monotonic()
+            # A forced hotkey blank may finish after the monitor dequeues a
+            # pending Raw Input wake. Recheck the newly established guard
+            # after acquiring the operation lock so that stale input cannot
+            # immediately undo the successful Picture Off command.
+            if reason == "raw_input" and now < self.wake_not_before:
+                return False
             if now < self.next_wake_attempt:
                 return False
 
@@ -1326,6 +1332,11 @@ def main() -> int:
     mode.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
+    if args.self_test:
+        ok, message = self_test_structures()
+        print(message)
+        return 0 if ok else 6
+
     try:
         config = load_config()
     except Exception as exc:
@@ -1335,11 +1346,6 @@ def main() -> int:
 
     if args.check_hotkey:
         return check_hotkey(config)
-
-    if args.self_test:
-        ok, message = self_test_structures()
-        print(message)
-        return 0 if ok else 6
 
     client = TVClient(config)
 

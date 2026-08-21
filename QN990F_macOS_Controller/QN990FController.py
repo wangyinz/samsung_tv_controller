@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import c_double, c_int32, c_uint32, c_void_p, POINTER, Structure
+from ctypes import c_double, c_int32, c_uint8, c_uint32, c_ulong, c_void_p, POINTER, Structure
 import fcntl
 import json
 import logging
@@ -31,6 +31,7 @@ LOCK_FILE = APP_DIR / "controller.lock"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
+    "control_method": "lan",
     "tv_ip": "",
     "port": 8002,
     "idle_minutes": 10.0,
@@ -39,10 +40,18 @@ DEFAULT_CONFIG = {
     "hotkey": "Ctrl+Cmd+P",
     "picture_off_key": "KEY_PICTURE_OFF",
     "wake_key": "KEY_RETURN",
-    "wake_guard_ms": 700,
-    "poll_interval_ms": 100,
+    "wake_guard_ms": 800,
+    "poll_interval_ms": 50,
+    "input_wake_debounce_ms": 180,
+    "mouse_wake_threshold_counts": 24,
+    "mouse_motion_window_ms": 500,
     "socket_timeout_seconds": 5.0,
     "key_press_delay_seconds": 0.05,
+    "smartthings_cli": str(APP_DIR / "smartthings"),
+    "smartthings_no_browser_dir": str(APP_DIR / "noninteractive-bin"),
+    "smartthings_profile": "local.qn990f.picture-controller",
+    "smartthings_device_id": "",
+    "smartthings_command_timeout_seconds": 20.0,
 }
 
 logger = logging.getLogger("QN990FController")
@@ -68,6 +77,10 @@ class EventHotKeyID(Structure):
     _fields_ = [("signature", c_uint32), ("id", c_uint32)]
 
 
+class CGPoint(Structure):
+    _fields_ = [("x", c_double), ("y", c_double)]
+
+
 class MacOSBackend:
     K_EVENT_CLASS_KEYBOARD = fourcc("keyb")
     K_EVENT_HOTKEY_PRESSED = 5
@@ -76,7 +89,14 @@ class MacOSBackend:
     OPTION_KEY = 0x0800
     CONTROL_KEY = 0x1000
     K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION = 0
+    K_CG_EVENT_SOURCE_STATE_HID_SYSTEM = 1
     K_CG_ANY_INPUT_EVENT_TYPE = 0xFFFFFFFF
+    K_CG_EVENT_LEFT_MOUSE_DOWN = 1
+    K_CG_EVENT_RIGHT_MOUSE_DOWN = 3
+    K_CG_EVENT_MOUSE_MOVED = 5
+    K_CG_EVENT_KEY_DOWN = 10
+    K_CG_EVENT_SCROLL_WHEEL = 22
+    K_CG_EVENT_OTHER_MOUSE_DOWN = 25
 
     KEY_CODES = {
         "A":0x00,"S":0x01,"D":0x02,"F":0x03,"H":0x04,"G":0x05,
@@ -93,13 +113,17 @@ class MacOSBackend:
     def __init__(self):
         ht = "/System/Library/Frameworks/Carbon.framework/Frameworks/HIToolbox.framework/HIToolbox"
         cg = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        cf = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
         self.hitoolbox = ctypes.CDLL(ht)
         self.coregraphics = ctypes.CDLL(cg)
+        self.corefoundation = ctypes.CDLL(cf)
 
         self.hitoolbox.GetApplicationEventTarget.argtypes = []
         self.hitoolbox.GetApplicationEventTarget.restype = c_void_p
+        self.hitoolbox.GetEventDispatcherTarget.argtypes = []
+        self.hitoolbox.GetEventDispatcherTarget.restype = c_void_p
         self.hitoolbox.InstallEventHandler.argtypes = [
-            c_void_p, self.CALLBACK, c_uint32, POINTER(EventTypeSpec),
+            c_void_p, self.CALLBACK, c_ulong, POINTER(EventTypeSpec),
             c_void_p, POINTER(c_void_p)
         ]
         self.hitoolbox.InstallEventHandler.restype = c_int32
@@ -111,23 +135,91 @@ class MacOSBackend:
         self.hitoolbox.RegisterEventHotKey.restype = c_int32
         self.hitoolbox.UnregisterEventHotKey.argtypes = [c_void_p]
         self.hitoolbox.UnregisterEventHotKey.restype = c_int32
-        self.hitoolbox.RunCurrentEventLoop.argtypes = [c_double]
-        self.hitoolbox.RunCurrentEventLoop.restype = c_int32
+        self.hitoolbox.ReceiveNextEvent.argtypes = [
+            c_ulong, POINTER(EventTypeSpec), c_double, c_uint8, POINTER(c_void_p)
+        ]
+        self.hitoolbox.ReceiveNextEvent.restype = c_int32
+        self.hitoolbox.SendEventToEventTarget.argtypes = [c_void_p, c_void_p]
+        self.hitoolbox.SendEventToEventTarget.restype = c_int32
+        self.hitoolbox.ReleaseEvent.argtypes = [c_void_p]
+        self.hitoolbox.ReleaseEvent.restype = None
 
         self.coregraphics.CGEventSourceSecondsSinceLastEventType.argtypes = [c_int32, c_uint32]
         self.coregraphics.CGEventSourceSecondsSinceLastEventType.restype = c_double
+        self.coregraphics.CGEventSourceCounterForEventType.argtypes = [c_int32, c_uint32]
+        self.coregraphics.CGEventSourceCounterForEventType.restype = c_uint32
+        self.coregraphics.CGEventCreate.argtypes = [c_void_p]
+        self.coregraphics.CGEventCreate.restype = c_void_p
+        self.coregraphics.CGEventGetLocation.argtypes = [c_void_p]
+        self.coregraphics.CGEventGetLocation.restype = CGPoint
+        self.corefoundation.CFRelease.argtypes = [c_void_p]
+        self.corefoundation.CFRelease.restype = None
 
         self._handler_ref = c_void_p()
         self._hotkey_ref = c_void_p()
         self._callback = None
         self._hotkey_event = threading.Event()
         self._registered = False
+        self._dispatcher_target = c_void_p()
+        self._input_poll_lock = threading.Lock()
+        self._last_input_snapshot = None
 
     def idle_seconds(self) -> float:
         return max(0.0, float(self.coregraphics.CGEventSourceSecondsSinceLastEventType(
             self.K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION,
             self.K_CG_ANY_INPUT_EVENT_TYPE
         )))
+
+    def _input_snapshot(self):
+        counter = self.coregraphics.CGEventSourceCounterForEventType
+        state = self.K_CG_EVENT_SOURCE_STATE_HID_SYSTEM
+        event = self.coregraphics.CGEventCreate(None)
+        if not event:
+            raise RuntimeError("CGEventCreate returned NULL.")
+        try:
+            point = self.coregraphics.CGEventGetLocation(event)
+        finally:
+            self.corefoundation.CFRelease(event)
+        return {
+            "keyboard": int(counter(state, self.K_CG_EVENT_KEY_DOWN)),
+            "mouse_button": (
+                int(counter(state, self.K_CG_EVENT_LEFT_MOUSE_DOWN)),
+                int(counter(state, self.K_CG_EVENT_RIGHT_MOUSE_DOWN)),
+                int(counter(state, self.K_CG_EVENT_OTHER_MOUSE_DOWN)),
+            ),
+            "mouse_wheel": int(counter(state, self.K_CG_EVENT_SCROLL_WHEEL)),
+            "mouse_move": int(counter(state, self.K_CG_EVENT_MOUSE_MOVED)),
+            "cursor": (float(point.x), float(point.y)),
+        }
+
+    def reset_input_baseline(self):
+        with self._input_poll_lock:
+            self._last_input_snapshot = self._input_snapshot()
+
+    def poll_input_events(self):
+        with self._input_poll_lock:
+            current = self._input_snapshot()
+            previous = self._last_input_snapshot
+            self._last_input_snapshot = current
+
+        if previous is None:
+            return []
+
+        events = []
+        if current["keyboard"] != previous["keyboard"]:
+            events.append({"kind": "keyboard"})
+        if current["mouse_button"] != previous["mouse_button"]:
+            events.append({"kind": "mouse_button"})
+        if current["mouse_wheel"] != previous["mouse_wheel"]:
+            events.append({"kind": "mouse_wheel"})
+        if current["mouse_move"] != previous["mouse_move"]:
+            old_x, old_y = previous["cursor"]
+            new_x, new_y = current["cursor"]
+            dx = new_x - old_x
+            dy = new_y - old_y
+            if dx != 0.0 or dy != 0.0:
+                events.append({"kind": "mouse_move", "dx": dx, "dy": dy})
+        return events
 
     def parse_hotkey(self, spec: str):
         parts = [p.strip().upper() for p in spec.split("+") if p.strip()]
@@ -154,6 +246,9 @@ class MacOSBackend:
         target = self.hitoolbox.GetApplicationEventTarget()
         if not target:
             raise RuntimeError("GetApplicationEventTarget returned NULL.")
+        self._dispatcher_target = self.hitoolbox.GetEventDispatcherTarget()
+        if not self._dispatcher_target:
+            raise RuntimeError("GetEventDispatcherTarget returned NULL.")
 
         def cb(_next, _event, _user):
             self._hotkey_event.set()
@@ -191,9 +286,24 @@ class MacOSBackend:
         self._handler_ref = c_void_p()
         self._callback = None
         self._registered = False
+        self._dispatcher_target = c_void_p()
 
     def pump_events(self, timeout: float) -> bool:
-        self.hitoolbox.RunCurrentEventLoop(float(timeout))
+        wait = max(0.0, float(timeout))
+        while True:
+            event = c_void_p()
+            status = self.hitoolbox.ReceiveNextEvent(
+                0, None, wait, 1, ctypes.byref(event)
+            )
+            if status == -9875:
+                break
+            if status != 0:
+                raise RuntimeError(f"ReceiveNextEvent failed: OSStatus {status}")
+            try:
+                self.hitoolbox.SendEventToEventTarget(event, self._dispatcher_target)
+            finally:
+                self.hitoolbox.ReleaseEvent(event)
+            wait = 0.0
         if self._hotkey_event.is_set():
             self._hotkey_event.clear()
             return True
@@ -204,17 +314,54 @@ def load_config():
     cfg = DEFAULT_CONFIG.copy()
     with CONFIG_FILE.open("r", encoding="utf-8-sig") as f:
         cfg.update(json.load(f))
+    cfg["control_method"] = str(cfg.get("control_method", "lan")).strip().lower()
+    if cfg["control_method"] not in {"lan", "smartthings"}:
+        raise ValueError("control_method must be 'lan' or 'smartthings'.")
     cfg["tv_ip"] = str(cfg.get("tv_ip","")).strip()
-    if not cfg["tv_ip"]:
+    if cfg["control_method"] == "lan" and not cfg["tv_ip"]:
         raise ValueError("config.json has an empty tv_ip.")
     cfg["port"] = int(cfg.get("port",8002))
     cfg["idle_minutes"] = float(cfg.get("idle_minutes",10))
     cfg["enable_idle_off"] = bool(cfg.get("enable_idle_off", cfg["idle_minutes"] > 0))
     cfg["respect_display_required"] = bool(cfg.get("respect_display_required",True))
-    cfg["wake_guard_ms"] = max(0, int(cfg.get("wake_guard_ms",700)))
-    cfg["poll_interval_ms"] = max(50, int(cfg.get("poll_interval_ms",100)))
+    cfg["wake_guard_ms"] = max(0, int(cfg.get("wake_guard_ms",800)))
+    cfg["poll_interval_ms"] = max(25, int(cfg.get("poll_interval_ms",50)))
+    cfg["input_wake_debounce_ms"] = max(
+        50, int(cfg.get("input_wake_debounce_ms",180))
+    )
+    cfg["mouse_wake_threshold_counts"] = max(
+        0, int(cfg.get("mouse_wake_threshold_counts",24))
+    )
+    cfg["mouse_motion_window_ms"] = max(
+        100, int(cfg.get("mouse_motion_window_ms",500))
+    )
     cfg["socket_timeout_seconds"] = max(1.0, float(cfg.get("socket_timeout_seconds",5)))
     cfg["key_press_delay_seconds"] = max(0.0, float(cfg.get("key_press_delay_seconds",0.05)))
+    if cfg["control_method"] == "smartthings":
+        cfg["smartthings_cli"] = str(cfg.get("smartthings_cli", "")).strip()
+        cfg["smartthings_no_browser_dir"] = str(
+            cfg.get("smartthings_no_browser_dir", APP_DIR / "noninteractive-bin")
+        ).strip()
+        cfg["smartthings_profile"] = str(
+            cfg.get("smartthings_profile", "local.qn990f.picture-controller")
+        ).strip()
+        cfg["smartthings_device_id"] = str(cfg.get("smartthings_device_id", "")).strip()
+        if not cfg["smartthings_cli"]:
+            raise ValueError("smartthings_cli is empty.")
+        if not cfg["smartthings_no_browser_dir"]:
+            raise ValueError("smartthings_no_browser_dir is empty.")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", cfg["smartthings_profile"]):
+            raise ValueError("smartthings_profile contains unsupported characters.")
+        if not re.fullmatch(
+            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+            cfg["smartthings_device_id"],
+        ):
+            raise ValueError("smartthings_device_id is not a UUID.")
+        cfg["smartthings_command_timeout_seconds"] = min(
+            20.0,
+            max(5.0, float(cfg.get("smartthings_command_timeout_seconds", 20.0))),
+        )
     MacOSBackend().parse_hotkey(str(cfg.get("hotkey","Ctrl+Cmd+P")))
     return cfg
 
@@ -309,22 +456,183 @@ class TVClient:
             self._reset()
 
 
+class SmartThingsTVClient:
+    # Samsung's TV web plugin maps the Accessibility Mode button to
+    # KEY_PICTURE_OFF/Click, then maps Click to this OCF pressAndRelease write.
+    EXECUTE_CAPABILITY = "execute"
+    REMOTE_MARKER_CAPABILITY = "samsungvd.remoteControl"
+    REMOTE_RESOURCE = "/sec/tv/remotecontrol"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._command_times = []
+
+    def _run(self, *args, timeout=None, allow_login=False):
+        cli = Path(str(self.cfg["smartthings_cli"])).expanduser()
+        if not cli.is_file() or not os.access(cli, os.X_OK):
+            raise RuntimeError(f"SmartThings CLI is missing or not executable: {cli}")
+        command = [
+            str(cli), *args,
+            "--profile", str(self.cfg["smartthings_profile"]),
+            "--token", "",
+            "--language", "NONE",
+        ]
+        environment = os.environ.copy()
+        environment.pop("SMARTTHINGS_TOKEN", None)
+        if not allow_login:
+            no_browser_dir = Path(
+                str(self.cfg["smartthings_no_browser_dir"])
+            ).expanduser()
+            if not no_browser_dir.is_dir():
+                raise RuntimeError(
+                    f"SmartThings noninteractive directory is missing: {no_browser_dir}"
+                )
+            # SmartThings CLI falls back to interactive OAuth by spawning the
+            # macOS `open` executable. An intentionally empty PATH makes that
+            # fallback fail immediately while normal token refresh stays usable.
+            environment["PATH"] = str(no_browser_dir)
+        command_timeout = (
+            float(self.cfg["smartthings_command_timeout_seconds"])
+            if timeout is None else float(timeout)
+        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=command_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "SmartThings command timed out. Run Configure.command to sign in again."
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            if len(detail) > 1200:
+                detail = detail[-1200:]
+            if "spawn open ENOENT" in detail:
+                raise RuntimeError(
+                    "SmartThings authorization requires user interaction; "
+                    "run Configure.command."
+                )
+            raise RuntimeError(detail or f"SmartThings CLI exited with {result.returncode}")
+        return result.stdout
+
+    def pair(self):
+        output = self._run(
+            "devices", str(self.cfg["smartthings_device_id"]), "--json",
+            timeout=650,
+            allow_login=True,
+        )
+        try:
+            device = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("SmartThings CLI returned invalid device data.") from exc
+        capabilities = set()
+        categories = set()
+        for component in device.get("components", []):
+            if component.get("id") != "main":
+                continue
+            for capability in component.get("capabilities", []):
+                if isinstance(capability, str):
+                    capabilities.add(capability)
+                elif isinstance(capability, dict):
+                    capabilities.add(str(capability.get("id", "")))
+            for category in component.get("categories", []):
+                if isinstance(category, str):
+                    categories.add(category)
+                elif isinstance(category, dict):
+                    categories.add(str(category.get("name", "")))
+        required_capabilities = {
+            self.EXECUTE_CAPABILITY,
+            self.REMOTE_MARKER_CAPABILITY,
+        }
+        if not required_capabilities.issubset(capabilities):
+            raise RuntimeError(
+                "Selected device does not expose SmartThings TV remote control."
+            )
+        if "Television" not in categories:
+            raise RuntimeError("Selected SmartThings device is not a television.")
+        if device.get("manufacturerName") != "Samsung Electronics" or \
+           device.get("type") != "OCF":
+            raise RuntimeError("Selected SmartThings device is not a Samsung OCF TV.")
+        model = str(device.get("ocf", {}).get("modelNumber", ""))
+        if "QN990F" not in model.upper():
+            raise RuntimeError(f"Selected SmartThings TV is not a QN990F: {model or 'unknown model'}.")
+        return str(device.get("label") or device.get("name") or "Samsung TV")
+
+    def _ensure_command_budget(self, needed):
+        cutoff = time.monotonic() - 60.0
+        self._command_times = [stamp for stamp in self._command_times if stamp > cutoff]
+        if len(self._command_times) + needed > 12:
+            raise RuntimeError("SmartThings command limit reached; wait one minute.")
+
+    def _send_ocf_remote(self, remote_key):
+        payload = {
+            "x.com.samsung.tv.keyvalue": remote_key,
+            "x.com.samsung.tv.keystatus": "pressAndRelease",
+        }
+        argument = "main:{capability}:execute({resource},{payload})".format(
+            capability=self.EXECUTE_CAPABILITY,
+            resource=json.dumps(self.REMOTE_RESOURCE),
+            payload=json.dumps(payload, separators=(",", ":")),
+        )
+        self._command_times.append(time.monotonic())
+        self._run(
+            "devices:commands", str(self.cfg["smartthings_device_id"]), argument
+        )
+        logger.info("SmartThings sent OCF remote key %s", remote_key)
+
+    def send(self, key):
+        with self._lock:
+            try:
+                if key == str(self.cfg["picture_off_key"]):
+                    self._ensure_command_budget(1)
+                    self._send_ocf_remote(key)
+                elif key == str(self.cfg["wake_key"]):
+                    self._ensure_command_budget(1)
+                    self._send_ocf_remote(key)
+                else:
+                    raise ValueError(f"Unsupported SmartThings action: {key}")
+                return True
+            except Exception as exc:
+                logger.warning("SmartThings action %s failed: %r", key, exc)
+                return False
+
+    def close(self):
+        pass
+
+
+def make_tv_client(cfg):
+    if cfg["control_method"] == "smartthings":
+        return SmartThingsTVClient(cfg)
+    return TVClient(cfg)
+
+
 class Controller:
     def __init__(self, cfg, backend):
         self.cfg = cfg
         self.backend = backend
-        self.tv = TVClient(cfg)
+        self.tv = make_tv_client(cfg)
         self._op_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._input_lock = threading.Lock()
         self._stop = threading.Event()
         self.picture_off = False
-        self.off_last_idle = backend.idle_seconds()
         self.wake_not_before = 0.0
-        self.last_wake_time = 0.0
         self.next_off_attempt = 0.0
         self.next_wake_attempt = 0.0
+        self.hotkey_input_suppress_until = 0.0
+        self.pending_input_wake_at = 0.0
+        self.pending_input_source = ""
+        self.mouse_motion_last_time = 0.0
+        self.mouse_motion_total = 0.0
         self._assert_cache = False
         self._assert_checked = 0.0
+        self.backend.reset_input_baseline()
 
     def is_off(self):
         with self._state_lock: return self.picture_off
@@ -332,42 +640,167 @@ class Controller:
     def set_off(self, value):
         with self._state_lock: self.picture_off = value
 
-    def blank(self, reason):
+    def _clear_pending_wake(self):
+        with self._input_lock:
+            self.pending_input_wake_at = 0.0
+            self.pending_input_source = ""
+            self.mouse_motion_last_time = 0.0
+            self.mouse_motion_total = 0.0
+
+    def blank(self, reason, force=False):
         with self._op_lock:
-            if self.is_off(): return True
+            if self.is_off() and not force:
+                return True
             if not self.tv.send(str(self.cfg["picture_off_key"])):
-                self.next_off_attempt = time.monotonic() + 5
+                if self.cfg["control_method"] == "lan":
+                    self.next_off_attempt = time.monotonic() + 5
+                else:
+                    self.next_off_attempt = float("inf")
                 write_status(running=True,state="error",last_action="blank_failed",reason=reason)
                 return False
-            self.off_last_idle = self.backend.idle_seconds()
-            self.wake_not_before = time.monotonic() + int(self.cfg["wake_guard_ms"])/1000.0
+
+            self.backend.reset_input_baseline()
+            self.wake_not_before = (
+                time.monotonic() + int(self.cfg["wake_guard_ms"]) / 1000.0
+            )
+            self._clear_pending_wake()
             self.set_off(True)
+            self.next_off_attempt = 0.0
+            logger.info("Picture off (%s)", reason)
             write_status(running=True,state="picture_off",last_action="blank",reason=reason)
             return True
 
-    def wake(self, reason):
+    def wake(self, reason, source=""):
         with self._op_lock:
             if not self.is_off(): return True
             now = time.monotonic()
+            if reason == "input" and now < self.wake_not_before:
+                logger.info("Input wake discarded by Picture Off guard source=%s", source)
+                return False
             if now < self.next_wake_attempt: return False
             if not self.tv.send(str(self.cfg["wake_key"])):
                 self.next_wake_attempt = now + 1
+                write_status(running=True,state="error",last_action="wake_failed",reason=reason)
                 return False
             self.set_off(False)
-            self.last_wake_time = time.monotonic()
+            self._clear_pending_wake()
             self.next_wake_attempt = 0
-            write_status(running=True,state="awake",last_action="wake",reason=reason)
+            if source:
+                logger.info("Picture wake (%s) source=%s", reason, source)
+            else:
+                logger.info("Picture wake (%s)", reason)
+            write_status(
+                running=True, state="awake", last_action="wake",
+                reason=reason, source=source,
+            )
             return True
 
-    def hotkey(self):
-        if time.monotonic() - self.last_wake_time < 1.25:
+    def handle_hotkey(self):
+        now = time.monotonic()
+        with self._input_lock:
+            self.hotkey_input_suppress_until = now + 0.60
+            self.pending_input_wake_at = 0.0
+            self.pending_input_source = ""
+            self.mouse_motion_last_time = 0.0
+            self.mouse_motion_total = 0.0
+        logger.info("Global hotkey action; local_picture_off=%s", self.is_off())
+        self.blank("hotkey", force=True)
+
+    def _schedule_input_wake(self, source, delay_ms=None):
+        now = time.monotonic()
+        delay = (
+            int(self.cfg["input_wake_debounce_ms"])
+            if delay_ms is None else max(0, int(delay_ms))
+        ) / 1000.0
+        with self._input_lock:
+            if now < self.hotkey_input_suppress_until:
+                logger.info("Input wake suppressed by hotkey source=%s", source)
+                return
+            due = now + delay
+            if self.pending_input_wake_at <= 0.0 or due < self.pending_input_wake_at:
+                self.pending_input_wake_at = due
+                self.pending_input_source = source
+                logger.info("Input wake scheduled in %d ms source=%s", int(delay * 1000), source)
+
+    def _qualify_input(self, event, now):
+        kind = event.get("kind")
+        if kind == "keyboard":
+            return "keyboard:key_down"
+        if kind == "mouse_button":
+            return "mouse_button"
+        if kind == "mouse_wheel":
+            return "mouse_wheel"
+        if kind != "mouse_move":
+            return ""
+
+        dx = float(event.get("dx", 0.0))
+        dy = float(event.get("dy", 0.0))
+        amount = abs(dx) + abs(dy)
+        if amount <= 0.0:
+            return ""
+
+        threshold = int(self.cfg["mouse_wake_threshold_counts"])
+        if threshold <= 0:
+            return f"mouse_move:dx={dx:g},dy={dy:g},sum={amount:g}"
+
+        window = int(self.cfg["mouse_motion_window_ms"]) / 1000.0
+        with self._input_lock:
+            if (now - self.mouse_motion_last_time) <= window:
+                total = self.mouse_motion_total + amount
+            else:
+                total = amount
+            self.mouse_motion_last_time = now
+            self.mouse_motion_total = total
+            if total < threshold:
+                return ""
+            self.mouse_motion_total = 0.0
+
+        return (
+            f"mouse_move:threshold={threshold},sum={total:g},"
+            f"dx={dx:g},dy={dy:g}"
+        )
+
+    def handle_input(self, event):
+        now = time.monotonic()
+        off = self.is_off()
+        if off and now < self.wake_not_before:
             return
-        if self.is_off(): self.wake("hotkey")
-        else: self.blank("hotkey")
+
+        source = self._qualify_input(event, now)
+        if not source:
+            return
+
+        if not off:
+            if self.cfg["control_method"] == "smartthings" and \
+               self.next_off_attempt == float("inf"):
+                self.next_off_attempt = 0.0
+                logger.info("SmartThings Picture Off retry rearmed by input source=%s", source)
+            return
+
+        delay_ms = 80 if event.get("kind") in {"mouse_button", "mouse_wheel"} else None
+        self._schedule_input_wake(source, delay_ms=delay_ms)
+
+    def _process_pending_wake(self, now):
+        due = 0.0
+        source = ""
+        suppressed = False
+        with self._input_lock:
+            if self.pending_input_wake_at > 0.0 and now >= self.pending_input_wake_at:
+                if now < self.hotkey_input_suppress_until:
+                    suppressed = True
+                else:
+                    due = self.pending_input_wake_at
+                    source = self.pending_input_source
+                self.pending_input_wake_at = 0.0
+                self.pending_input_source = ""
+        if suppressed:
+            logger.info("Pending input wake cancelled by hotkey")
+        elif due > 0.0:
+            self.wake("input", source=source)
 
     def display_required(self):
         now = time.monotonic()
-        if now - self._assert_checked >= 5:
+        if now - self._assert_checked >= 2:
             self._assert_checked = now
             self._assert_cache = display_is_explicitly_required()
         return self._assert_cache
@@ -378,18 +811,14 @@ class Controller:
         while not self._stop.is_set():
             try:
                 now = time.monotonic()
-                idle = self.backend.idle_seconds()
+                for event in self.backend.poll_input_events():
+                    self.handle_input(event)
                 if self.is_off():
-                    if now < self.wake_not_before:
-                        self.off_last_idle = idle
-                    elif idle + 0.05 < self.off_last_idle:
-                        self.off_last_idle = idle
-                        self.wake("mac_input")
-                    else:
-                        self.off_last_idle = idle
+                    self._process_pending_wake(now)
                 else:
                     auto = bool(self.cfg["enable_idle_off"]) and threshold > 0
-                    if auto and now >= self.next_off_attempt and idle >= threshold:
+                    if auto and now >= self.next_off_attempt and \
+                       self.backend.idle_seconds() >= threshold:
                         keep = bool(self.cfg["respect_display_required"]) and self.display_required()
                         if not keep:
                             self.blank("idle")
@@ -417,7 +846,7 @@ def check_hotkey(cfg):
     try:
         b.register_hotkey(str(cfg["hotkey"]))
         b.pump_events(0.05)
-        print(f"Hotkey {cfg['hotkey']} is available.")
+        print(f"Hotkey {cfg['hotkey']} registration succeeded.")
         return 0
     except Exception as exc:
         print(exc, file=sys.stderr)
@@ -439,10 +868,14 @@ def run_daemon(cfg):
         backend.register_hotkey(str(cfg["hotkey"]))
         ctrl = Controller(cfg, backend)
         threading.Thread(target=ctrl.monitor, daemon=True, name="QN990F-IdleMonitor").start()
-        write_status(running=True,state="awake",hotkey=cfg["hotkey"])
+        write_status(
+            running=True, state="awake", hotkey=cfg["hotkey"],
+            control_method=cfg["control_method"],
+        )
         while not stop.is_set():
             if backend.pump_events(0.10):
-                ctrl.hotkey()
+                logger.info("Global hotkey received")
+                ctrl.handle_hotkey()
         return 0
     except Exception as exc:
         logger.exception("Controller stopped: %r", exc)
@@ -479,25 +912,40 @@ def main():
         print(f"{MacOSBackend().idle_seconds():.3f}")
         return 0
 
-    tv = TVClient(cfg)
+    tv = make_tv_client(cfg)
     if a.pair:
-        print(f"Connecting to Samsung TV at {cfg['tv_ip']}:{cfg['port']}...")
-        print("If the TV asks whether to allow remote control, choose Allow.")
+        if cfg["control_method"] == "smartthings":
+            print("Validating SmartThings cloud access...")
+            print("A browser will open if SmartThings sign-in is required.")
+        else:
+            print(f"Connecting to Samsung TV at {cfg['tv_ip']}:{cfg['port']}...")
+            print("If the TV asks whether to allow remote control, choose Allow.")
         try:
-            tv.pair()
-            print(f"Pairing succeeded. Token file: {TOKEN_FILE}")
+            label = tv.pair()
+            if cfg["control_method"] == "smartthings":
+                print(f"SmartThings cloud access succeeded: {label}")
+            else:
+                print(f"Pairing succeeded. Token file: {TOKEN_FILE}")
             return 0
         except Exception as exc:
-            print(f"Pairing failed: {exc}", file=sys.stderr)
+            action = "SmartThings validation" if cfg["control_method"] == "smartthings" else "Pairing"
+            print(f"{action} failed: {exc}", file=sys.stderr)
             return 3
         finally: tv.close()
 
     if a.test:
-        print("Sending KEY_PICTURE_OFF; screen should go black for about 2 seconds.")
+        if cfg["control_method"] == "smartthings":
+            print("Sending the SmartThings Accessibility Picture Off key.")
+        else:
+            print("Sending KEY_PICTURE_OFF.")
+        print("The screen should go black for about 2 seconds.")
         if not tv.send(str(cfg["picture_off_key"])):
             tv.close(); return 4
         time.sleep(2)
-        print(f"Sending wake key {cfg['wake_key']}...")
+        if cfg["control_method"] == "smartthings":
+            print(f"Sending SmartThings wake key {cfg['wake_key']}...")
+        else:
+            print(f"Sending wake key {cfg['wake_key']}...")
         ok = tv.send(str(cfg["wake_key"]))
         tv.close()
         return 0 if ok else 5

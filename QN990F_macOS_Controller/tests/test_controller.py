@@ -1,0 +1,486 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from unittest import mock
+
+
+CONTROLLER_PATH = Path(__file__).parents[1] / "QN990FController.py"
+TEST_HOME = tempfile.TemporaryDirectory()
+
+fake_samsungtvws = types.ModuleType("samsungtvws")
+fake_samsungtvws.SamsungTVWS = object
+sys.modules["samsungtvws"] = fake_samsungtvws
+
+original_home = os.environ.get("HOME")
+original_platform = sys.platform
+os.environ["HOME"] = TEST_HOME.name
+sys.platform = "darwin"
+try:
+    spec = importlib.util.spec_from_file_location("qn990f_controller", CONTROLLER_PATH)
+    controller = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(controller)
+finally:
+    sys.platform = original_platform
+    if original_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = original_home
+
+
+DEVICE_ID = "12345678-1234-4234-8234-123456789abc"
+
+
+def cloud_config(temp_dir):
+    return {
+        "control_method": "smartthings",
+        "picture_off_key": "KEY_PICTURE_OFF",
+        "wake_key": "KEY_RETURN",
+        "smartthings_cli": "/usr/bin/true",
+        "smartthings_no_browser_dir": temp_dir,
+        "smartthings_profile": "local.qn990f.picture-controller",
+        "smartthings_device_id": DEVICE_ID,
+        "smartthings_command_timeout_seconds": 20.0,
+    }
+
+
+def controller_config(control_method="lan"):
+    config = {
+        **controller.DEFAULT_CONFIG,
+        "control_method": control_method,
+        "tv_ip": "192.0.2.10",
+        "idle_minutes": 10.0,
+        "enable_idle_off": True,
+    }
+    if control_method == "smartthings":
+        config.update(cloud_config(TEST_HOME.name))
+    return config
+
+
+class FakeBackend:
+    def __init__(self, idle=0.0):
+        self.idle = idle
+        self.idle_calls = 0
+        self.reset_calls = 0
+        self.events = []
+        self.on_poll = None
+
+    def idle_seconds(self):
+        self.idle_calls += 1
+        return self.idle
+
+    def reset_input_baseline(self):
+        self.reset_calls += 1
+
+    def poll_input_events(self):
+        events, self.events = self.events, []
+        if self.on_poll is not None:
+            self.on_poll()
+        return events
+
+
+class RecordingTV:
+    def __init__(self, results=None):
+        self.sent = []
+        self.results = list(results or [])
+
+    def send(self, key):
+        self.sent.append(key)
+        return self.results.pop(0) if self.results else True
+
+    def close(self):
+        pass
+
+
+class Clock:
+    def __init__(self, value=1.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+class MacOSBackendTests(unittest.TestCase):
+    def test_manual_carbon_pump_dispatches_and_releases_event(self):
+        calls = []
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+        backend._dispatcher_target = controller.c_void_p(99)
+        backend._hotkey_event = controller.threading.Event()
+
+        class FakeHIToolbox:
+            statuses = [0, -9875, -9875]
+
+            def ReceiveNextEvent(self, count, event_types, timeout, pull, out_event):
+                calls.append(("receive", count, event_types, timeout, pull))
+                status = self.statuses.pop(0)
+                if status == 0:
+                    out_event._obj.value = 123
+                return status
+
+            def SendEventToEventTarget(self, event, target):
+                calls.append(("send", event.value, target.value))
+                backend._hotkey_event.set()
+                return 0
+
+            def ReleaseEvent(self, event):
+                calls.append(("release", event.value))
+
+        backend.hitoolbox = FakeHIToolbox()
+
+        self.assertTrue(backend.pump_events(0.1))
+        self.assertFalse(backend.pump_events(0.1))
+
+        self.assertIn(("send", 123, 99), calls)
+        self.assertIn(("release", 123), calls)
+
+    def test_hid_counter_changes_are_normalized_as_input_events(self):
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+        backend._input_poll_lock = controller.threading.Lock()
+        backend._last_input_snapshot = {
+            "keyboard": 7,
+            "mouse_button": (2, 3, 4),
+            "mouse_wheel": 5,
+            "mouse_move": 6,
+            "cursor": (10.0, 20.0),
+        }
+        current = {
+            "keyboard": 8,
+            "mouse_button": (3, 3, 4),
+            "mouse_wheel": 6,
+            "mouse_move": 7,
+            "cursor": (14.0, 18.0),
+        }
+
+        with mock.patch.object(backend, "_input_snapshot", return_value=current):
+            events = backend.poll_input_events()
+
+        self.assertEqual(
+            events,
+            [
+                {"kind": "keyboard"},
+                {"kind": "mouse_button"},
+                {"kind": "mouse_wheel"},
+                {"kind": "mouse_move", "dx": 4.0, "dy": -2.0},
+            ],
+        )
+
+    def test_cursor_change_without_hid_motion_counter_is_ignored(self):
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+        backend._input_poll_lock = controller.threading.Lock()
+        backend._last_input_snapshot = {
+            "keyboard": 1,
+            "mouse_button": (1, 1, 1),
+            "mouse_wheel": 1,
+            "mouse_move": 1,
+            "cursor": (10.0, 20.0),
+        }
+        current = {**backend._last_input_snapshot, "cursor": (30.0, 40.0)}
+
+        with mock.patch.object(backend, "_input_snapshot", return_value=current):
+            self.assertEqual(backend.poll_input_events(), [])
+
+
+class SmartThingsTVClientTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.cfg = cloud_config(self.temp_dir.name)
+        self.client = controller.SmartThingsTVClient(self.cfg)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_picture_off_uses_phone_accessibility_ocf_payload(self):
+        with mock.patch.object(self.client, "_run") as run:
+            self.client._send_ocf_remote("KEY_PICTURE_OFF")
+
+        run.assert_called_once_with(
+            "devices:commands",
+            DEVICE_ID,
+            'main:execute:execute("/sec/tv/remotecontrol",'
+            '{"x.com.samsung.tv.keyvalue":"KEY_PICTURE_OFF",'
+            '"x.com.samsung.tv.keystatus":"pressAndRelease"})',
+        )
+
+    def test_send_uses_same_ocf_transport_for_off_and_wake(self):
+        with mock.patch.object(self.client, "_send_ocf_remote") as send:
+            self.assertTrue(self.client.send("KEY_PICTURE_OFF"))
+            self.assertTrue(self.client.send("KEY_RETURN"))
+
+        self.assertEqual(
+            send.call_args_list,
+            [mock.call("KEY_PICTURE_OFF"), mock.call("KEY_RETURN")],
+        )
+
+    def test_run_is_noninteractive_and_does_not_inherit_pat(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
+        with mock.patch.dict(os.environ, {"SMARTTHINGS_TOKEN": "must-not-leak"}), \
+             mock.patch.object(controller.subprocess, "run", return_value=completed) as run:
+            output = self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertEqual(output, "ok")
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                "/usr/bin/true",
+                "devices",
+                DEVICE_ID,
+                "--json",
+                "--profile",
+                "local.qn990f.picture-controller",
+                "--token",
+                "",
+                "--language",
+                "NONE",
+            ],
+        )
+        self.assertNotIn("SMARTTHINGS_TOKEN", kwargs["env"])
+        self.assertEqual(kwargs["env"]["PATH"], self.temp_dir.name)
+        self.assertNotIn("shell", kwargs)
+
+    def test_pair_accepts_actual_qn990f_shape_with_null_device_type_name(self):
+        device = {
+            "label": '65" Neo QLED 8K',
+            "manufacturerName": "Samsung Electronics",
+            "deviceTypeName": None,
+            "type": "OCF",
+            "ocf": {"modelNumber": "QN65QN990FFXZA"},
+            "components": [
+                {
+                    "id": "main",
+                    "capabilities": [
+                        {"id": "execute", "version": 1},
+                        {"id": "samsungvd.remoteControl", "version": 1},
+                    ],
+                    "categories": [{"name": "Television"}],
+                }
+            ],
+        }
+        with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
+            self.assertEqual(self.client.pair(), '65" Neo QLED 8K')
+
+    def test_pair_rejects_device_without_execute_capability(self):
+        device = {
+            "manufacturerName": "Samsung Electronics",
+            "type": "OCF",
+            "ocf": {"modelNumber": "QN65QN990FFXZA"},
+            "components": [{"id": "main", "capabilities": []}],
+        }
+        with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
+            with self.assertRaisesRegex(RuntimeError, "does not expose SmartThings TV"):
+                self.client.pair()
+
+    def test_pair_rejects_qn990f_light_sensor_child_device(self):
+        device = {
+            "manufacturerName": "Samsung Electronics",
+            "type": "OCF",
+            "ocf": {"modelNumber": "QN65QN990FFXZA"},
+            "components": [
+                {
+                    "id": "main",
+                    "capabilities": [{"id": "execute", "version": 1}],
+                    "categories": [{"name": "LightSensor"}],
+                }
+            ],
+        }
+        with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
+            with self.assertRaisesRegex(RuntimeError, "does not expose SmartThings TV"):
+                self.client.pair()
+
+
+class CloudConfigTests(unittest.TestCase):
+    def test_cloud_mode_keeps_requested_idle_automation(self):
+        config = {
+            **controller.DEFAULT_CONFIG,
+            **cloud_config(TEST_HOME.name),
+            "idle_minutes": 7.5,
+            "enable_idle_off": True,
+        }
+        controller.CONFIG_FILE.write_text(json.dumps(config), encoding="utf-8")
+
+        class BackendWithoutFrameworks:
+            def parse_hotkey(self, _spec):
+                return 0, 0
+
+        with mock.patch.object(controller, "MacOSBackend", BackendWithoutFrameworks):
+            loaded = controller.load_config()
+
+        self.assertEqual(loaded["idle_minutes"], 7.5)
+        self.assertTrue(loaded["enable_idle_off"])
+
+
+class ControllerInputTests(unittest.TestCase):
+    def setUp(self):
+        self.status_patch = mock.patch.object(controller, "write_status")
+        self.status_patch.start()
+        self.addCleanup(self.status_patch.stop)
+
+    def make_controller(self, control_method="lan", tv=None):
+        backend = FakeBackend()
+        instance = controller.Controller(
+            controller_config(control_method),
+            backend,
+        )
+        instance.tv = tv or RecordingTV()
+        return instance, backend
+
+    def test_hotkey_is_one_way_picture_off_even_when_already_off(self):
+        instance, backend = self.make_controller()
+        clock = Clock(100.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_hotkey()
+            instance.pending_input_wake_at = 101.0
+            instance.pending_input_source = "keyboard:key_down"
+            instance.handle_hotkey()
+
+        self.assertTrue(instance.is_off())
+        self.assertEqual(
+            instance.tv.sent,
+            ["KEY_PICTURE_OFF", "KEY_PICTURE_OFF"],
+        )
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertEqual(backend.reset_calls, 3)
+
+    def test_hotkey_suppression_rejects_a_concurrent_key_event(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        instance.hotkey_input_suppress_until = 10.0
+        clock = Clock(9.8)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "keyboard"})
+
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertEqual(instance.tv.sent, [])
+
+    def test_micro_mouse_motion_must_accumulate_to_threshold(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "mouse_move", "dx": 4, "dy": 4})
+            self.assertEqual(instance.pending_input_wake_at, 0.0)
+
+            clock.value = 1.2
+            instance.handle_input({"kind": "mouse_move", "dx": 5, "dy": 3})
+            self.assertEqual(instance.pending_input_wake_at, 0.0)
+
+            clock.value = 1.4
+            instance.handle_input({"kind": "mouse_move", "dx": 4, "dy": 4})
+            self.assertAlmostEqual(instance.pending_input_wake_at, 1.58)
+
+            instance._process_pending_wake(1.57)
+            self.assertEqual(instance.tv.sent, [])
+
+            clock.value = 1.58
+            instance._process_pending_wake(1.58)
+
+        self.assertFalse(instance.is_off())
+        self.assertEqual(instance.tv.sent, ["KEY_RETURN"])
+
+    def test_mouse_motion_window_discards_old_accumulation(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "mouse_move", "dx": 10, "dy": 10})
+            clock.value = 1.51
+            instance.handle_input({"kind": "mouse_move", "dx": 3, "dy": 2})
+
+        self.assertEqual(instance.mouse_motion_total, 5.0)
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertEqual(instance.tv.sent, [])
+
+    def test_button_debounce_can_replace_a_later_keyboard_wake(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "keyboard"})
+            self.assertAlmostEqual(instance.pending_input_wake_at, 1.18)
+
+            clock.value = 1.05
+            instance.handle_input({"kind": "mouse_button"})
+            self.assertAlmostEqual(instance.pending_input_wake_at, 1.13)
+
+            clock.value = 1.06
+            instance.handle_input({"kind": "mouse_wheel"})
+
+        self.assertAlmostEqual(instance.pending_input_wake_at, 1.13)
+        self.assertEqual(instance.pending_input_source, "mouse_button")
+
+    def test_wake_guard_discards_input_before_qualification(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 2.0
+        clock = Clock(1.9)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "mouse_move", "dx": 30, "dy": 0})
+            instance.handle_input({"kind": "keyboard"})
+
+            self.assertEqual(instance.mouse_motion_total, 0.0)
+            self.assertEqual(instance.pending_input_wake_at, 0.0)
+
+            clock.value = 2.0
+            instance.handle_input({"kind": "keyboard"})
+
+        self.assertAlmostEqual(instance.pending_input_wake_at, 2.18)
+
+    def test_wake_rechecks_guard_after_waiting_for_picture_off(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.pending_input_wake_at = 2.0
+        instance.pending_input_source = "keyboard:key_down"
+        instance.wake_not_before = 2.8
+        clock = Clock(2.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance._process_pending_wake(2.0)
+
+        self.assertTrue(instance.is_off())
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertEqual(instance.tv.sent, [])
+
+    def test_failed_cloud_blank_rearms_only_after_qualified_input(self):
+        instance, _backend = self.make_controller(
+            "smartthings",
+            tv=RecordingTV(results=[False]),
+        )
+
+        self.assertFalse(instance.blank("idle"))
+        self.assertEqual(instance.next_off_attempt, float("inf"))
+
+        instance.handle_input({"kind": "mouse_move", "dx": 1, "dy": 1})
+        self.assertEqual(instance.next_off_attempt, float("inf"))
+
+        instance.handle_input({"kind": "keyboard"})
+        self.assertEqual(instance.next_off_attempt, 0.0)
+
+    def test_idle_api_is_not_used_to_wake_picture(self):
+        instance, backend = self.make_controller()
+        instance.set_off(True)
+        backend.on_poll = instance._stop.set
+
+        instance.monitor()
+
+        self.assertEqual(backend.idle_calls, 0)
+        self.assertEqual(instance.tv.sent, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

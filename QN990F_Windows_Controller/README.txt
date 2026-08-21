@@ -1,81 +1,15 @@
-QN990F Windows Picture Controller v3.1
-=======================================
+QN990F Windows Picture Controller
+=================================
 
-V3.1 MOUSE FIX
---------------
-v3 had a ctypes declaration bug in RAWMOUSE: the nested anonymous button
-structure was not marked anonymous. Every mouse WM_INPUT therefore raised:
-
-    AttributeError: 'RAWMOUSE' object has no attribute 'usButtonFlags'
-
-Keyboard Raw Input still worked, which is why keyboard keys could eventually
-wake the picture while moving the mouse never did.
-
-v3.1 fixes that structure and adds a startup self-test. If v3 is installed,
-run:
-
-    UPDATE-TO-V3.1.cmd
-
-Normal mouse movement still uses the v3 anti-jitter rule: at least 24 raw
-motion counts accumulated within 500 ms. A normal deliberate mouse move should
-cross that threshold almost immediately.
-
-
-V3: RAW INPUT WAKE
-------------------
-If v1 or v2 is already installed, run:
-
-    UPDATE-TO-V3.cmd
-
-This preserves the Samsung token, TV IP, hotkey, and idle-timeout settings.
-
-Why v3 exists:
-The original wake detector used GetLastInputInfo(). That API reports the last
-session input timestamp, but it does not identify the device or prove that the
-change was a deliberate physical mouse/keyboard action. Microsoft also notes
-that the value is not guaranteed to be monotonically increasing and can be
-affected by injected SendInput events.
-
-v3 therefore uses Windows Raw Input (WM_INPUT) for WAKE detection.
-
-Wake rules:
-- Keyboard: a real raw non-modifier key-down qualifies.
-- Mouse button/wheel: qualifies.
-- Mouse motion: must accumulate at least 24 raw counts within 500 ms.
-  Tiny sensor jitter below that threshold does not wake the TV.
-- Ctrl+Alt+P itself is arbitrated so the P key cannot immediately wake the TV
-  that the same shortcut is trying to blank.
-- GetLastInputInfo remains only for optional idle-auto-OFF timing.
-
-Diagnostics:
-Every qualifying wake records a line like:
-
-    Picture wake (raw_input) source=mouse_move:... device=\\?\HID#VID_...
-
-The device path lets us determine which physical/virtual keyboard or mouse
-caused an unexpected wake.
-
-Advanced filtering:
-config.json supports:
-
-    "ignored_input_device_substrings": []
-
-After identifying a noisy/virtual device from the log, put a unique substring
-of its device path in that array. Example:
-
-    "ignored_input_device_substrings": ["vid_1234&pid_abcd"]
-
-Use this only after the log identifies the culprit.
-
-Purpose
+PURPOSE
 -------
 Makes a Samsung QN990F behave more like a PC monitor on Windows:
 
 1) Global hotkey (default Ctrl+Alt+P)
-   -> sends Samsung Tizen KEY_PICTURE_OFF.
+   -> always sends Samsung Tizen KEY_PICTURE_OFF.
 
-2) If this controller blanked the TV, the next Windows keyboard/mouse input
-   -> sends KEY_RETURN to wake the picture.
+2) If this controller blanked the TV, the next qualifying keyboard or mouse
+   input sends KEY_RETURN to wake the picture.
 
 3) Optional automatic blanking after N minutes of keyboard/mouse inactivity.
 
@@ -84,16 +18,47 @@ Makes a Samsung QN990F behave more like a PC monitor on Windows:
    should therefore suppress automatic blanking.
 
 
+INPUT AND WAKE RULES
+--------------------
+Wake detection uses Windows Raw Input (WM_INPUT):
+
+- Keyboard: a non-modifier key-down qualifies. Pressing only Ctrl, Alt, Shift,
+  Win, or a lock key does not wake the TV.
+- Mouse: a button press or vertical/horizontal wheel input qualifies.
+- Mouse motion: abs(dx) + abs(dy) is accumulated separately for each input
+  device. It must reach 24 raw motion counts while successive movement events
+  stay within 500 ms of one another. Tiny sensor jitter below that threshold
+  does not wake the TV.
+- The configured hotkey is arbitrated so its final key-down cannot immediately
+  wake the picture it just turned off.
+
+Keyboard/mouse wake is briefly debounced, and begins only after the post-blank
+wake guard. GetLastInputInfo is used only for optional idle-auto-OFF timing; it
+is not used to decide whether an input should wake the picture.
+
+Every qualifying wake is logged with its Raw Input device path, for example:
+
+    Picture wake (raw_input) source=mouse_move:... device=\\?\HID#VID_...
+
+If the log identifies a noisy or virtual device, config.json supports a
+case-insensitive device-path substring filter:
+
+    "ignored_input_device_substrings": ["vid_1234&pid_abcd"]
+
+Use a unique substring copied from the log. Input from matching devices is
+ignored. This is a Windows-only, per-device Raw Input feature.
+
+
 INSTALL
 -------
 1. Keep all files from this ZIP together.
-2. Easiest method: double-click INSTALL-ME.cmd.
+2. Double-click INSTALL-ME.cmd.
 
    Or open PowerShell in the extracted folder and run:
 
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-QN990FController.ps1
 
-The installer will:
+For a new installation, the installer will:
 - Ask for the QN990F's LAN IP.
 - Ask for the idle timeout (default 10 minutes; 0 disables it).
 - Use an existing Python 3.9+ if available.
@@ -102,9 +67,22 @@ The installer will:
     %LOCALAPPDATA%\QN990FController
 - Install samsungtvws 3.0.5 there. You do NOT need a system "pip" command.
 - Pair with the TV over Tizen WebSocket TLS port 8002.
-- Run a two-second Picture Off / wake test.
+- Run a two-second Picture Off / wake visual test and ask you to confirm it.
 - Start the controller invisibly with pythonw.exe.
 - Add it to the current user's Startup folder.
+
+
+UPGRADE OR REPAIR
+-----------------
+Download and extract the latest complete release, then run INSTALL-ME.cmd
+again. The same installer handles new installs, upgrades, and repairs.
+
+When an existing installation is detected, the installer preserves config.json
+and samsung-token.txt, including the TV IP, hotkey, idle timeout, pairing token,
+and advanced input settings. It updates the program/runtime and restarts the
+controller without sending the Picture Off / wake visual test. Ordinary upgrades
+also skip pairing; repair mode pairs only when the token is missing or you
+explicitly supply a different TV IP.
 
 
 FIRST PAIRING
@@ -121,17 +99,16 @@ remove/clear the denied device if necessary, and pair again.
 NORMAL USE
 ----------
 Ctrl+Alt+P
-    Picture Off immediately.
+    Picture Off immediately. The hotkey is one-way: pressing it again sends
+    Picture Off again; it never acts as a wake/toggle command.
 
 After Picture Off:
-    Move the mouse or press a key -> wake picture.
+    Press a non-modifier key, press a mouse button, use the wheel, or move the
+    mouse far enough to cross the anti-jitter threshold -> wake picture.
 
 Automatic idle behavior:
     After the configured idle time, KEY_PICTURE_OFF is sent.
-    The next real keyboard/mouse input wakes it.
-
-The hotkey is a toggle when the controller still considers the picture off,
-but normal mouse/keyboard activity already handles wake automatically.
+    The next qualifying keyboard/mouse input wakes it.
 
 
 CONFIGURATION
@@ -151,6 +128,9 @@ Examples:
     Ctrl+Alt+O
     Ctrl+Shift+9
 
+Advanced input thresholds and ignored device substrings can be edited directly
+in config.json. Restart the controller after a manual edit.
+
 
 FILES
 -----
@@ -161,7 +141,7 @@ FILES
     Samsung pairing token. Treat it as a local credential.
 
 %LOCALAPPDATA%\QN990FController\controller.log
-    Rotating diagnostic log.
+    Rotating diagnostic log, including qualifying input source/device details.
 
 %LOCALAPPDATA%\QN990FController\status.json
     Current/last daemon status.
@@ -172,7 +152,7 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 - KEY_PICTURE_OFF is a Samsung remote key, not Windows display sleep.
   The HDMI connection remains logically active; this is why it is useful here.
 
-- Samsung firmware can silently ignore unsupported KEY_* values. The installer
+- Samsung firmware can silently ignore unsupported KEY_* values. A new install
   therefore asks you to visually confirm the Picture Off test.
 
 - Wake uses KEY_RETURN because Samsung documents that a non-Power/non-Volume
@@ -204,7 +184,9 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 
 MANUAL TEST COMMANDS
 --------------------
-Open PowerShell and run:
+These commands send real commands to the TV. Open PowerShell and run:
+
+Picture Off, wait two seconds, then wake:
 
   & "$env:LOCALAPPDATA\QN990FController\venv\Scripts\python.exe" `
     "$env:LOCALAPPDATA\QN990FController\QN990FController.py" --test
@@ -222,5 +204,10 @@ Send wake key once:
 
 UNINSTALL
 ---------
-Start menu:
+Use Start menu:
     QN990F Controller -> Uninstall QN990F Controller
+
+Uninstall stops the controller, removes its Startup and Start menu shortcuts,
+and deletes %LOCALAPPDATA%\QN990FController. That deletion includes config.json,
+samsung-token.txt, the private Python environment, status, and logs. It does not
+change the TV itself or revoke entries in the TV's Device Connection Manager.

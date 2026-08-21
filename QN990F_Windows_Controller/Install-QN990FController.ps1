@@ -1,14 +1,17 @@
 param(
     [string]$TvIp = "",
     [double]$IdleMinutes = -1,
-    [string]$Hotkey = "Ctrl+Alt+P"
+    [string]$Hotkey = ""
 )
 
 $ErrorActionPreference = "Stop"
 $AppDir = Join-Path $env:LOCALAPPDATA "QN990FController"
 $VenvDir = Join-Path $AppDir "venv"
 $ControllerPath = Join-Path $AppDir "QN990FController.py"
+$SourceControllerPath = Join-Path $PSScriptRoot "QN990FController.py"
 $ConfigPath = Join-Path $AppDir "config.json"
+$TokenPath = Join-Path $AppDir "samsung-token.txt"
+$InstallStatePath = Join-Path $AppDir "install-complete"
 $PidPath = Join-Path $AppDir "controller.pid"
 $StatusPath = Join-Path $AppDir "status.json"
 $StartupDir = [Environment]::GetFolderPath("Startup")
@@ -27,9 +30,18 @@ function Stop-ExistingController {
             $ControllerPid = [int](Get-Content $PidPath -ErrorAction Stop)
             $Process = Get-Process -Id $ControllerPid -ErrorAction SilentlyContinue
             if ($Process) {
-                Write-Host "Stopping existing QN990F Controller (PID $ControllerPid)..."
-                Stop-Process -Id $ControllerPid -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 300
+                $ExpectedProcessPaths = @(
+                    (Join-Path $VenvDir "Scripts\python.exe"),
+                    (Join-Path $VenvDir "Scripts\pythonw.exe")
+                )
+                $ProcessPath = $Process.Path
+                if ($ProcessPath -and ($ExpectedProcessPaths -contains $ProcessPath)) {
+                    Write-Host "Stopping existing QN990F Controller (PID $ControllerPid)..."
+                    Stop-Process -Id $ControllerPid -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 300
+                } else {
+                    Write-Warning "Ignoring stale controller PID $ControllerPid because it belongs to another process."
+                }
             }
         } catch {
             # Stale PID file; ignore.
@@ -137,11 +149,45 @@ function New-Shortcut {
 }
 
 Write-Host "QN990F Windows Picture Controller installer" -ForegroundColor Green
-Write-Host "Hotkey: $Hotkey -> Picture Off"
-Write-Host "Mouse/keyboard input after blanking -> wake"
 
-if (-not (Test-Path (Join-Path $PSScriptRoot "QN990FController.py"))) {
-    throw "QN990FController.py is missing. Keep the files from the ZIP in the same folder."
+foreach ($RequiredFile in @(
+    "QN990FController.py",
+    "Configure-QN990FController.ps1",
+    "Uninstall-QN990FController.ps1",
+    "README.txt"
+)) {
+    if (-not (Test-Path (Join-Path $PSScriptRoot $RequiredFile))) {
+        throw "$RequiredFile is missing. Keep the files from the ZIP in the same folder."
+    }
+}
+
+$ExistingConfig = $null
+$ExistingConfigText = $null
+$HasExistingConfig = Test-Path $ConfigPath
+$IsUpgrade = $HasExistingConfig -and (
+    (Test-Path $InstallStatePath) -or
+    ((Test-Path $ControllerPath) -and (Test-Path $StartupShortcut))
+)
+if ($HasExistingConfig) {
+    try {
+        $ExistingConfigText = Get-Content $ConfigPath -Raw -ErrorAction Stop
+        $ExistingConfig = $ExistingConfigText | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $ExistingConfig -or -not ($ExistingConfig -is [PSCustomObject])) {
+            throw "The JSON root must be an object."
+        }
+    } catch {
+        throw "The existing config.json is invalid and was not changed. Fix or remove '$ConfigPath', then rerun the installer. $($_.Exception.Message)"
+    }
+}
+$HadExistingToken = Test-Path $TokenPath
+$ExistingTokenBytes = if ($HadExistingToken) {
+    [IO.File]::ReadAllBytes($TokenPath)
+} else {
+    $null
+}
+
+if ((-not $PSBoundParameters.ContainsKey("TvIp")) -and $ExistingConfig) {
+    $TvIp = [string]$ExistingConfig.tv_ip
 }
 
 if ([string]::IsNullOrWhiteSpace($TvIp)) {
@@ -150,7 +196,19 @@ if ([string]::IsNullOrWhiteSpace($TvIp)) {
 if ([string]::IsNullOrWhiteSpace($TvIp)) {
     throw "TV IP address cannot be empty."
 }
+$TvIp = $TvIp.Trim()
+$TvIpChanged = $ExistingConfig -and
+    (([string]$ExistingConfig.tv_ip).Trim() -ne $TvIp)
 
+$IdleWasChanged = $PSBoundParameters.ContainsKey("IdleMinutes")
+if ((-not $IdleWasChanged) -and $ExistingConfig -and
+    ($ExistingConfig.PSObject.Properties.Name -contains "idle_minutes")) {
+    try {
+        $IdleMinutes = [double]$ExistingConfig.idle_minutes
+    } catch {
+        throw "The existing config.json has an invalid idle_minutes value and was not changed."
+    }
+}
 if ($IdleMinutes -lt 0) {
     $RawIdle = Read-Host "Idle minutes before automatic Picture Off [10; enter 0 to disable]"
     if ([string]::IsNullOrWhiteSpace($RawIdle)) {
@@ -162,16 +220,70 @@ if ($IdleMinutes -lt 0) {
         }
         $IdleMinutes = $Parsed
     }
+    $IdleWasChanged = $true
 }
 
-New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-Stop-ExistingController
+if ((-not $PSBoundParameters.ContainsKey("Hotkey")) -and $ExistingConfig -and
+    ($ExistingConfig.PSObject.Properties.Name -contains "hotkey")) {
+    $Hotkey = [string]$ExistingConfig.hotkey
+}
+if ([string]::IsNullOrWhiteSpace($Hotkey)) {
+    $Hotkey = "Ctrl+Alt+P"
+}
+$Hotkey = $Hotkey.Trim()
+$NeedsPairing = (-not $IsUpgrade) -or (-not $HadExistingToken) -or $TvIpChanged
 
-Write-Step "Copying controller files"
-Copy-Item (Join-Path $PSScriptRoot "QN990FController.py") $ControllerPath -Force
-Copy-Item (Join-Path $PSScriptRoot "Configure-QN990FController.ps1") (Join-Path $AppDir "Configure-QN990FController.ps1") -Force
-Copy-Item (Join-Path $PSScriptRoot "Uninstall-QN990FController.ps1") (Join-Path $AppDir "Uninstall-QN990FController.ps1") -Force
-Copy-Item (Join-Path $PSScriptRoot "README.txt") (Join-Path $AppDir "README.txt") -Force
+function Restore-PreviousInstallation {
+    if ($ExistingConfig) {
+        Set-Content -Path $ConfigPath -Value $ExistingConfigText -Encoding UTF8
+    } else {
+        Remove-Item $ConfigPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($HadExistingToken) {
+        [IO.File]::WriteAllBytes($TokenPath, $ExistingTokenBytes)
+    } else {
+        Remove-Item $TokenPath -Force -ErrorAction SilentlyContinue
+    }
+
+    foreach ($FileName in $InstalledFileNames) {
+        $BackupFile = Join-Path $BackupDir $FileName
+        $InstalledFile = Join-Path $AppDir $FileName
+        if (Test-Path $BackupFile) {
+            Copy-Item -LiteralPath $BackupFile -Destination $InstalledFile -Force
+        } else {
+            Remove-Item -LiteralPath $InstalledFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($HadStartupShortcut) {
+        Copy-Item -LiteralPath $BackupStartupShortcut -Destination $StartupShortcut -Force
+    } else {
+        Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item $StartMenuDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($HadStartMenu) {
+        Copy-Item -LiteralPath $BackupStartMenuDir -Destination $StartMenuDir -Recurse -Force
+    }
+    if ($HadInstallState) {
+        Copy-Item -LiteralPath $BackupInstallState -Destination $InstallStatePath -Force
+    } else {
+        Remove-Item $InstallStatePath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($IsUpgrade -and (Test-Path $ControllerPath) -and (Test-Path $VenvPythonW)) {
+        Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath $VenvPythonW -ArgumentList "`"$ControllerPath`"" -WorkingDirectory $AppDir
+    }
+}
+
+if ($IsUpgrade) {
+    Write-Host "Existing installation found. Settings and Samsung pairing token will be preserved."
+}
+Write-Host "Hotkey: $Hotkey -> Picture Off"
+Write-Host "Deliberate mouse/keyboard input after blanking -> wake"
+
+New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 
 $Python = Find-Python
 if (-not $Python) {
@@ -184,14 +296,19 @@ if (-not $Python) {
 Write-Host "Using Python: $($Python.Description)"
 
 Write-Step "Creating an isolated Python environment"
-if (-not (Test-Path (Join-Path $VenvDir "Scripts\python.exe"))) {
+$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+$VenvPythonW = Join-Path $VenvDir "Scripts\pythonw.exe"
+$VenvIsUsable = (Test-Path $VenvPython) -and (Test-Path $VenvPythonW) -and
+    (Test-PythonInvocation -Exe $VenvPython)
+if (-not $VenvIsUsable) {
+    if (Test-Path $VenvDir) {
+        Stop-ExistingController
+        Remove-Item -LiteralPath $VenvDir -Recurse -Force
+    }
     $VenvArgs = @($Python.PrefixArgs) + @("-m", "venv", $VenvDir)
     & $Python.Exe @VenvArgs
     if ($LASTEXITCODE -ne 0) { throw "Failed to create Python virtual environment." }
 }
-
-$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
-$VenvPythonW = Join-Path $VenvDir "Scripts\pythonw.exe"
 
 Write-Step "Installing samsungtvws 3.0.5"
 & $VenvPython -m pip install --disable-pip-version-check --upgrade pip
@@ -200,100 +317,200 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to update pip inside the virtual enviro
 & $VenvPython -m pip install --disable-pip-version-check "samsungtvws==3.0.5"
 if ($LASTEXITCODE -ne 0) { throw "Failed to install samsungtvws." }
 
-$Config = [ordered]@{
-    tv_ip = $TvIp.Trim()
-    port = 8002
-    idle_minutes = [double]$IdleMinutes
-    enable_idle_off = ($IdleMinutes -gt 0)
-    respect_display_required = $true
-    hotkey = $Hotkey
-    picture_off_key = "KEY_PICTURE_OFF"
-    wake_key = "KEY_RETURN"
-    wake_guard_ms = 800
-    poll_interval_ms = 50
-    socket_timeout_seconds = 5.0
-    key_press_delay_seconds = 0.05
-    connection_refresh_seconds = 8.0
-    input_wake_debounce_ms = 180
-    mouse_wake_threshold_counts = 24
-    mouse_motion_window_ms = 500
-    ignored_input_device_substrings = @()
-}
-$Config | ConvertTo-Json | Set-Content -Path $ConfigPath -Encoding UTF8
-
-Write-Step "Checking the global hotkey"
-& $VenvPython $ControllerPath --check-hotkey
+Write-Step "Checking the controller package"
+& $VenvPython $SourceControllerPath --self-test
 if ($LASTEXITCODE -ne 0) {
-    throw "The hotkey '$Hotkey' is already in use or invalid. Rerun the installer with another hotkey, for example: -Hotkey 'Ctrl+Alt+O'."
+    throw "The controller self-test failed. The installed controller and configuration were not replaced."
 }
 
-Write-Step "Pairing with the TV"
-Write-Host "Turn the QN990F on and keep it on the same LAN/subnet as this PC."
-Write-Host "When the TV asks whether to allow QN990F-PC-Controller, choose Allow." -ForegroundColor Yellow
-& $VenvPython $ControllerPath --pair
-if ($LASTEXITCODE -ne 0) {
-    throw "Pairing failed. Check the TV IP, LAN connectivity, and Samsung Device Connection Manager permissions."
-}
+$InstalledFileNames = @(
+    "QN990FController.py",
+    "Configure-QN990FController.ps1",
+    "Uninstall-QN990FController.ps1",
+    "README.txt"
+)
+$BackupDir = Join-Path $AppDir ("install-backup-" + [Guid]::NewGuid().ToString("N"))
+$BackupStartupShortcut = Join-Path $BackupDir "StartupShortcut.lnk"
+$BackupStartMenuDir = Join-Path $BackupDir "StartMenu"
+$BackupInstallState = Join-Path $BackupDir "install-complete"
+$HadStartupShortcut = $IsUpgrade -and (Test-Path $StartupShortcut)
+$HadStartMenu = $IsUpgrade -and (Test-Path $StartMenuDir)
+$HadInstallState = $IsUpgrade -and (Test-Path $InstallStatePath)
+$CandidateProcess = $null
 
-Write-Step "Testing Picture Off + wake"
-Write-Host "The TV should go black for about 2 seconds and then return."
-& $VenvPython $ControllerPath --test
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "The test command reported an error. See $AppDir\controller.log."
-}
-$Answer = Read-Host "Did the TV actually go black and then come back? [Y/n]"
-if ($Answer -match '^[Nn]') {
-    Write-Warning "KEY_PICTURE_OFF may be ignored by this QN990F firmware. The controller is installed, but automatic startup will NOT be enabled."
-    Write-Host "You can retest later with:"
-    Write-Host "`"$VenvPython`" `"$ControllerPath`" --test"
-    exit 2
-}
+try {
+    New-Item -ItemType Directory -Path $BackupDir | Out-Null
+    foreach ($FileName in $InstalledFileNames) {
+        $InstalledFile = Join-Path $AppDir $FileName
+        if (Test-Path $InstalledFile) {
+            Copy-Item -LiteralPath $InstalledFile -Destination (Join-Path $BackupDir $FileName)
+        }
+    }
+    if ($HadStartupShortcut) {
+        Copy-Item -LiteralPath $StartupShortcut -Destination $BackupStartupShortcut
+    }
+    if ($HadStartMenu) {
+        Copy-Item -LiteralPath $StartMenuDir -Destination $BackupStartMenuDir -Recurse
+    }
+    if ($HadInstallState) {
+        Copy-Item -LiteralPath $InstallStatePath -Destination $BackupInstallState
+    }
 
-Write-Step "Adding automatic startup"
-New-Shortcut `
-    -Path $StartupShortcut `
-    -Target $VenvPythonW `
-    -Arguments "`"$ControllerPath`"" `
-    -WorkingDirectory $AppDir
+    Stop-ExistingController
 
-New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
-$PowerShellExe = (Get-Command powershell.exe).Source
-New-Shortcut `
-    -Path (Join-Path $StartMenuDir "Configure QN990F Controller.lnk") `
-    -Target $PowerShellExe `
-    -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Configure-QN990FController.ps1`"" `
-    -WorkingDirectory $AppDir
-New-Shortcut `
-    -Path (Join-Path $StartMenuDir "Uninstall QN990F Controller.lnk") `
-    -Target $PowerShellExe `
-    -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Uninstall-QN990FController.ps1`"" `
-    -WorkingDirectory $AppDir
-
-Write-Step "Starting the controller"
-Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
-Start-Process -FilePath $VenvPythonW -ArgumentList "`"$ControllerPath`"" -WorkingDirectory $AppDir
-Start-Sleep -Seconds 1
-
-$Started = $false
-if (Test-Path $StatusPath) {
     try {
-        $Status = Get-Content $StatusPath -Raw | ConvertFrom-Json
-        $Started = [bool]$Status.running
-    } catch {}
-}
-if (-not $Started) {
-    Write-Warning "The background process did not report a running state. Check $AppDir\controller.log."
+        if (-not $IsUpgrade) {
+            Remove-Item $InstallStatePath -Force -ErrorAction SilentlyContinue
+            Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+            Remove-Item $StartMenuDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $Config = [ordered]@{
+            tv_ip = $TvIp
+            port = 8002
+            idle_minutes = [double]$IdleMinutes
+            enable_idle_off = ($IdleMinutes -gt 0)
+            respect_display_required = $true
+            hotkey = $Hotkey
+            picture_off_key = "KEY_PICTURE_OFF"
+            wake_key = "KEY_RETURN"
+            wake_guard_ms = 800
+            poll_interval_ms = 50
+            socket_timeout_seconds = 5.0
+            key_press_delay_seconds = 0.05
+            connection_refresh_seconds = 8.0
+            input_wake_debounce_ms = 180
+            mouse_wake_threshold_counts = 24
+            mouse_motion_window_ms = 500
+            ignored_input_device_substrings = @()
+        }
+        if ($ExistingConfig) {
+            foreach ($Property in $ExistingConfig.PSObject.Properties) {
+                $Config[$Property.Name] = $Property.Value
+            }
+        }
+        $Config["tv_ip"] = $TvIp
+        $Config["idle_minutes"] = [double]$IdleMinutes
+        if ((-not $ExistingConfig) -or $IdleWasChanged -or
+            (-not ($ExistingConfig.PSObject.Properties.Name -contains "enable_idle_off"))) {
+            $Config["enable_idle_off"] = ($IdleMinutes -gt 0)
+        }
+        $Config["hotkey"] = $Hotkey
+        $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigPath -Encoding UTF8
+
+        Write-Step "Checking the global hotkey"
+        & $VenvPython $SourceControllerPath --check-hotkey
+        if ($LASTEXITCODE -ne 0) {
+            throw "The hotkey '$Hotkey' is already in use or invalid. Rerun the installer with another hotkey, for example: -Hotkey 'Ctrl+Alt+O'."
+        }
+
+        if ($NeedsPairing) {
+            Write-Step "Pairing with the TV"
+            Write-Host "Turn the QN990F on and keep it on the same LAN/subnet as this PC."
+            Write-Host "When the TV asks whether to allow QN990F-PC-Controller, choose Allow." -ForegroundColor Yellow
+            if ($TvIpChanged) {
+                Remove-Item $TokenPath -Force -ErrorAction SilentlyContinue
+            }
+            & $VenvPython $SourceControllerPath --pair
+            if ($LASTEXITCODE -ne 0) {
+                throw "Pairing failed. Check the TV IP, LAN connectivity, and Samsung Device Connection Manager permissions."
+            }
+        } else {
+            Write-Step "Preserving TV pairing"
+            Write-Host "Existing Samsung pairing token was kept; no pairing command was sent."
+        }
+
+        if (-not $IsUpgrade) {
+            Write-Step "Testing Picture Off + wake"
+            Write-Host "The TV should go black for about 2 seconds and then return."
+            & $VenvPython $SourceControllerPath --test
+            if ($LASTEXITCODE -ne 0) {
+                throw "The Picture Off/wake test failed. Automatic startup was not enabled. See $AppDir\controller.log."
+            }
+            $Answer = Read-Host "Did the TV actually go black and then come back? [y/N]"
+            if ($Answer -notmatch '^[Yy]') {
+                throw "Picture Off/wake was not visually confirmed. Automatic startup was not enabled."
+            }
+        } else {
+            Write-Host "Skipped the Picture Off/wake visual test during upgrade."
+        }
+
+        Write-Step "Copying controller files"
+        Copy-Item $SourceControllerPath $ControllerPath -Force
+        Copy-Item (Join-Path $PSScriptRoot "Configure-QN990FController.ps1") (Join-Path $AppDir "Configure-QN990FController.ps1") -Force
+        Copy-Item (Join-Path $PSScriptRoot "Uninstall-QN990FController.ps1") (Join-Path $AppDir "Uninstall-QN990FController.ps1") -Force
+        Copy-Item (Join-Path $PSScriptRoot "README.txt") (Join-Path $AppDir "README.txt") -Force
+
+        Write-Step "Adding automatic startup"
+        New-Shortcut `
+            -Path $StartupShortcut `
+            -Target $VenvPythonW `
+            -Arguments "`"$ControllerPath`"" `
+            -WorkingDirectory $AppDir
+
+        New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
+        $PowerShellExe = (Get-Command powershell.exe).Source
+        New-Shortcut `
+            -Path (Join-Path $StartMenuDir "Configure QN990F Controller.lnk") `
+            -Target $PowerShellExe `
+            -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Configure-QN990FController.ps1`"" `
+            -WorkingDirectory $AppDir
+        New-Shortcut `
+            -Path (Join-Path $StartMenuDir "Uninstall QN990F Controller.lnk") `
+            -Target $PowerShellExe `
+            -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Uninstall-QN990FController.ps1`"" `
+            -WorkingDirectory $AppDir
+
+        Write-Step "Starting the controller"
+        Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
+        $CandidateProcess = Start-Process -FilePath $VenvPythonW -ArgumentList "`"$ControllerPath`"" -WorkingDirectory $AppDir -PassThru
+
+        $Started = $false
+        for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
+            Start-Sleep -Milliseconds 100
+            if ($CandidateProcess.HasExited) { break }
+            if (Test-Path $StatusPath) {
+                try {
+                    $Status = Get-Content $StatusPath -Raw | ConvertFrom-Json
+                    $Started = [bool]$Status.running
+                } catch {}
+                if ($Started) { break }
+            }
+        }
+        if (-not $Started) {
+            throw "The background process did not report a running state. Check $AppDir\controller.log."
+        }
+        "complete" | Set-Content -Path $InstallStatePath -Encoding ASCII
+    } catch {
+        $InstallError = $_
+        if ($CandidateProcess) {
+            try {
+                if (-not $CandidateProcess.HasExited) {
+                    Stop-Process -Id $CandidateProcess.Id -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 300
+                }
+            } catch {}
+        }
+        Restore-PreviousInstallation
+        throw $InstallError
+    }
+} finally {
+    Remove-Item $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ""
-Write-Host "Installed." -ForegroundColor Green
+if ($IsUpgrade) {
+    Write-Host "Updated/repaired." -ForegroundColor Green
+} else {
+    Write-Host "Installed." -ForegroundColor Green
+}
 Write-Host "  Hotkey:           $Hotkey"
-if ($IdleMinutes -gt 0) {
+if ([bool]($Config["enable_idle_off"])) {
     Write-Host "  Automatic blank:  after $IdleMinutes minute(s) of keyboard/mouse inactivity"
 } else {
     Write-Host "  Automatic blank:  disabled"
 }
-Write-Host "  Wake:             next keyboard/mouse input after the controller blanked the TV"
+Write-Host "  Wake:             next qualifying input; tiny pointer motion is ignored"
 Write-Host "  Config/logs:      $AppDir"
 Write-Host ""
 Write-Host "For reliable use, reserve the TV's IP in your router/DHCP settings."
