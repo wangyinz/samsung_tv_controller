@@ -209,10 +209,15 @@ $Config = [ordered]@{
     hotkey = $Hotkey
     picture_off_key = "KEY_PICTURE_OFF"
     wake_key = "KEY_RETURN"
-    wake_guard_ms = 700
-    poll_interval_ms = 100
+    wake_guard_ms = 800
+    poll_interval_ms = 50
     socket_timeout_seconds = 5.0
     key_press_delay_seconds = 0.05
+    connection_refresh_seconds = 8.0
+    input_wake_debounce_ms = 180
+    mouse_wake_threshold_counts = 24
+    mouse_motion_window_ms = 500
+    ignored_input_device_substrings = @()
 }
 $Config | ConvertTo-Json | Set-Content -Path $ConfigPath -Encoding UTF8
 

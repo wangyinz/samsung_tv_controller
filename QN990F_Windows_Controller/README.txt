@@ -1,5 +1,71 @@
-QN990F Windows Picture Controller
-=================================
+QN990F Windows Picture Controller v3.1
+=======================================
+
+V3.1 MOUSE FIX
+--------------
+v3 had a ctypes declaration bug in RAWMOUSE: the nested anonymous button
+structure was not marked anonymous. Every mouse WM_INPUT therefore raised:
+
+    AttributeError: 'RAWMOUSE' object has no attribute 'usButtonFlags'
+
+Keyboard Raw Input still worked, which is why keyboard keys could eventually
+wake the picture while moving the mouse never did.
+
+v3.1 fixes that structure and adds a startup self-test. If v3 is installed,
+run:
+
+    UPDATE-TO-V3.1.cmd
+
+Normal mouse movement still uses the v3 anti-jitter rule: at least 24 raw
+motion counts accumulated within 500 ms. A normal deliberate mouse move should
+cross that threshold almost immediately.
+
+
+V3: RAW INPUT WAKE
+------------------
+If v1 or v2 is already installed, run:
+
+    UPDATE-TO-V3.cmd
+
+This preserves the Samsung token, TV IP, hotkey, and idle-timeout settings.
+
+Why v3 exists:
+The original wake detector used GetLastInputInfo(). That API reports the last
+session input timestamp, but it does not identify the device or prove that the
+change was a deliberate physical mouse/keyboard action. Microsoft also notes
+that the value is not guaranteed to be monotonically increasing and can be
+affected by injected SendInput events.
+
+v3 therefore uses Windows Raw Input (WM_INPUT) for WAKE detection.
+
+Wake rules:
+- Keyboard: a real raw non-modifier key-down qualifies.
+- Mouse button/wheel: qualifies.
+- Mouse motion: must accumulate at least 24 raw counts within 500 ms.
+  Tiny sensor jitter below that threshold does not wake the TV.
+- Ctrl+Alt+P itself is arbitrated so the P key cannot immediately wake the TV
+  that the same shortcut is trying to blank.
+- GetLastInputInfo remains only for optional idle-auto-OFF timing.
+
+Diagnostics:
+Every qualifying wake records a line like:
+
+    Picture wake (raw_input) source=mouse_move:... device=\\?\HID#VID_...
+
+The device path lets us determine which physical/virtual keyboard or mouse
+caused an unexpected wake.
+
+Advanced filtering:
+config.json supports:
+
+    "ignored_input_device_substrings": []
+
+After identifying a noisy/virtual device from the log, put a unique substring
+of its device path in that array. Example:
+
+    "ignored_input_device_substrings": ["vid_1234&pid_abcd"]
+
+Use this only after the log identifies the culprit.
 
 Purpose
 -------
