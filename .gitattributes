@@ -1,0 +1,2 @@
+*.cmd whitespace=cr-at-eol
+*.ps1 whitespace=cr-at-eol

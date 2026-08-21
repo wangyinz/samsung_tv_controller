@@ -1,9 +1,9 @@
-QN990F Windows Picture Controller
-=================================
+Samsung TV Picture Controller for Windows
+=========================================
 
 PURPOSE
 -------
-Makes a Samsung QN990F behave more like a PC monitor on Windows:
+Makes a compatible Samsung TV behave more like a PC monitor on Windows:
 
 1) Global hotkey (default Ctrl+Alt+P)
    -> always sends Samsung Tizen KEY_PICTURE_OFF.
@@ -17,6 +17,12 @@ Makes a Samsung QN990F behave more like a PC monitor on Windows:
    Media/presentation apps that explicitly tell Windows "keep the display on"
    should therefore suppress automatic blanking.
 
+This controller was developed and validated with a Samsung QN990F. Other
+Samsung TVs may work when they expose the encrypted Tizen WebSocket remote on
+TCP port 8002 and their firmware accepts KEY_PICTURE_OFF plus the configured
+wake key. The installer requires a visual Picture Off / wake test before it
+enables background startup; that test is the compatibility check for your TV.
+
 
 INPUT AND WAKE RULES
 --------------------
@@ -26,9 +32,9 @@ Wake detection uses Windows Raw Input (WM_INPUT):
   Win, or a lock key does not wake the TV.
 - Mouse: a button press or vertical/horizontal wheel input qualifies.
 - Mouse motion: abs(dx) + abs(dy) is accumulated separately for each input
-  device. It must reach 24 raw motion counts while successive movement events
-  stay within 500 ms of one another. Tiny sensor jitter below that threshold
-  does not wake the TV.
+  device while successive events stay no more than 500 ms apart. The total must
+  reach 24 raw motion counts. Tiny sensor jitter below that threshold does not
+  wake the TV.
 - The configured hotkey is arbitrated so its final key-down cannot immediately
   wake the picture it just turned off.
 
@@ -59,7 +65,7 @@ INSTALL
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-QN990FController.ps1
 
 For a new installation, the installer will:
-- Ask for the QN990F's LAN IP.
+- Ask for the Samsung TV's LAN IP.
 - Ask for the idle timeout (default 10 minutes; 0 disables it).
 - Use an existing Python 3.9+ if available.
 - If Python is absent, install Python 3.12 with winget.
@@ -67,7 +73,8 @@ For a new installation, the installer will:
     %LOCALAPPDATA%\QN990FController
 - Install samsungtvws 3.0.5 there. You do NOT need a system "pip" command.
 - Pair with the TV over Tizen WebSocket TLS port 8002.
-- Run a two-second Picture Off / wake visual test and ask you to confirm it.
+- Ask permission, run a two-second Picture Off / wake visual test, and ask you
+  to confirm what you observed.
 - Start the controller invisibly with pythonw.exe.
 - Add it to the current user's Startup folder.
 
@@ -89,8 +96,10 @@ FIRST PAIRING
 -------------
 Keep the TV on and on the same LAN/subnet as the PC.
 
-When the Samsung TV asks whether to allow "QN990F-PC-Controller",
-choose Allow.
+On a new installation, when the Samsung TV asks whether to allow
+"Samsung-TV-Picture-Controller", choose Allow. An installation upgraded from
+an older release may retain the previous remote name so its pairing token stays
+valid; allow the displayed request if the installer asks you to pair again.
 
 If pairing was previously denied, open the TV's Device Connection Manager,
 remove/clear the denied device if necessary, and pair again.
@@ -114,7 +123,7 @@ Automatic idle behavior:
 CONFIGURATION
 -------------
 Use Start menu:
-    QN990F Controller -> Configure QN990F Controller
+    Samsung TV Picture Controller -> Configure Samsung TV Picture Controller
 
 You can change:
 - TV IP
@@ -134,6 +143,9 @@ in config.json. Restart the controller after a manual edit.
 
 FILES
 -----
+The QN990FController application-data directory is a legacy internal path kept
+for in-place upgrades. It does not restrict which compatible TV can be used.
+
 %LOCALAPPDATA%\QN990FController\config.json
     Main settings.
 
@@ -142,6 +154,8 @@ FILES
 
 %LOCALAPPDATA%\QN990FController\controller.log
     Rotating diagnostic log, including qualifying input source/device details.
+    The active log and three backups are each limited to 1 MB, so retained logs
+    use at most approximately 4 MB in total.
 
 %LOCALAPPDATA%\QN990FController\status.json
     Current/last daemon status.
@@ -159,7 +173,7 @@ IMPORTANT BEHAVIOR / LIMITATIONS
   remote key wakes Picture Off. If your firmware does not wake with KEY_RETURN,
   edit config.json and try "KEY_UP", then restart/configure the controller.
 
-- The controller wakes only after Picture Off actions that IT initiated.
+- The controller wakes only after Picture Off actions that the controller initiated.
   If you blank the picture by some other method, Windows input is not guaranteed
   to wake it through this controller.
 
@@ -205,7 +219,7 @@ Send wake key once:
 UNINSTALL
 ---------
 Use Start menu:
-    QN990F Controller -> Uninstall QN990F Controller
+    Samsung TV Picture Controller -> Uninstall Samsung TV Picture Controller
 
 Uninstall stops the controller, removes its Startup and Start menu shortcuts,
 and deletes %LOCALAPPDATA%\QN990FController. That deletion includes config.json,

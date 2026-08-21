@@ -10,7 +10,7 @@ STAGED_PLIST="$APP_DIR/local.qn990f.picture-controller.plist.disabled"
 LABEL="local.qn990f.picture-controller"
 
 if [[ ! -x "$PYTHON" || ! -f "$CONFIG" ]]; then
-  echo "QN990F Controller is not installed."
+  echo "Samsung TV Picture Controller is not installed."
   read -r -p "Press Return to close."
   exit 1
 fi
@@ -42,7 +42,7 @@ HOTKEY="$(get_value hotkey)"
 RESPECT="$(get_value respect_display_required)"
 SMARTTHINGS_DEVICE_ID="$(get_value smartthings_device_id)"
 
-echo "QN990F macOS Controller configuration"
+echo "Samsung TV Picture Controller configuration"
 echo "Press Return to keep the current value."
 echo "Connection: $CONTROL_METHOD"
 echo

@@ -15,9 +15,11 @@ $InstallStatePath = Join-Path $AppDir "install-complete"
 $PidPath = Join-Path $AppDir "controller.pid"
 $StatusPath = Join-Path $AppDir "status.json"
 $StartupDir = [Environment]::GetFolderPath("Startup")
-$StartupShortcut = Join-Path $StartupDir "QN990F Picture Controller.lnk"
+$StartupShortcut = Join-Path $StartupDir "Samsung TV Picture Controller.lnk"
+$LegacyStartupShortcut = Join-Path $StartupDir "QN990F Picture Controller.lnk"
 $ProgramsDir = [Environment]::GetFolderPath("Programs")
-$StartMenuDir = Join-Path $ProgramsDir "QN990F Controller"
+$StartMenuDir = Join-Path $ProgramsDir "Samsung TV Picture Controller"
+$LegacyStartMenuDir = Join-Path $ProgramsDir "QN990F Controller"
 
 function Write-Step([string]$Text) {
     Write-Host ""
@@ -36,7 +38,7 @@ function Stop-ExistingController {
                 )
                 $ProcessPath = $Process.Path
                 if ($ProcessPath -and ($ExpectedProcessPaths -contains $ProcessPath)) {
-                    Write-Host "Stopping existing QN990F Controller (PID $ControllerPid)..."
+                    Write-Host "Stopping existing Samsung TV Picture Controller (PID $ControllerPid)..."
                     Stop-Process -Id $ControllerPid -Force -ErrorAction SilentlyContinue
                     Start-Sleep -Milliseconds 300
                 } else {
@@ -148,7 +150,7 @@ function New-Shortcut {
     $Shortcut.Save()
 }
 
-Write-Host "QN990F Windows Picture Controller installer" -ForegroundColor Green
+Write-Host "Samsung TV Picture Controller installer for Windows" -ForegroundColor Green
 
 foreach ($RequiredFile in @(
     "QN990FController.py",
@@ -166,7 +168,9 @@ $ExistingConfigText = $null
 $HasExistingConfig = Test-Path $ConfigPath
 $IsUpgrade = $HasExistingConfig -and (
     (Test-Path $InstallStatePath) -or
-    ((Test-Path $ControllerPath) -and (Test-Path $StartupShortcut))
+    ((Test-Path $ControllerPath) -and (
+        (Test-Path $StartupShortcut) -or (Test-Path $LegacyStartupShortcut)
+    ))
 )
 if ($HasExistingConfig) {
     try {
@@ -191,7 +195,7 @@ if ((-not $PSBoundParameters.ContainsKey("TvIp")) -and $ExistingConfig) {
 }
 
 if ([string]::IsNullOrWhiteSpace($TvIp)) {
-    $TvIp = Read-Host "Enter the QN990F LAN IP address (example: 192.168.1.50)"
+    $TvIp = Read-Host "Enter the Samsung TV LAN IP address (example: 192.168.1.50)"
 }
 if ([string]::IsNullOrWhiteSpace($TvIp)) {
     throw "TV IP address cannot be empty."
@@ -378,6 +382,7 @@ try {
             poll_interval_ms = 50
             socket_timeout_seconds = 5.0
             key_press_delay_seconds = 0.05
+            remote_name = "Samsung-TV-Picture-Controller"
             connection_refresh_seconds = 8.0
             input_wake_debounce_ms = 180
             mouse_wake_threshold_counts = 24
@@ -387,6 +392,9 @@ try {
         if ($ExistingConfig) {
             foreach ($Property in $ExistingConfig.PSObject.Properties) {
                 $Config[$Property.Name] = $Property.Value
+            }
+            if (-not ($ExistingConfig.PSObject.Properties.Name -contains "remote_name")) {
+                $Config["remote_name"] = "QN990F-PC-Controller"
             }
         }
         $Config["tv_ip"] = $TvIp
@@ -406,8 +414,8 @@ try {
 
         if ($NeedsPairing) {
             Write-Step "Pairing with the TV"
-            Write-Host "Turn the QN990F on and keep it on the same LAN/subnet as this PC."
-            Write-Host "When the TV asks whether to allow QN990F-PC-Controller, choose Allow." -ForegroundColor Yellow
+            Write-Host "Turn the Samsung TV on and keep it on the same LAN/subnet as this PC."
+            Write-Host "When the TV asks whether to allow $($Config['remote_name']), choose Allow." -ForegroundColor Yellow
             if ($TvIpChanged) {
                 Remove-Item $TokenPath -Force -ErrorAction SilentlyContinue
             }
@@ -423,6 +431,10 @@ try {
         if (-not $IsUpgrade) {
             Write-Step "Testing Picture Off + wake"
             Write-Host "The TV should go black for about 2 seconds and then return."
+            $TestReady = Read-Host "Run this Picture Off test now? [y/N]"
+            if ($TestReady -notmatch '^[Yy]') {
+                throw "No TV command was sent. Automatic startup was not enabled."
+            }
             & $VenvPython $SourceControllerPath --test
             if ($LASTEXITCODE -ne 0) {
                 throw "The Picture Off/wake test failed. Automatic startup was not enabled. See $AppDir\controller.log."
@@ -451,12 +463,12 @@ try {
         New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
         $PowerShellExe = (Get-Command powershell.exe).Source
         New-Shortcut `
-            -Path (Join-Path $StartMenuDir "Configure QN990F Controller.lnk") `
+            -Path (Join-Path $StartMenuDir "Configure Samsung TV Picture Controller.lnk") `
             -Target $PowerShellExe `
             -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Configure-QN990FController.ps1`"" `
             -WorkingDirectory $AppDir
         New-Shortcut `
-            -Path (Join-Path $StartMenuDir "Uninstall QN990F Controller.lnk") `
+            -Path (Join-Path $StartMenuDir "Uninstall Samsung TV Picture Controller.lnk") `
             -Target $PowerShellExe `
             -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Uninstall-QN990FController.ps1`"" `
             -WorkingDirectory $AppDir
@@ -481,6 +493,10 @@ try {
             throw "The background process did not report a running state. Check $AppDir\controller.log."
         }
         "complete" | Set-Content -Path $InstallStatePath -Encoding ASCII
+        Remove-Item $LegacyStartupShortcut -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $LegacyStartMenuDir "Configure QN990F Controller.lnk") -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $LegacyStartMenuDir "Uninstall QN990F Controller.lnk") -Force -ErrorAction SilentlyContinue
+        Remove-Item $LegacyStartMenuDir -Force -ErrorAction SilentlyContinue
     } catch {
         $InstallError = $_
         if ($CandidateProcess) {

@@ -8,12 +8,12 @@ $VenvPythonW = Join-Path $AppDir "venv\Scripts\pythonw.exe"
 $PidPath = Join-Path $AppDir "controller.pid"
 
 if (-not (Test-Path $ConfigPath)) {
-    throw "QN990F Controller is not installed."
+    throw "Samsung TV Picture Controller is not installed."
 }
 
 $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 
-Write-Host "QN990F Controller configuration" -ForegroundColor Green
+Write-Host "Samsung TV Picture Controller configuration" -ForegroundColor Green
 Write-Host "Press Enter to keep the current value."
 
 $NewIp = Read-Host "TV IP [$($Config.tv_ip)]"

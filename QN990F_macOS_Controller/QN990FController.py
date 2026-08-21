@@ -28,6 +28,8 @@ TOKEN_FILE = APP_DIR / "samsung-token.txt"
 LOG_FILE = APP_DIR / "controller.log"
 STATUS_FILE = APP_DIR / "status.json"
 LOCK_FILE = APP_DIR / "controller.lock"
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUP_COUNT = 3
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
@@ -47,6 +49,7 @@ DEFAULT_CONFIG = {
     "mouse_motion_window_ms": 500,
     "socket_timeout_seconds": 5.0,
     "key_press_delay_seconds": 0.05,
+    "remote_name": "Samsung-TV-Picture-Controller",
     "smartthings_cli": str(APP_DIR / "smartthings"),
     "smartthings_no_browser_dir": str(APP_DIR / "noninteractive-bin"),
     "smartthings_profile": "local.qn990f.picture-controller",
@@ -57,7 +60,12 @@ DEFAULT_CONFIG = {
 logger = logging.getLogger("QN990FController")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    h = RotatingFileHandler(LOG_FILE, maxBytes=512_000, backupCount=2, encoding="utf-8")
+    h = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(h)
 
@@ -313,7 +321,10 @@ class MacOSBackend:
 def load_config():
     cfg = DEFAULT_CONFIG.copy()
     with CONFIG_FILE.open("r", encoding="utf-8-sig") as f:
-        cfg.update(json.load(f))
+        user_cfg = json.load(f)
+    cfg.update(user_cfg)
+    if "remote_name" not in user_cfg:
+        cfg["remote_name"] = "QN990F-Mac-Controller"
     cfg["control_method"] = str(cfg.get("control_method", "lan")).strip().lower()
     if cfg["control_method"] not in {"lan", "smartthings"}:
         raise ValueError("control_method must be 'lan' or 'smartthings'.")
@@ -337,6 +348,9 @@ def load_config():
     )
     cfg["socket_timeout_seconds"] = max(1.0, float(cfg.get("socket_timeout_seconds",5)))
     cfg["key_press_delay_seconds"] = max(0.0, float(cfg.get("key_press_delay_seconds",0.05)))
+    cfg["remote_name"] = str(cfg.get("remote_name", "")).strip()
+    if not cfg["remote_name"]:
+        raise ValueError("remote_name cannot be empty.")
     if cfg["control_method"] == "smartthings":
         cfg["smartthings_cli"] = str(cfg.get("smartthings_cli", "")).strip()
         cfg["smartthings_no_browser_dir"] = str(
@@ -406,6 +420,44 @@ def display_is_explicitly_required() -> bool:
     return False
 
 
+def windowserver_activity_is_hardware(output: str) -> bool:
+    pattern = re.compile(
+        r'^\s*pid\s+\d+\(WindowServer\):.*?'
+        r'(\d+):([0-5]\d):([0-5]\d)\s+UserIsActive named:\s*"([^"]+)"'
+    )
+    latest_age = None
+    latest_details = []
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match:
+            age = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + \
+                int(match.group(3))
+            if latest_age is None or age < latest_age:
+                latest_age = age
+                latest_details = [match.group(4)]
+            elif age == latest_age:
+                latest_details.append(match.group(4))
+    if latest_age is None or latest_age > 2:
+        return False
+    return all(
+        "serviceID:" in detail and "eventType:" in detail and
+        " process:" not in detail
+        for detail in latest_details
+    )
+
+
+def latest_pointer_activity_is_hardware() -> bool:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/pmset", "-g", "assertions"],
+            capture_output=True, text=True, timeout=1, check=False,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0 and \
+        windowserver_activity_is_hardware(completed.stdout)
+
+
 class TVClient:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -418,7 +470,7 @@ class TVClient:
             token_file=str(TOKEN_FILE),
             timeout=45.0 if pairing else float(self.cfg["socket_timeout_seconds"]),
             key_press_delay=float(self.cfg["key_press_delay_seconds"]),
-            name="QN990F-Mac-Controller"
+            name=str(self.cfg["remote_name"])
         )
 
     def pair(self):
@@ -559,9 +611,6 @@ class SmartThingsTVClient:
         if device.get("manufacturerName") != "Samsung Electronics" or \
            device.get("type") != "OCF":
             raise RuntimeError("Selected SmartThings device is not a Samsung OCF TV.")
-        model = str(device.get("ocf", {}).get("modelNumber", ""))
-        if "QN990F" not in model.upper():
-            raise RuntimeError(f"Selected SmartThings TV is not a QN990F: {model or 'unknown model'}.")
         return str(device.get("label") or device.get("name") or "Samsung TV")
 
     def _ensure_command_budget(self, needed):
@@ -717,7 +766,14 @@ class Controller:
                 logger.info("Input wake suppressed by hotkey source=%s", source)
                 return
             due = now + delay
-            if self.pending_input_wake_at <= 0.0 or due < self.pending_input_wake_at:
+            pending_is_mouse = self.pending_input_source.startswith("mouse_move:")
+            source_is_mouse = source.startswith("mouse_move:")
+            replace = self.pending_input_wake_at <= 0.0
+            if not replace and pending_is_mouse != source_is_mouse:
+                replace = pending_is_mouse and not source_is_mouse
+            elif not replace and pending_is_mouse == source_is_mouse:
+                replace = due < self.pending_input_wake_at
+            if replace:
                 self.pending_input_wake_at = due
                 self.pending_input_source = source
                 logger.info("Input wake scheduled in %d ms source=%s", int(delay * 1000), source)
@@ -753,6 +809,7 @@ class Controller:
             self.mouse_motion_total = total
             if total < threshold:
                 return ""
+            self.mouse_motion_last_time = 0.0
             self.mouse_motion_total = 0.0
 
         return (
@@ -796,7 +853,11 @@ class Controller:
         if suppressed:
             logger.info("Pending input wake cancelled by hotkey")
         elif due > 0.0:
-            self.wake("input", source=source)
+            if source.startswith("mouse_move:") and \
+               not latest_pointer_activity_is_hardware():
+                logger.info("Ignored unverified/non-hardware pointer wake source=%s", source)
+            else:
+                self.wake("input", source=source)
 
     def display_required(self):
         now = time.monotonic()
@@ -837,7 +898,7 @@ def acquire_lock():
         fcntl.flock(h.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         h.close()
-        raise RuntimeError("QN990F Controller is already running.")
+        raise RuntimeError("Samsung TV Picture Controller is already running.")
     return h
 
 

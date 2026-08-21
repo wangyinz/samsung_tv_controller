@@ -1,9 +1,9 @@
-QN990F macOS Picture Controller
-================================
+Samsung TV Picture Controller for macOS
+=======================================
 
 Features
 --------
-Makes a Samsung QN990F behave more like a conventional computer display on macOS:
+Makes a compatible Samsung TV behave more like a conventional computer display on macOS:
 
 1. Default global hotkey:
        Control + Command + P
@@ -21,6 +21,22 @@ Makes a Samsung QN990F behave more like a conventional computer display on macOS
    explicitly requests that the display remain on.
 
 
+Compatibility
+-------------
+This controller was developed and validated with a Samsung QN990F. It is not
+restricted to that model name.
+
+Direct LAN mode requires the encrypted Samsung Tizen WebSocket remote on TCP
+port 8002, firmware support for KEY_PICTURE_OFF, and support for the configured
+wake key (KEY_RETURN by default).
+
+SmartThings cloud mode lists Samsung OCF televisions that expose both the
+execute and samsungvd.remoteControl capabilities. Those capabilities indicate
+the required API shape, but they do not guarantee that a particular firmware
+will execute Picture Off. The installer therefore requires a visual Picture
+Off / restore test before it enables background startup.
+
+
 Connection Modes
 ----------------
 The installer asks you to choose one of these modes:
@@ -29,26 +45,27 @@ The installer asks you to choose one of these modes:
 
    The original mode. The Mac connects directly to TCP port 8002 on the TV and sends
    KEY_PICTURE_OFF / KEY_RETURN. This mode is faster and sends commands more directly
-   when the VPN allows access to the local network. It remains the installer's default.
+   when the Mac has direct access to the TV's local network. It remains the installer's
+   default.
 
 2. SmartThings cloud
 
-   Intended for cases where Cisco Secure Client routes the TV's LAN traffic through a
-   utun interface and the administrator has disabled Local LAN Access. The Mac accesses
-   only the public SmartThings HTTPS service, not the TV's 192.168.x.x address, so this
-   mode does not require changes to Cisco routes or security policies.
+   Intended for networks where a VPN, firewall, or managed policy blocks direct access
+   to the TV's private LAN address. The Mac accesses the public SmartThings HTTPS service
+   instead of connecting directly to the TV. This project does not modify routes or
+   bypass network security policy.
 
    Requirements:
    - macOS 13.5 or later
-   - The QN990F has been added to your SmartThings mobile app
+   - The Samsung TV has been added to your SmartThings mobile app
    - Both the TV and the Mac can access the internet
-   - The Cisco VPN does not block the SmartThings website or API
+   - The current network or VPN permits Samsung sign-in and SmartThings API access
 
-   Cloud mode reproduces the Picture Off button from Accessibility Mode in the
-   SmartThings mobile remote. It sends KEY_PICTURE_OFF / pressAndRelease through the
-   TV's OCF remote-control resource. It does not open the Accessibility menu or depend
-   on menu order. The next Mac input that meets the wake rules sends KEY_RETURN through
-   the same path after the picture has been turned off.
+   Cloud mode attempts the same KEY_PICTURE_OFF / pressAndRelease operation used by the
+   Picture Off button in Accessibility Mode of the SmartThings mobile remote. It writes
+   the TV's OCF remote-control resource through the exposed execute capability; it does
+   not open the Accessibility menu or depend on menu order. The next Mac input that
+   meets the wake rules sends KEY_RETURN through the same path.
 
 The two modes never fall back to each other silently. Rerun INSTALL.command to switch modes.
 
@@ -67,13 +84,13 @@ SmartThings cloud installation flow:
 - Explicitly choose option 2 (SmartThings cloud); option 1 (Direct LAN) remains the default
 - The installer downloads and verifies a pinned version of the official SmartThings CLI
 - A browser opens for Samsung/SmartThings OAuth sign-in
-- Select the QN990F
+- Select the compatible Samsung TV to control
 - A test command is sent only after you explicitly confirm in Terminal
 - Visually verify the Picture Off -> restore after approximately 2 seconds test
 
 Direct LAN installation flow:
 - Choose Direct LAN WebSocket
-- Enter the QN990F's LAN IP address
+- Enter the Samsung TV's LAN IP address
 - Choose Allow when the TV displays the pairing prompt
 - A test command is sent only after you explicitly confirm in Terminal
 - Visually verify the KEY_PICTURE_OFF -> KEY_RETURN test
@@ -111,11 +128,10 @@ The global hotkey uses macOS Carbon RegisterEventHotKey.
 Wake detection after Picture Off uses:
     CGEventSourceCounterForEventType(kCGEventSourceStateHIDSystemState, ...)
 
-The controller only compares cumulative macOS hardware-event counters for keyboard
-key-down, mouse-button down, scroll wheel, and mouse movement. It does not install an
-event tap or read specific keys, typed text, or event contents. Because it observes only
-the key-down counter, pressing Control, Command, Option, or Shift alone does not wake the
-picture.
+The controller compares cumulative macOS event counters for keyboard key-down,
+mouse-button down, scroll wheel, and mouse movement. It does not install an event tap or
+read specific keys, typed text, or event contents. Because it observes only the key-down
+counter, pressing Control, Command, Option, or Shift alone does not wake the picture.
 
 When the mouse-movement counter changes, the controller uses CGEventGetLocation to read
 the current pointer position. It accumulates movement in screen-coordinate points and
@@ -143,9 +159,12 @@ After Picture Off:
 Wake rules:
 - Pressing modifier keys such as Control, Command, Option, or Shift alone does not wake.
 - Mouse-button and scroll-wheel input wakes the picture.
-- Mouse or trackpad movement accumulates abs(dx) + abs(dy). Consecutive movement events
-  must be no more than 500 ms apart, and the total must reach 24 screen-coordinate points
-  before the picture wakes. Small movement below the threshold does not wake it.
+- Mouse or trackpad movement accumulates abs(dx) + abs(dy) while successive samples are
+  no more than 500 ms apart. The total must reach 24 screen-coordinate points before the
+  picture wakes, so small movement is ignored. Before waking, the controller uses pmset
+  to verify that
+  WindowServer attributes the latest activity to a device rather than a software process;
+  generated cursor movement from keep-awake utilities is ignored.
 - A short arbitration and guard interval follows hotkey activation, so the hotkey's own
   P key-down does not immediately wake the picture that was just turned off.
 
@@ -198,6 +217,10 @@ Option/Opt/Alt, and Shift.
 
 Files and Credentials
 ---------------------
+The QN990FController application-data directory, LaunchAgent label, and
+SmartThings profile are legacy internal identifiers retained to avoid breaking
+existing installations. They do not restrict TV model compatibility.
+
 ~/Library/Application Support/QN990FController/config.json
     Controller configuration; does not contain a SmartThings access token.
 
@@ -213,7 +236,8 @@ local.qn990f.picture-controller. Because the directory is shared SmartThings CLI
 uninstaller does not modify or sign out any profile.
 
 ~/Library/Application Support/QN990FController/controller.log
-    Controller log.
+    Rotating controller log. It is limited to controller.log plus three backups of at
+    most 1 MB each (about 4 MB total). Oldest entries are discarded automatically.
 
 ~/Library/Application Support/QN990FController/status.json
     Current or most recent runtime status.

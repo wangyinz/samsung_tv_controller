@@ -89,7 +89,7 @@ install_smartthings_cli() {
   TEMP_DIR=""
 }
 
-echo "QN990F macOS Picture Controller installer"
+echo "Samsung TV Picture Controller installer for macOS"
 echo
 echo "Default hotkey: Control + Command + P -> Picture Off"
 echo "After this controller blanks the TV: next deliberate keyboard/mouse input -> wake"
@@ -99,7 +99,7 @@ echo "No Accessibility or Input Monitoring permission is required."
 echo
 echo "Control connection:"
 echo "  1. Direct LAN WebSocket (original mode)"
-echo "  2. SmartThings cloud (works while Cisco VPN blocks the TV's LAN)"
+echo "  2. SmartThings cloud (for networks where a VPN or policy blocks TV LAN access)"
 
 if [[ ! -f "$SCRIPT_DIR/QN990FController.py" ]]; then
   echo "QN990FController.py is missing. Keep all extracted files together."
@@ -111,7 +111,7 @@ CONNECTION_CHOICE="${CONNECTION_CHOICE:-1}"
 case "$CONNECTION_CHOICE" in
   1|lan|LAN)
     CONTROL_METHOD="lan"
-    read -r -p "Enter the QN990F LAN IP address (example: 192.168.1.50): " TV_IP
+    read -r -p "Enter the Samsung TV LAN IP address (example: 192.168.1.50): " TV_IP
     TV_IP="${TV_IP//[[:space:]]/}"
     if [[ -z "$TV_IP" ]]; then
       echo "TV IP address cannot be empty."
@@ -151,6 +151,7 @@ HOTKEY="Ctrl+Cmd+P"
 mkdir -p "$APP_DIR" "$HOME/Library/LaunchAgents"
 stop_agent
 rm -f "$PLIST"
+rm -f "$APP_DIR/launchd.out.log" "$APP_DIR/launchd.err.log"
 
 step "Copying controller files"
 cp "$SCRIPT_DIR/QN990FController.py" "$CONTROLLER"
@@ -203,13 +204,10 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
     value = json.load(f)
 devices = value if isinstance(value, list) else value.get("items", [])
-def is_qn990f(device):
+def is_compatible_tv(device):
     if device.get("manufacturerName") != "Samsung Electronics":
         return False
     if device.get("type") != "OCF":
-        return False
-    model = str(device.get("ocf", {}).get("modelNumber", "")).upper()
-    if "QN990F" not in model:
         return False
     for component in device.get("components", []):
         if component.get("id") != "main":
@@ -222,15 +220,15 @@ def is_qn990f(device):
         if "execute" in ids and "samsungvd.remoteControl" in ids and "Television" in categories:
             return True
     return False
-devices = [device for device in devices if is_qn990f(device)]
+devices = [device for device in devices if is_compatible_tv(device)]
 with open(sys.argv[2], "w", encoding="utf-8") as f:
     json.dump(devices, f)
 print(len(devices))
 PY
 )"
   if [[ "$DEVICE_COUNT" == "0" ]]; then
-    echo "No QN990F with SmartThings OCF cloud control was found."
-    echo "Add the QN990F in the SmartThings mobile app, then rerun this installer."
+    echo "No compatible Samsung TV with SmartThings OCF cloud control was found."
+    echo "Add the TV in the SmartThings mobile app, then rerun this installer."
     exit 1
   fi
 
@@ -247,10 +245,10 @@ for index, device in enumerate(devices, 1):
 PY
 
   if [[ "$DEVICE_COUNT" == "1" ]]; then
-    read -r -p "Confirm this is the QN990F [1]: " DEVICE_CHOICE
+    read -r -p "Confirm this is the TV to control [1]: " DEVICE_CHOICE
     DEVICE_CHOICE="${DEVICE_CHOICE:-1}"
   else
-    read -r -p "Choose the QN990F: " DEVICE_CHOICE
+    read -r -p "Choose the TV to control: " DEVICE_CHOICE
   fi
   if ! [[ "$DEVICE_CHOICE" =~ ^[0-9]+$ ]] || \
      (( DEVICE_CHOICE < 1 || DEVICE_CHOICE > DEVICE_COUNT )); then
@@ -283,15 +281,30 @@ ENABLE_IDLE="true"
 if [[ "$IDLE" == "0" || "$IDLE" == "0.0" ]]; then
   ENABLE_IDLE="false"
 fi
+REMOTE_NAME="Samsung-TV-Picture-Controller"
+if [[ -f "$CONFIG" ]]; then
+  REMOTE_NAME="$("$PYTHON" - "$CONFIG" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8-sig") as f:
+        config = json.load(f)
+    value = str(config.get("remote_name", "")).strip()
+except (OSError, ValueError, TypeError):
+    value = ""
+print(value or "QN990F-Mac-Controller")
+PY
+)"
+fi
 
 "$PYTHON" - \
   "$CONFIG" "$CONTROL_METHOD" "$TV_IP" "$IDLE" "$HOTKEY" "$ENABLE_IDLE" \
   "$SMARTTHINGS" "$SMARTTHINGS_NO_BROWSER_DIR" \
-  "$SMARTTHINGS_PROFILE" "$SMARTTHINGS_DEVICE_ID" <<'PY'
+  "$SMARTTHINGS_PROFILE" "$SMARTTHINGS_DEVICE_ID" "$REMOTE_NAME" <<'PY'
 import json, sys
 (
     path, method, ip, idle, hotkey, enable_idle, smartthings_cli,
     smartthings_no_browser_dir, smartthings_profile, smartthings_device_id,
+    remote_name,
 ) = sys.argv[1:]
 config = {
     "control_method": method,
@@ -310,6 +323,7 @@ config = {
     "mouse_motion_window_ms": 500,
     "socket_timeout_seconds": 5.0,
     "key_press_delay_seconds": 0.05,
+    "remote_name": remote_name,
     "smartthings_cli": smartthings_cli,
     "smartthings_no_browser_dir": smartthings_no_browser_dir,
     "smartthings_profile": smartthings_profile,
@@ -329,11 +343,11 @@ echo "Current input idle time: ${IDLE_NOW}s"
 
 if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
   step "Validating SmartThings cloud control"
-  echo "Keep the QN990F on and connected to the internet."
+  echo "Keep the selected Samsung TV on and connected to the internet."
 else
   step "Pairing with the TV"
-  echo "Keep the QN990F on and on the same LAN/subnet as this Mac."
-  echo "When the TV asks whether to allow QN990F-Mac-Controller, choose Allow."
+  echo "Keep the Samsung TV on and on the same LAN/subnet as this Mac."
+  echo "When the TV asks whether to allow $REMOTE_NAME, choose Allow."
 fi
 "$PYTHON" "$CONTROLLER" --pair
 
@@ -381,9 +395,9 @@ cat > "$PLIST" <<PLIST
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>$APP_DIR/launchd.out.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>$APP_DIR/launchd.err.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>
 PLIST
@@ -398,7 +412,7 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   echo "LaunchAgent is loaded."
 else
   echo "Warning: LaunchAgent did not appear loaded."
-  echo "Check: $APP_DIR/launchd.err.log"
+  printf 'Check with: launchctl print "gui/%s/%s"\n' "$(id -u)" "$LABEL"
 fi
 
 echo

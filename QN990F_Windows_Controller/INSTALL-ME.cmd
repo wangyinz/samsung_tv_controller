@@ -1,5 +1,5 @@
 @echo off
-title QN990F Windows Picture Controller Installer
+title Samsung TV Picture Controller Installer
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-QN990FController.ps1"
 set "InstallerExitCode=%ERRORLEVEL%"
 echo.

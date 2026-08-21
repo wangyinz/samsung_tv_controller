@@ -5,7 +5,7 @@ APP_DIR="$HOME/Library/Application Support/QN990FController"
 CONTROLLER="$APP_DIR/QN990FController.py"
 PLIST="$HOME/Library/LaunchAgents/local.qn990f.picture-controller.plist"
 
-echo "Uninstalling QN990F macOS Controller..."
+echo "Uninstalling Samsung TV Picture Controller..."
 launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
 pkill -f "$CONTROLLER" >/dev/null 2>&1 || true
 rm -f "$PLIST"

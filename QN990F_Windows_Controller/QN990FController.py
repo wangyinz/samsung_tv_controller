@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QN990F Windows Picture Controller v3
+Samsung TV Picture Controller for Windows
 
 Key changes vs v1/v2:
 - Ctrl+Alt+P is always Picture Off (never a state-dependent toggle).
@@ -33,7 +33,7 @@ import time
 try:
     from samsungtvws import SamsungTVWS
 except ImportError:
-    print("samsungtvws is not installed. Run Install-QN990FController.ps1 first.", file=sys.stderr)
+    print("samsungtvws is not installed. Run INSTALL-ME.cmd first.", file=sys.stderr)
     raise
 
 if os.name != "nt":
@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
     "poll_interval_ms": 50,
     "socket_timeout_seconds": 5.0,
     "key_press_delay_seconds": 0.05,
+    "remote_name": "Samsung-TV-Picture-Controller",
     "connection_refresh_seconds": 8.0,
     "input_wake_debounce_ms": 180,
     "mouse_wake_threshold_counts": 24,
@@ -453,6 +454,8 @@ def load_config() -> dict:
     with CONFIG_FILE.open("r", encoding="utf-8-sig") as f:
         user_config = json.load(f)
     config.update(user_config)
+    if "remote_name" not in user_config:
+        config["remote_name"] = "QN990F-PC-Controller"
 
     config["tv_ip"] = str(config.get("tv_ip", "")).strip()
     if not config["tv_ip"]:
@@ -468,6 +471,9 @@ def load_config() -> dict:
     config["key_press_delay_seconds"] = max(
         0.0, float(config.get("key_press_delay_seconds", 0.05))
     )
+    config["remote_name"] = str(config.get("remote_name", "")).strip()
+    if not config["remote_name"]:
+        raise ValueError("remote_name cannot be empty.")
     config["connection_refresh_seconds"] = max(
         0.0, float(config.get("connection_refresh_seconds", 8.0))
     )
@@ -763,7 +769,7 @@ class TVClient:
             token_file=str(TOKEN_FILE),
             timeout=timeout,
             key_press_delay=float(self.config["key_press_delay_seconds"]),
-            name="QN990F-PC-Controller",
+            name=str(self.config["remote_name"]),
         )
 
     def pair(self) -> None:
@@ -1086,12 +1092,10 @@ class Controller:
                 last_time, old_total = self.mouse_motion.get(device, (0.0, 0))
                 if (now - last_time) <= window:
                     total = old_total + amount
-                else:
-                    total = amount
                 self.mouse_motion[device] = (now, total)
 
                 if total >= threshold:
-                    self.mouse_motion[device] = (now, 0)
+                    self.mouse_motion.pop(device, None)
                     qualified = True
 
             if qualified:
@@ -1198,7 +1202,7 @@ def acquire_single_instance() -> wintypes.HANDLE:
 
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
-        raise RuntimeError("QN990F Controller is already running.")
+        raise RuntimeError("Samsung TV Picture Controller is already running.")
     return handle
 
 
@@ -1321,7 +1325,7 @@ def run_daemon(config: dict) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="QN990F Windows Picture Controller v3"
+        description="Samsung TV Picture Controller for Windows"
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--pair", action="store_true")

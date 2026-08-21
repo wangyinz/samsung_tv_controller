@@ -106,6 +106,86 @@ class Clock:
         return self.value
 
 
+class LoggingConfigurationTests(unittest.TestCase):
+    def test_controller_log_has_bounded_retention(self):
+        handlers = [
+            handler
+            for handler in controller.logger.handlers
+            if isinstance(handler, controller.RotatingFileHandler)
+        ]
+
+        self.assertEqual(len(handlers), 1)
+        self.assertEqual(handlers[0].maxBytes, controller.LOG_MAX_BYTES)
+        self.assertEqual(handlers[0].backupCount, controller.LOG_BACKUP_COUNT)
+        self.assertEqual(controller.LOG_MAX_BYTES, 1_000_000)
+        self.assertEqual(controller.LOG_BACKUP_COUNT, 3)
+
+
+class InputSourceTests(unittest.TestCase):
+    def test_windowserver_hardware_activity_is_recognized(self):
+        output = (
+            'pid 396(WindowServer): [0x1] 00:00:00 UserIsActive named: '
+            '"com.apple.iohideventsystem.queue.tickle serviceID:100072bfa '
+            'service:AppleUserHIDEventService product:Razer Basilisk V3 Pro '
+            'eventType:17"'
+        )
+
+        self.assertTrue(controller.windowserver_activity_is_hardware(output))
+
+    def test_windowserver_process_activity_is_rejected(self):
+        output = (
+            'pid 396(WindowServer): [0x1] 00:00:00 UserIsActive named: '
+            '"com.apple.iohideventsystem.queue.tickle service:IOHIDSystem '
+            'pid:1576 process:Amphetamine"'
+        )
+
+        self.assertFalse(controller.windowserver_activity_is_hardware(output))
+
+    def test_stale_windowserver_hardware_activity_is_rejected(self):
+        output = (
+            'pid 396(WindowServer): [0x1] 00:00:03 UserIsActive named: '
+            '"com.apple.iohideventsystem.queue.tickle serviceID:100072bfa '
+            'service:AppleUserHIDEventService product:Razer Basilisk V3 Pro '
+            'eventType:17"'
+        )
+
+        self.assertFalse(controller.windowserver_activity_is_hardware(output))
+
+    def test_same_age_mixed_activity_is_rejected_in_either_order(self):
+        hardware = (
+            'pid 396(WindowServer): [0x1] 00:00:00 UserIsActive named: '
+            '"com.apple.iohideventsystem.queue.tickle serviceID:100072bfa '
+            'service:AppleUserHIDEventService product:Razer Basilisk V3 Pro '
+            'eventType:17"'
+        )
+        software = (
+            'pid 396(WindowServer): [0x2] 00:00:00 UserIsActive named: '
+            '"com.apple.iohideventsystem.queue.tickle service:IOHIDSystem '
+            'pid:1576 process:Amphetamine"'
+        )
+
+        for output in (f"{hardware}\n{software}", f"{software}\n{hardware}"):
+            with self.subTest(output=output):
+                self.assertFalse(controller.windowserver_activity_is_hardware(output))
+
+    def test_pointer_source_check_fails_closed(self):
+        cases = [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="failed"),
+            subprocess.CompletedProcess([], 0, stdout="unexpected output", stderr=""),
+        ]
+        for completed in cases:
+            with self.subTest(returncode=completed.returncode, stdout=completed.stdout), \
+                 mock.patch.object(controller.subprocess, "run", return_value=completed):
+                self.assertFalse(controller.latest_pointer_activity_is_hardware())
+
+        with mock.patch.object(
+            controller.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["pmset"], 1),
+        ):
+            self.assertFalse(controller.latest_pointer_activity_is_hardware())
+
+
 class MacOSBackendTests(unittest.TestCase):
     def test_manual_carbon_pump_dispatches_and_releases_event(self):
         calls = []
@@ -186,6 +266,19 @@ class MacOSBackendTests(unittest.TestCase):
             self.assertEqual(backend.poll_input_events(), [])
 
 
+class LANClientTests(unittest.TestCase):
+    def test_new_config_uses_generic_remote_name(self):
+        config = controller_config("lan")
+
+        with mock.patch.object(controller, "SamsungTVWS") as samsung_tv:
+            controller.TVClient(config)._new()
+
+        self.assertEqual(
+            samsung_tv.call_args.kwargs["name"],
+            "Samsung-TV-Picture-Controller",
+        )
+
+
 class SmartThingsTVClientTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -244,7 +337,7 @@ class SmartThingsTVClientTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["PATH"], self.temp_dir.name)
         self.assertNotIn("shell", kwargs)
 
-    def test_pair_accepts_actual_qn990f_shape_with_null_device_type_name(self):
+    def test_pair_accepts_samsung_ocf_tv_shape_with_null_device_type_name(self):
         device = {
             "label": '65" Neo QLED 8K',
             "manufacturerName": "Samsung Electronics",
@@ -265,6 +358,27 @@ class SmartThingsTVClientTests(unittest.TestCase):
         with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
             self.assertEqual(self.client.pair(), '65" Neo QLED 8K')
 
+    def test_pair_accepts_compatible_non_qn990f_model(self):
+        device = {
+            "label": "Living Room TV",
+            "manufacturerName": "Samsung Electronics",
+            "deviceTypeName": None,
+            "type": "OCF",
+            "ocf": {"modelNumber": "QE65S95FAUXZA"},
+            "components": [
+                {
+                    "id": "main",
+                    "capabilities": [
+                        {"id": "execute", "version": 1},
+                        {"id": "samsungvd.remoteControl", "version": 1},
+                    ],
+                    "categories": [{"name": "Television"}],
+                }
+            ],
+        }
+        with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
+            self.assertEqual(self.client.pair(), "Living Room TV")
+
     def test_pair_rejects_device_without_execute_capability(self):
         device = {
             "manufacturerName": "Samsung Electronics",
@@ -276,7 +390,7 @@ class SmartThingsTVClientTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "does not expose SmartThings TV"):
                 self.client.pair()
 
-    def test_pair_rejects_qn990f_light_sensor_child_device(self):
+    def test_pair_rejects_light_sensor_child_device(self):
         device = {
             "manufacturerName": "Samsung Electronics",
             "type": "OCF",
@@ -313,6 +427,28 @@ class CloudConfigTests(unittest.TestCase):
 
         self.assertEqual(loaded["idle_minutes"], 7.5)
         self.assertTrue(loaded["enable_idle_off"])
+
+    def test_legacy_lan_config_keeps_existing_pairing_identity(self):
+        config = {
+            **controller.DEFAULT_CONFIG,
+            "control_method": "lan",
+            "tv_ip": "192.0.2.10",
+        }
+        config.pop("remote_name")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config.json"
+            config_file.write_text(json.dumps(config), encoding="utf-8")
+
+            class BackendWithoutFrameworks:
+                def parse_hotkey(self, _spec):
+                    return 0, 0
+
+            with mock.patch.object(controller, "CONFIG_FILE", config_file), \
+                 mock.patch.object(controller, "MacOSBackend", BackendWithoutFrameworks):
+                loaded = controller.load_config()
+
+        self.assertEqual(loaded["remote_name"], "QN990F-Mac-Controller")
 
 
 class ControllerInputTests(unittest.TestCase):
@@ -383,7 +519,10 @@ class ControllerInputTests(unittest.TestCase):
             self.assertEqual(instance.tv.sent, [])
 
             clock.value = 1.58
-            instance._process_pending_wake(1.58)
+            with mock.patch.object(
+                controller, "latest_pointer_activity_is_hardware", return_value=True
+            ):
+                instance._process_pending_wake(1.58)
 
         self.assertFalse(instance.is_off())
         self.assertEqual(instance.tv.sent, ["KEY_RETURN"])
@@ -402,6 +541,72 @@ class ControllerInputTests(unittest.TestCase):
         self.assertEqual(instance.mouse_motion_total, 5.0)
         self.assertEqual(instance.pending_input_wake_at, 0.0)
         self.assertEqual(instance.tv.sent, [])
+
+    def test_software_cursor_warp_does_not_wake_picture(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock), \
+             mock.patch.object(
+                 controller, "latest_pointer_activity_is_hardware", return_value=False
+             ):
+            instance.handle_input(
+                {"kind": "mouse_move", "dx": 720.448, "dy": -1176.762}
+            )
+            self.assertAlmostEqual(instance.pending_input_wake_at, 1.18)
+            clock.value = 1.5
+            instance._process_pending_wake(clock.value)
+
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertTrue(instance.is_off())
+        self.assertEqual(instance.tv.sent, [])
+
+    def test_single_large_mouse_sample_qualifies_motion(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "mouse_move", "dx": 30, "dy": 0})
+
+        self.assertAlmostEqual(instance.pending_input_wake_at, 1.18)
+        self.assertIn("sum=30", instance.pending_input_source)
+
+    def test_periodic_software_cursor_warps_do_not_wake(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock), \
+             mock.patch.object(
+                 controller, "latest_pointer_activity_is_hardware", return_value=False
+             ):
+            instance.handle_input({"kind": "mouse_move", "dx": 800, "dy": 500})
+            clock.value = 1.18
+            instance._process_pending_wake(clock.value)
+            clock.value = 61.0
+            instance.handle_input({"kind": "mouse_move", "dx": -800, "dy": -500})
+            clock.value = 61.18
+            instance._process_pending_wake(clock.value)
+
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertEqual(instance.tv.sent, [])
+
+    def test_zero_distance_threshold_qualifies_first_nonzero_sample(self):
+        instance, _backend = self.make_controller()
+        instance.cfg["mouse_wake_threshold_counts"] = 0
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_input({"kind": "mouse_move", "dx": 1, "dy": 0})
+
+        self.assertAlmostEqual(instance.pending_input_wake_at, 1.18)
 
     def test_button_debounce_can_replace_a_later_keyboard_wake(self):
         instance, _backend = self.make_controller()
@@ -422,6 +627,32 @@ class ControllerInputTests(unittest.TestCase):
 
         self.assertAlmostEqual(instance.pending_input_wake_at, 1.13)
         self.assertEqual(instance.pending_input_source, "mouse_button")
+
+    def test_trusted_key_replaces_pending_unverified_mouse_wake(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock), \
+             mock.patch.object(
+                 controller,
+                 "latest_pointer_activity_is_hardware",
+                 side_effect=AssertionError("trusted input must bypass pointer verification"),
+             ):
+            instance.handle_input({"kind": "mouse_move", "dx": 30, "dy": 0})
+            self.assertAlmostEqual(instance.pending_input_wake_at, 1.18)
+
+            clock.value = 1.05
+            instance.handle_input({"kind": "keyboard"})
+            self.assertAlmostEqual(instance.pending_input_wake_at, 1.23)
+            self.assertEqual(instance.pending_input_source, "keyboard:key_down")
+
+            clock.value = 1.23
+            instance._process_pending_wake(clock.value)
+
+        self.assertFalse(instance.is_off())
+        self.assertEqual(instance.tv.sent, ["KEY_RETURN"])
 
     def test_wake_guard_discards_input_before_qualification(self):
         instance, _backend = self.make_controller()
