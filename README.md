@@ -19,8 +19,9 @@ monitor.
 ## Features
 
 - Global, configurable `Picture Off` hotkey.
-- Automatic picture restore after qualifying keyboard, mouse, or trackpad input.
-- Anti-jitter filtering so tiny pointer movement does not wake the picture.
+- Automatic picture restore after qualifying keyboard or mouse input.
+- Raw-motion anti-jitter filtering on Windows; macOS ignores pointer movement by
+  default to prevent unattended software-generated wake events.
 - Optional automatic `Picture Off` after a configurable period of input inactivity.
 - Protection against idle blanking while media or presentation software requests
   that the display remain awake.
@@ -61,9 +62,9 @@ settings. Reports for additional models are welcome.
 | Direct LAN WebSocket | Yes | Yes |
 | SmartThings cloud | Yes | No |
 | Default hotkey | `Control+Command+P` | `Ctrl+Alt+P` |
-| Intentional input wake | Keyboard, button, wheel, pointer movement | Keyboard, button, wheel, pointer movement |
-| Pointer anti-jitter | 24 screen-coordinate points within 500 ms | 24 Raw Input counts per device within 500 ms |
-| Software-generated pointer filtering | WindowServer source verification | Raw Input excludes ordinary `SendInput`-style activity |
+| Intentional input wake | Keyboard, mouse button, or wheel | Keyboard, button, wheel, or pointer movement |
+| Pointer anti-jitter | Pointer movement disabled by default | 24 Raw Input counts per device within 500 ms |
+| Software-generated pointer filtering | Prevented by disabling movement-only wake | Raw Input excludes ordinary `SendInput`-style activity |
 | Per-device input exclusion | No | Yes, by Raw Input device-path substring |
 | Media/presentation protection | macOS display power assertions | Windows `ES_DISPLAY_REQUIRED` |
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
@@ -158,11 +159,16 @@ Press the configured hotkey to blank the picture:
 - macOS default: `Control+Command+P`
 - Windows default: `Ctrl+Alt+P`
 
-Afterward, press a non-modifier key, click a mouse button, use the wheel, or move
-the pointer deliberately to restore the picture. Modifier keys alone do not
-wake it. Pointer motion must cross the anti-jitter threshold; on macOS, the most
-recent pointer activity must also be attributed to hardware rather than a
-software process.
+Afterward, press a non-modifier key, click a mouse button, or use the wheel to
+restore the picture. On Windows, deliberate pointer movement also wakes after
+crossing the anti-jitter threshold. Modifier keys alone do not wake it.
+
+Pointer movement alone is disabled as a wake source on macOS by default. The
+zero-permission macOS event counters include cursor movement posted by software,
+and the operating system does not provide reliable source attribution without
+Input Monitoring access. Advanced users can set `enable_mouse_move_wake` to
+`true` in `config.json` and restart the controller, but software-generated
+movement may then wake the TV.
 
 The optional idle mode sends `Picture Off` after the configured number of
 minutes without keyboard or mouse input. Set the interval to `0` to disable it.
@@ -254,8 +260,9 @@ archive checksum.
 - Check `controller.log` for the qualifying input category.
 - On Windows, the log includes the Raw Input device path. Add a unique substring
   to `ignored_input_device_substrings` only after identifying the noisy device.
-- On macOS, small and software-attributed pointer movement is filtered, but a
-  real hardware event that crosses the configured threshold is expected to wake.
+- On macOS, pointer movement alone is ignored by default. Check whether
+  `enable_mouse_move_wake` was manually enabled if the log reports a
+  `mouse_move` wake.
 
 ### Picture Off works but restore does not
 

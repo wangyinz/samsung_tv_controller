@@ -92,8 +92,8 @@ install_smartthings_cli() {
 echo "Samsung TV Picture Controller installer for macOS"
 echo
 echo "Default hotkey: Control + Command + P -> Picture Off"
-echo "After this controller blanks the TV: next deliberate keyboard/mouse input -> wake"
-echo "Tiny pointer movements are ignored until they accumulate past the wake threshold."
+echo "After this controller blanks the TV: key, mouse button, or wheel input -> wake"
+echo "Pointer movement alone is ignored to prevent unattended synthetic wake events."
 echo
 echo "No Accessibility or Input Monitoring permission is required."
 echo
@@ -319,6 +319,7 @@ config = {
     "wake_guard_ms": 800,
     "poll_interval_ms": 50,
     "input_wake_debounce_ms": 180,
+    "enable_mouse_move_wake": False,
     "mouse_wake_threshold_counts": 24,
     "mouse_motion_window_ms": 500,
     "socket_timeout_seconds": 5.0,
@@ -423,7 +424,7 @@ if [[ "$ENABLE_IDLE" == "true" ]]; then
 else
   echo "  Automatic blank: disabled"
 fi
-echo "  Wake:            key/button/wheel, or intentional pointer movement"
+echo "  Wake:            key, mouse button, or wheel"
 if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
   echo "  Connection:      SmartThings cloud ($SMARTTHINGS_DEVICE_LABEL)"
 else

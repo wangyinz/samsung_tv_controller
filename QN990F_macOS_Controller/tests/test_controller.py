@@ -450,6 +450,28 @@ class CloudConfigTests(unittest.TestCase):
 
         self.assertEqual(loaded["remote_name"], "QN990F-Mac-Controller")
 
+    def test_existing_config_defaults_mouse_movement_wake_to_disabled(self):
+        config = {
+            **controller.DEFAULT_CONFIG,
+            "control_method": "lan",
+            "tv_ip": "192.0.2.10",
+        }
+        config.pop("enable_mouse_move_wake")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config.json"
+            config_file.write_text(json.dumps(config), encoding="utf-8")
+
+            class BackendWithoutFrameworks:
+                def parse_hotkey(self, _spec):
+                    return 0, 0
+
+            with mock.patch.object(controller, "CONFIG_FILE", config_file), \
+                 mock.patch.object(controller, "MacOSBackend", BackendWithoutFrameworks):
+                loaded = controller.load_config()
+
+        self.assertFalse(loaded["enable_mouse_move_wake"])
+
 
 class ControllerInputTests(unittest.TestCase):
     def setUp(self):
@@ -465,6 +487,10 @@ class ControllerInputTests(unittest.TestCase):
         )
         instance.tv = tv or RecordingTV()
         return instance, backend
+
+    @staticmethod
+    def enable_mouse_move_wake(instance):
+        instance.cfg["enable_mouse_move_wake"] = True
 
     def test_hotkey_is_one_way_picture_off_even_when_already_off(self):
         instance, backend = self.make_controller()
@@ -499,6 +525,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_micro_mouse_motion_must_accumulate_to_threshold(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.set_off(True)
         instance.wake_not_before = 0.0
         clock = Clock(1.0)
@@ -529,6 +556,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_mouse_motion_window_discards_old_accumulation(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.set_off(True)
         instance.wake_not_before = 0.0
         clock = Clock(1.0)
@@ -544,6 +572,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_software_cursor_warp_does_not_wake_picture(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.set_off(True)
         instance.wake_not_before = 0.0
         clock = Clock(1.0)
@@ -565,6 +594,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_single_large_mouse_sample_qualifies_motion(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.set_off(True)
         instance.wake_not_before = 0.0
         clock = Clock(1.0)
@@ -577,6 +607,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_periodic_software_cursor_warps_do_not_wake(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.set_off(True)
         instance.wake_not_before = 0.0
         clock = Clock(1.0)
@@ -598,6 +629,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_zero_distance_threshold_qualifies_first_nonzero_sample(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.cfg["mouse_wake_threshold_counts"] = 0
         instance.set_off(True)
         instance.wake_not_before = 0.0
@@ -630,6 +662,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_trusted_key_replaces_pending_unverified_mouse_wake(self):
         instance, _backend = self.make_controller()
+        self.enable_mouse_move_wake(instance)
         instance.set_off(True)
         instance.wake_not_before = 0.0
         clock = Clock(1.0)
@@ -653,6 +686,28 @@ class ControllerInputTests(unittest.TestCase):
 
         self.assertFalse(instance.is_off())
         self.assertEqual(instance.tv.sent, ["KEY_RETURN"])
+
+    def test_mouse_movement_wake_is_disabled_by_default(self):
+        instance, _backend = self.make_controller()
+        instance.set_off(True)
+        instance.wake_not_before = 0.0
+        clock = Clock(1.0)
+
+        with mock.patch.object(controller.time, "monotonic", clock), \
+             mock.patch.object(
+                 controller,
+                 "latest_pointer_activity_is_hardware",
+                 side_effect=AssertionError("disabled movement must not be verified"),
+             ):
+            instance.handle_input(
+                {"kind": "mouse_move", "dx": 1200, "dy": -900}
+            )
+            instance._process_pending_wake(2.0)
+
+        self.assertTrue(instance.is_off())
+        self.assertEqual(instance.pending_input_wake_at, 0.0)
+        self.assertEqual(instance.mouse_motion_total, 0.0)
+        self.assertEqual(instance.tv.sent, [])
 
     def test_wake_guard_discards_input_before_qualification(self):
         instance, _backend = self.make_controller()

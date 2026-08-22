@@ -129,14 +129,19 @@ Wake detection after Picture Off uses:
     CGEventSourceCounterForEventType(kCGEventSourceStateHIDSystemState, ...)
 
 The controller compares cumulative macOS event counters for keyboard key-down,
-mouse-button down, scroll wheel, and mouse movement. It does not install an event tap or
-read specific keys, typed text, or event contents. Because it observes only the key-down
-counter, pressing Control, Command, Option, or Shift alone does not wake the picture.
+mouse-button down, and scroll-wheel input. It also observes mouse movement only when the
+advanced enable_mouse_move_wake setting is explicitly enabled. It does not install an
+event tap or read specific keys, typed text, or event contents. Because it observes only
+the key-down counter, pressing Control, Command, Option, or Shift alone does not wake the
+picture.
 
-When the mouse-movement counter changes, the controller uses CGEventGetLocation to read
-the current pointer position. It accumulates movement in screen-coordinate points and
-filters small jitter. It cannot read per-device raw dx/dy values or device paths, so the
-macOS version cannot log or ignore a particular keyboard or mouse as Windows Raw Input can.
+Pointer movement alone is disabled as a wake source by default. macOS includes
+software-posted cursor movement in the zero-permission counters, but does not provide
+reliable source attribution without Input Monitoring access. If movement wake is manually
+enabled, the controller uses CGEventGetLocation to accumulate movement in
+screen-coordinate points and applies a best-effort source check. It cannot read per-device
+raw dx/dy values or device paths, so the macOS version cannot reliably distinguish every
+synthetic movement or ignore a particular device as Windows Raw Input can.
 
 Automatic idle Picture Off uses this API separately:
     CGEventSourceSecondsSinceLastEventType(..., kCGAnyInputEventType)
@@ -152,19 +157,19 @@ Control + Command + P:
     sends Picture Off again. It does not restore the picture and is not a toggle.
 
 After Picture Off:
-    Press a non-modifier key, click a mouse button, use the scroll wheel, or deliberately
-    move the mouse or trackpad
+    Press a non-modifier key, click a mouse button, or use the scroll wheel
     -> The picture is restored automatically.
 
 Wake rules:
 - Pressing modifier keys such as Control, Command, Option, or Shift alone does not wake.
 - Mouse-button and scroll-wheel input wakes the picture.
-- Mouse or trackpad movement accumulates abs(dx) + abs(dy) while successive samples are
-  no more than 500 ms apart. The total must reach 24 screen-coordinate points before the
-  picture wakes, so small movement is ignored. Before waking, the controller uses pmset
-  to verify that
-  WindowServer attributes the latest activity to a device rather than a software process;
-  generated cursor movement from keep-awake utilities is ignored.
+- Mouse or trackpad movement alone does not wake by default. This prevents keep-awake
+  utilities and other software-generated movement from waking the TV unattended.
+- Advanced opt-in: set "enable_mouse_move_wake": true in config.json to restore the
+  movement threshold, then run Configure.command to restart the controller. Movement then
+  accumulates abs(dx) + abs(dy) while successive samples are no more than 500 ms apart, and
+  must reach 24 screen-coordinate points. macOS source attribution is best-effort, so
+  synthetic movement may still wake the TV in this mode.
 - A short arbitration and guard interval follows hotkey activation, so the hotkey's own
   P key-down does not immediately wake the picture that was just turned off.
 
@@ -264,8 +269,8 @@ Important Limitations
 4. SmartThings rate-limits each device; avoid switching the picture repeatedly in quick
    succession during normal use. The controller does not retry an automatic idle Picture
    Off command in a loop after it fails. It is re-enabled only after detecting new keyboard
-   or mouse input that meets the wake rules. Small movement below the threshold does not
-   re-enable it.
+   or mouse input that meets the wake rules. Pointer movement does not re-enable it unless
+   movement wake was explicitly enabled.
 
 5. When SmartThings credentials expire, background commands fail within a bounded period
    instead of opening a browser. Run Configure.command to sign in interactively again and
@@ -278,10 +283,11 @@ Important Limitations
    turned off the picture. The controller may not know the current state when the picture
    is turned off through the TV menu, Bixby, or another device.
 
-8. The zero-permission movement threshold on macOS is measured in screen-coordinate points,
-   not Windows per-device raw motion counts. Movement farther toward a display edge may not
-   count while the pointer remains pinned to the edge. The macOS version also cannot filter
-   input by device.
+8. If movement wake is explicitly enabled, its zero-permission threshold is measured in
+   screen-coordinate points, not Windows per-device raw motion counts. Movement farther
+   toward a display edge may not count while the pointer remains pinned to the edge. The
+   macOS version also cannot filter input by device or reliably attribute every synthetic
+   cursor event.
 
 
 Manual Tests

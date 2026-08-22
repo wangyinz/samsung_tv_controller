@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "wake_guard_ms": 800,
     "poll_interval_ms": 50,
     "input_wake_debounce_ms": 180,
+    "enable_mouse_move_wake": False,
     "mouse_wake_threshold_counts": 24,
     "mouse_motion_window_ms": 500,
     "socket_timeout_seconds": 5.0,
@@ -339,6 +340,9 @@ def load_config():
     cfg["poll_interval_ms"] = max(25, int(cfg.get("poll_interval_ms",50)))
     cfg["input_wake_debounce_ms"] = max(
         50, int(cfg.get("input_wake_debounce_ms",180))
+    )
+    cfg["enable_mouse_move_wake"] = bool(
+        cfg.get("enable_mouse_move_wake", False)
     )
     cfg["mouse_wake_threshold_counts"] = max(
         0, int(cfg.get("mouse_wake_threshold_counts",24))
@@ -787,6 +791,8 @@ class Controller:
         if kind == "mouse_wheel":
             return "mouse_wheel"
         if kind != "mouse_move":
+            return ""
+        if not self.cfg["enable_mouse_move_wake"]:
             return ""
 
         dx = float(event.get("dx", 0.0))
