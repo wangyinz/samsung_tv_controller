@@ -31,10 +31,12 @@ Wake detection uses Windows Raw Input (WM_INPUT):
 - Keyboard: a non-modifier key-down qualifies. Pressing only Ctrl, Alt, Shift,
   Win, or a lock key does not wake the TV.
 - Mouse: a button press or vertical/horizontal wheel input qualifies.
-- Mouse motion: abs(dx) + abs(dy) is accumulated separately for each input
-  device while successive events stay no more than 500 ms apart. The total must
-  reach 24 raw motion counts. Tiny sensor jitter below that threshold does not
-  wake the TV.
+- Mouse motion alone does not wake by default. This prevents unattended motion
+  from noisy, virtual, or automated pointing devices.
+- Advanced opt-in: set "enable_mouse_move_wake": true in config.json and
+  restart the controller. Raw abs(dx) + abs(dy) is then accumulated separately
+  for each input device while successive events stay no more than 500 ms apart.
+  The total must reach 24 raw motion counts.
 - The configured hotkey is arbitrated so its final key-down cannot immediately
   wake the picture it just turned off.
 
@@ -42,7 +44,8 @@ Keyboard/mouse wake is briefly debounced, and begins only after the post-blank
 wake guard. GetLastInputInfo is used only for optional idle-auto-OFF timing; it
 is not used to decide whether an input should wake the picture.
 
-Every qualifying wake is logged with its Raw Input device path, for example:
+Every qualifying wake is logged with its Raw Input device path. If movement
+wake was explicitly enabled, a movement record looks like:
 
     Picture wake (raw_input) source=mouse_move:... device=\\?\HID#VID_...
 
@@ -112,8 +115,8 @@ Ctrl+Alt+P
     Picture Off again; it never acts as a wake/toggle command.
 
 After Picture Off:
-    Press a non-modifier key, press a mouse button, use the wheel, or move the
-    mouse far enough to cross the anti-jitter threshold -> wake picture.
+    Press a non-modifier key, press a mouse button, or use the wheel
+    -> wake picture.
 
 Automatic idle behavior:
     After the configured idle time, KEY_PICTURE_OFF is sent.
@@ -137,8 +140,9 @@ Examples:
     Ctrl+Alt+O
     Ctrl+Shift+9
 
-Advanced input thresholds and ignored device substrings can be edited directly
-in config.json. Restart the controller after a manual edit.
+Advanced input settings and ignored device substrings can be edited directly in
+config.json. Set "enable_mouse_move_wake": true to opt into raw mouse-motion
+wake and its configured threshold. Restart the controller after a manual edit.
 
 
 FILES

@@ -7,7 +7,8 @@ Key changes vs v1/v2:
 - Picture wake is driven by Win32 Raw Input (WM_INPUT), not by changes in
   GetLastInputInfo(). This lets us identify the input device and avoids
   treating arbitrary timestamp changes / SendInput-style activity as a wake.
-- Tiny raw mouse motion must cross a configurable threshold before waking.
+- Mouse movement alone is ignored by default; an advanced opt-in applies a
+  configurable raw-motion threshold.
 - Qualifying wake events are logged with the raw device path.
 - GetLastInputInfo remains only for optional idle-auto-off timing.
 - A Samsung WebSocket that has sat idle is proactively discarded before a key
@@ -64,6 +65,7 @@ DEFAULT_CONFIG = {
     "remote_name": "Samsung-TV-Picture-Controller",
     "connection_refresh_seconds": 8.0,
     "input_wake_debounce_ms": 180,
+    "enable_mouse_move_wake": False,
     "mouse_wake_threshold_counts": 24,
     "mouse_motion_window_ms": 500,
     "ignored_input_device_substrings": [],
@@ -362,8 +364,7 @@ powrprof.CallNtPowerInformation.restype = wintypes.ULONG
 
 def self_test_structures() -> tuple[bool, str]:
     """
-    Catch ctypes layout/anonymous-field mistakes before the daemon starts.
-    This exact check would have failed in v3.
+    Catch ctypes layout and default input-policy regressions before install.
     """
     try:
         mouse = RAWMOUSE()
@@ -384,9 +385,29 @@ def self_test_structures() -> tuple[bool, str]:
         if size != 24:
             return False, f"Unexpected RAWMOUSE size {size}; expected 24"
 
-        return True, f"RAWMOUSE ctypes self-test passed (size={size})"
+        probe_config = DEFAULT_CONFIG.copy()
+        probe_config["tv_ip"] = "127.0.0.1"
+        probe = Controller(probe_config)
+        probe._set_picture_off_state(True)
+        probe.handle_raw_input(
+            {"kind": "mouse_move", "device": "self-test", "dx": 1000, "dy": 1000}
+        )
+        if probe.pending_input_wake_at != 0.0 or probe.mouse_motion:
+            return False, "Default mouse-movement wake suppression failed"
+
+        probe.config["enable_mouse_move_wake"] = True
+        probe.handle_raw_input(
+            {"kind": "mouse_move", "device": "self-test", "dx": 1000, "dy": 1000}
+        )
+        if probe.pending_input_wake_at <= 0.0:
+            return False, "Opt-in mouse-movement wake self-test failed"
+
+        return True, (
+            f"Controller self-test passed (RAWMOUSE size={size}; "
+            "mouse movement disabled by default)"
+        )
     except Exception as exc:
-        return False, f"RAWMOUSE ctypes self-test failed: {exc!r}"
+        return False, f"Controller self-test failed: {exc!r}"
 
 
 # ---------------- General helpers ----------------
@@ -479,6 +500,9 @@ def load_config() -> dict:
     )
     config["input_wake_debounce_ms"] = max(
         50, int(config.get("input_wake_debounce_ms", 180))
+    )
+    config["enable_mouse_move_wake"] = bool(
+        config.get("enable_mouse_move_wake", False)
     )
     config["mouse_wake_threshold_counts"] = max(
         0, int(config.get("mouse_wake_threshold_counts", 24))
@@ -1070,6 +1094,9 @@ class Controller:
             return
 
         if kind == "mouse_move":
+            if not self.config["enable_mouse_move_wake"]:
+                return
+
             dx = int(event.get("dx", 0))
             dy = int(event.get("dy", 0))
             amount = abs(dx) + abs(dy)
@@ -1263,12 +1290,13 @@ def run_daemon(config: dict) -> int:
 
         logger.info(
             "Controller v3.1 started. TV=%s:%s hotkey=%s idle=%s min auto=%s "
-            "mouse_threshold=%s",
+            "mouse_move_wake=%s mouse_threshold=%s",
             config["tv_ip"],
             config["port"],
             config["hotkey"],
             config["idle_minutes"],
             config["enable_idle_off"],
+            config["enable_mouse_move_wake"],
             config["mouse_wake_threshold_counts"],
         )
         write_status(

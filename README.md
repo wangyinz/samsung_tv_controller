@@ -20,8 +20,8 @@ monitor.
 
 - Global, configurable `Picture Off` hotkey.
 - Automatic picture restore after qualifying keyboard or mouse input.
-- Raw-motion anti-jitter filtering on Windows; macOS ignores pointer movement by
-  default to prevent unattended software-generated wake events.
+- Pointer movement alone is ignored by default on both platforms to prevent
+  unattended wake events; an advanced opt-in retains anti-jitter filtering.
 - Optional automatic `Picture Off` after a configurable period of input inactivity.
 - Protection against idle blanking while media or presentation software requests
   that the display remain awake.
@@ -62,9 +62,9 @@ settings. Reports for additional models are welcome.
 | Direct LAN WebSocket | Yes | Yes |
 | SmartThings cloud | Yes | No |
 | Default hotkey | `Control+Command+P` | `Ctrl+Alt+P` |
-| Intentional input wake | Keyboard, mouse button, or wheel | Keyboard, button, wheel, or pointer movement |
-| Pointer anti-jitter | Pointer movement disabled by default | 24 Raw Input counts per device within 500 ms |
-| Software-generated pointer filtering | Prevented by disabling movement-only wake | Raw Input excludes ordinary `SendInput`-style activity |
+| Intentional input wake | Keyboard, mouse button, or wheel | Keyboard, mouse button, or wheel |
+| Pointer anti-jitter | Disabled by default; optional 24 screen-coordinate points within 500 ms | Disabled by default; optional 24 Raw Input counts per device within 500 ms |
+| Software-generated pointer filtering | Prevented by disabling movement-only wake | Prevented by disabling movement-only wake; optional Raw Input excludes ordinary `SendInput`-style activity |
 | Per-device input exclusion | No | Yes, by Raw Input device-path substring |
 | Media/presentation protection | macOS display power assertions | Windows `ES_DISPLAY_REQUIRED` |
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
@@ -160,15 +160,15 @@ Press the configured hotkey to blank the picture:
 - Windows default: `Ctrl+Alt+P`
 
 Afterward, press a non-modifier key, click a mouse button, or use the wheel to
-restore the picture. On Windows, deliberate pointer movement also wakes after
-crossing the anti-jitter threshold. Modifier keys alone do not wake it.
+restore the picture. Modifier keys alone do not wake it.
 
-Pointer movement alone is disabled as a wake source on macOS by default. The
-zero-permission macOS event counters include cursor movement posted by software,
-and the operating system does not provide reliable source attribution without
-Input Monitoring access. Advanced users can set `enable_mouse_move_wake` to
-`true` in `config.json` and restart the controller, but software-generated
-movement may then wake the TV.
+Pointer movement alone is disabled as a wake source on both platforms by
+default. Advanced users can set `enable_mouse_move_wake` to `true` in
+`config.json` and restart the controller. Windows then uses per-device Raw Input
+and its anti-jitter threshold. On macOS, the zero-permission event counters
+include cursor movement posted by software and cannot reliably attribute its
+source without Input Monitoring access, so opt-in synthetic movement may wake
+the TV.
 
 The optional idle mode sends `Picture Off` after the configured number of
 minutes without keyboard or mouse input. Set the interval to `0` to disable it.
@@ -260,7 +260,7 @@ archive checksum.
 - Check `controller.log` for the qualifying input category.
 - On Windows, the log includes the Raw Input device path. Add a unique substring
   to `ignored_input_device_substrings` only after identifying the noisy device.
-- On macOS, pointer movement alone is ignored by default. Check whether
+- Pointer movement alone is ignored by default on both platforms. Check whether
   `enable_mouse_move_wake` was manually enabled if the log reports a
   `mouse_move` wake.
 
@@ -306,9 +306,9 @@ bash -n QN990F_macOS_Controller/INSTALL.command \
   QN990F_macOS_Controller/Uninstall.command
 ```
 
-The Windows installer runs the controller's structure self-test before replacing
-an existing installation. On a Windows development system with `samsungtvws`
-installed, it can also be invoked directly:
+The Windows installer runs the controller's ctypes and input-policy self-test
+before replacing an existing installation. On a Windows development system
+with `samsungtvws` installed, it can also be invoked directly:
 
 ```powershell
 python .\QN990F_Windows_Controller\QN990FController.py --self-test

@@ -285,7 +285,7 @@ if ($IsUpgrade) {
     Write-Host "Existing installation found. Settings and Samsung pairing token will be preserved."
 }
 Write-Host "Hotkey: $Hotkey -> Picture Off"
-Write-Host "Deliberate mouse/keyboard input after blanking -> wake"
+Write-Host "Key, mouse button, or wheel input after blanking -> wake"
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 
@@ -385,6 +385,7 @@ try {
             remote_name = "Samsung-TV-Picture-Controller"
             connection_refresh_seconds = 8.0
             input_wake_debounce_ms = 180
+            enable_mouse_move_wake = $false
             mouse_wake_threshold_counts = 24
             mouse_motion_window_ms = 500
             ignored_input_device_substrings = @()
@@ -526,7 +527,8 @@ if ([bool]($Config["enable_idle_off"])) {
 } else {
     Write-Host "  Automatic blank:  disabled"
 }
-Write-Host "  Wake:             next qualifying input; tiny pointer motion is ignored"
+Write-Host "  Wake:             key, mouse button, or wheel"
+Write-Host "  Pointer movement: ignored by default"
 Write-Host "  Config/logs:      $AppDir"
 Write-Host ""
 Write-Host "For reliable use, reserve the TV's IP in your router/DHCP settings."
