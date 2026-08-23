@@ -12,13 +12,20 @@ if (-not (Test-Path $ConfigPath)) {
 }
 
 $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+$ControlMethod = if ($Config.control_method) { [string]$Config.control_method } else { "lan" }
 
 Write-Host "Samsung TV Picture Controller configuration" -ForegroundColor Green
 Write-Host "Press Enter to keep the current value."
 
-$NewIp = Read-Host "TV IP [$($Config.tv_ip)]"
-if (-not [string]::IsNullOrWhiteSpace($NewIp)) {
-    $Config.tv_ip = $NewIp.Trim()
+if ($ControlMethod -eq "smartthings") {
+    Write-Host "Connection: SmartThings cloud"
+    Write-Host "SmartThings TV ID: $($Config.smartthings_device_id)"
+    Write-Host "Rerun the installer to change the connection or TV."
+} else {
+    $NewIp = Read-Host "TV IP [$($Config.tv_ip)]"
+    if (-not [string]::IsNullOrWhiteSpace($NewIp)) {
+        $Config.tv_ip = $NewIp.Trim()
+    }
 }
 
 $NewIdle = Read-Host "Idle minutes; 0 disables auto blank [$($Config.idle_minutes)]"
@@ -63,7 +70,7 @@ if ($LASTEXITCODE -ne 0) {
     exit 2
 }
 
-Write-Host "Pairing/validating TV connection..."
+Write-Host "Validating TV connection..."
 & $VenvPython $ControllerPath --pair
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "Could not connect/pair. The saved configuration remains, but the controller will not be restarted."
@@ -75,6 +82,7 @@ Start-Process -FilePath $VenvPythonW -ArgumentList "`"$ControllerPath`"" -Workin
 Write-Host ""
 Write-Host "Saved and restarted." -ForegroundColor Green
 Write-Host "Hotkey: $($Config.hotkey)"
+Write-Host "Connection: $ControlMethod"
 if ($Config.enable_idle_off) {
     Write-Host "Auto Picture Off: $($Config.idle_minutes) minute(s)"
 } else {

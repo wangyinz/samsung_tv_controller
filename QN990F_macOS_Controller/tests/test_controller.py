@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -47,6 +49,7 @@ def cloud_config(temp_dir):
         "smartthings_profile": "local.qn990f.picture-controller",
         "smartthings_device_id": DEVICE_ID,
         "smartthings_command_timeout_seconds": 20.0,
+        "enable_volume_control": True,
     }
 
 
@@ -57,6 +60,7 @@ def controller_config(control_method="lan"):
         "tv_ip": "192.0.2.10",
         "idle_minutes": 10.0,
         "enable_idle_off": True,
+        "enable_volume_control": False,
     }
     if control_method == "smartthings":
         config.update(cloud_config(TEST_HOME.name))
@@ -88,6 +92,8 @@ class FakeBackend:
 class RecordingTV:
     def __init__(self, results=None):
         self.sent = []
+        self.set_volumes = []
+        self.volume_set = threading.Event()
         self.results = list(results or [])
 
     def send(self, key):
@@ -96,6 +102,14 @@ class RecordingTV:
 
     def close(self):
         pass
+
+    def get_volume(self):
+        return None
+
+    def set_volume(self, value):
+        self.set_volumes.append(value)
+        self.volume_set.set()
+        return self.results.pop(0) if self.results else True
 
 
 class Clock:
@@ -265,6 +279,18 @@ class MacOSBackendTests(unittest.TestCase):
         with mock.patch.object(backend, "_input_snapshot", return_value=current):
             self.assertEqual(backend.poll_input_events(), [])
 
+    def test_fixed_volume_output_is_treated_as_already_at_maximum(self):
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+
+        def read_property(_object_id, selector, _scope, value, element=0):
+            if selector == backend.K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE:
+                value.value = 42
+                return value.value
+            raise RuntimeError("no writable volume scalar")
+
+        backend._audio_property = read_property
+        self.assertTrue(backend.system_volume_is_max())
+
 
 class LANClientTests(unittest.TestCase):
     def test_new_config_uses_generic_remote_name(self):
@@ -310,6 +336,58 @@ class SmartThingsTVClientTests(unittest.TestCase):
             [mock.call("KEY_PICTURE_OFF"), mock.call("KEY_RETURN")],
         )
 
+    def test_volume_status_is_read_from_audio_volume_capability(self):
+        status = {
+            "components": {
+                "main": {"audioVolume": {"volume": {"value": 17}}}
+            }
+        }
+        with mock.patch.object(
+            self.client, "_run", side_effect=["", json.dumps(status)]
+        ) as run, mock.patch.object(controller.time, "sleep") as sleep:
+            self.assertEqual(self.client.get_volume(), 17)
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    "devices:commands", DEVICE_ID, "main:refresh:refresh()"
+                ),
+                mock.call("devices:status", DEVICE_ID, "--json"),
+            ],
+        )
+        sleep.assert_called_once_with(0.5)
+
+    def test_set_volume_uses_explicit_audio_volume_target(self):
+        with mock.patch.object(self.client, "_run") as run:
+            self.assertTrue(self.client.set_volume(10))
+
+        run.assert_called_once_with(
+            "devices:commands",
+            DEVICE_ID,
+            "main:audioVolume:setVolume(10)",
+        )
+
+    def test_volume_keys_use_audio_volume_capability(self):
+        with mock.patch.object(self.client, "_send_volume_command") as send:
+            self.assertTrue(self.client.send("KEY_VOLUP"))
+            self.assertTrue(self.client.send("KEY_VOLDOWN"))
+
+        self.assertEqual(
+            send.call_args_list,
+            [mock.call("KEY_VOLUP"), mock.call("KEY_VOLDOWN")],
+        )
+
+    def test_volume_down_command_uses_standard_audio_volume_capability(self):
+        with mock.patch.object(self.client, "_run") as run:
+            self.client._send_volume_command("KEY_VOLDOWN")
+
+        run.assert_called_once_with(
+            "devices:commands",
+            DEVICE_ID,
+            "main:audioVolume:volumeDown()",
+        )
+
     def test_run_is_noninteractive_and_does_not_inherit_pat(self):
         completed = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
         with mock.patch.dict(os.environ, {"SMARTTHINGS_TOKEN": "must-not-leak"}), \
@@ -350,6 +428,7 @@ class SmartThingsTVClientTests(unittest.TestCase):
                     "capabilities": [
                         {"id": "execute", "version": 1},
                         {"id": "samsungvd.remoteControl", "version": 1},
+                        {"id": "audioVolume", "version": 1},
                     ],
                     "categories": [{"name": "Television"}],
                 }
@@ -371,6 +450,7 @@ class SmartThingsTVClientTests(unittest.TestCase):
                     "capabilities": [
                         {"id": "execute", "version": 1},
                         {"id": "samsungvd.remoteControl", "version": 1},
+                        {"id": "audioVolume", "version": 1},
                     ],
                     "categories": [{"name": "Television"}],
                 }
@@ -387,8 +467,47 @@ class SmartThingsTVClientTests(unittest.TestCase):
             "components": [{"id": "main", "capabilities": []}],
         }
         with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
-            with self.assertRaisesRegex(RuntimeError, "does not expose SmartThings TV"):
+            with self.assertRaisesRegex(RuntimeError, "required SmartThings TV"):
                 self.client.pair()
+
+    def test_pair_rejects_tv_without_audio_volume_capability(self):
+        device = {
+            "manufacturerName": "Samsung Electronics",
+            "type": "OCF",
+            "components": [
+                {
+                    "id": "main",
+                    "capabilities": [
+                        {"id": "execute", "version": 1},
+                        {"id": "samsungvd.remoteControl", "version": 1},
+                    ],
+                    "categories": [{"name": "Television"}],
+                }
+            ],
+        }
+        with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
+            with self.assertRaisesRegex(RuntimeError, "required SmartThings TV"):
+                self.client.pair()
+
+    def test_pair_accepts_tv_without_audio_volume_when_volume_control_is_disabled(self):
+        device = {
+            "manufacturerName": "Samsung Electronics",
+            "type": "OCF",
+            "components": [
+                {
+                    "id": "main",
+                    "capabilities": [
+                        {"id": "execute", "version": 1},
+                        {"id": "samsungvd.remoteControl", "version": 1},
+                    ],
+                    "categories": [{"name": "Television"}],
+                }
+            ],
+        }
+        self.client.cfg["enable_volume_control"] = False
+
+        with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
+            self.assertEqual(self.client.pair(), "Samsung TV")
 
     def test_pair_rejects_light_sensor_child_device(self):
         device = {
@@ -404,7 +523,7 @@ class SmartThingsTVClientTests(unittest.TestCase):
             ],
         }
         with mock.patch.object(self.client, "_run", return_value=json.dumps(device)):
-            with self.assertRaisesRegex(RuntimeError, "does not expose SmartThings TV"):
+            with self.assertRaisesRegex(RuntimeError, "required SmartThings TV"):
                 self.client.pair()
 
 
@@ -471,6 +590,67 @@ class CloudConfigTests(unittest.TestCase):
                 loaded = controller.load_config()
 
         self.assertFalse(loaded["enable_mouse_move_wake"])
+
+
+class VolumeCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.tv = RecordingTV()
+        self.cfg = {
+            **controller.DEFAULT_CONFIG,
+            "tv_volume_floor": 10,
+            "tv_volume_refresh_seconds": 60.0,
+        }
+        self.volume = controller.VolumeCoordinator(self.cfg, self.tv)
+        self.volume.BUFFER_SECONDS = 0.01
+        self.addCleanup(self.volume.stop)
+
+    def test_volume_up_routes_to_tv_only_after_system_reaches_maximum(self):
+        self.assertFalse(self.volume.handle_key("up", system_is_max=False))
+        self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+
+    def test_volume_down_stops_tv_at_floor_then_returns_to_system(self):
+        with self.volume._lock:
+            self.volume._tv_volume = 11
+
+        self.assertTrue(self.volume.handle_key("down"))
+        self.assertFalse(self.volume.handle_key("down"))
+        self.assertTrue(self.tv.volume_set.wait(1.0))
+        self.assertEqual(self.tv.set_volumes, [10])
+
+    def test_consecutive_volume_up_steps_are_sent_as_one_target(self):
+        with self.volume._lock:
+            self.volume._tv_volume = 20
+
+        for _ in range(5):
+            self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+
+        self.assertTrue(self.tv.volume_set.wait(1.0))
+        self.assertEqual(self.tv.set_volumes, [25])
+
+    def test_mixed_volume_steps_are_combined_as_net_change(self):
+        with self.volume._lock:
+            self.volume._tv_volume = 20
+
+        for direction in ("up", "up", "down", "up", "down"):
+            self.assertTrue(
+                self.volume.handle_key(
+                    direction,
+                    system_is_max=direction == "up",
+                )
+            )
+
+        self.assertTrue(self.tv.volume_set.wait(1.0))
+        self.assertEqual(self.tv.set_volumes, [21])
+
+    def test_cancelled_volume_steps_do_not_send_a_cloud_command(self):
+        with self.volume._lock:
+            self.volume._tv_volume = 20
+
+        self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+        self.assertTrue(self.volume.handle_key("down"))
+        time.sleep(0.1)
+
+        self.assertEqual(self.tv.set_volumes, [])
 
 
 class ControllerInputTests(unittest.TestCase):

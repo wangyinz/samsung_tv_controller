@@ -20,6 +20,10 @@ Makes a compatible Samsung TV behave more like a conventional computer display o
    The picture will not be turned off automatically while a video or presentation app
    explicitly requests that the display remain on.
 
+5. Optionally integrates the keyboard volume buttons with TV volume. Volume Up controls
+   macOS until it reaches maximum, then controls the TV. In SmartThings mode,
+   Volume Down lowers TV volume to 10 before continuing with macOS volume.
+
 
 Compatibility
 -------------
@@ -30,8 +34,9 @@ Direct LAN mode requires the encrypted Samsung Tizen WebSocket remote on TCP
 port 8002, firmware support for KEY_PICTURE_OFF, and support for the configured
 wake key (KEY_RETURN by default).
 
-SmartThings cloud mode lists Samsung OCF televisions that expose both the
-execute and samsungvd.remoteControl capabilities. Those capabilities indicate
+SmartThings cloud mode lists Samsung OCF televisions that expose the execute and
+samsungvd.remoteControl capabilities. Optional volume control also requires
+audioVolume. Those capabilities indicate
 the required API shape, but they do not guarantee that a particular firmware
 will execute Picture Off. The installer therefore requires a visual Picture
 Off / restore test before it enables background startup.
@@ -95,7 +100,8 @@ Direct LAN installation flow:
 - A test command is sent only after you explicitly confirm in Terminal
 - Visually verify the KEY_PICTURE_OFF -> KEY_RETURN test
 
-Both modes ask for the automatic Picture Off idle interval. Enter 0 to disable it.
+Both modes ask whether to enable integrated volume control and ask for the
+automatic Picture Off idle interval. Enter 0 to disable automatic blanking.
 The installer enables automatic startup at login only after you confirm that the visual
 test actually succeeded.
 
@@ -117,12 +123,18 @@ Not Required
 - System pip
 - Xcode / Command Line Tools
 - sudo / root
-- Accessibility permission
 - Input Monitoring permission
 
 
-Why Accessibility and Input Monitoring Are Not Required
---------------------------------------------------------
+macOS Privacy Permission
+------------------------
+When enabled, integrated volume routing uses a CGEvent tap limited to the hardware Volume Up
+and Volume Down controls. Add the installed venv Python runtime to System
+Settings -> Privacy & Security -> Accessibility when macOS prompts. The
+controller does not inspect ordinary typed keys through this tap.
+
+Why Wake Detection Does Not Need Input Monitoring
+--------------------------------------------------
 The global hotkey uses macOS Carbon RegisterEventHotKey.
 
 Wake detection after Picture Off uses:
@@ -130,8 +142,8 @@ Wake detection after Picture Off uses:
 
 The controller compares cumulative macOS event counters for keyboard key-down,
 mouse-button down, and scroll-wheel input. It also observes mouse movement only when the
-advanced enable_mouse_move_wake setting is explicitly enabled. It does not install an
-event tap or read specific keys, typed text, or event contents. Because it observes only
+advanced enable_mouse_move_wake setting is explicitly enabled. This wake path does not
+read specific keys, typed text, or event contents. Because it observes only
 the key-down counter, pressing Control, Command, Option, or Shift alone does not wake the
 picture.
 
@@ -159,6 +171,17 @@ Control + Command + P:
 After Picture Off:
     Press a non-modifier key, click a mouse button, or use the scroll wheel
     -> The picture is restored automatically.
+
+Volume keys:
+    Integrated volume control is optional during installation. Rerun
+    INSTALL.command to enable or disable it; press Return to keep the current choice.
+    Volume Up -> macOS volume until maximum, then TV volume.
+    Volume Down in SmartThings mode -> TV volume down to 10, then macOS.
+    SmartThings TV-volume steps within 200 ms are combined into one target;
+    volume-up and volume-down steps cancel each other within that buffer.
+
+Direct LAN can send TV volume keys but cannot read current TV volume, so the
+TV-first Volume Down rule is intentionally limited to SmartThings mode.
 
 Wake rules:
 - Pressing modifier keys such as Control, Command, Option, or Shift alone does not wake.

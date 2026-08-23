@@ -1,7 +1,10 @@
 param(
     [string]$TvIp = "",
     [double]$IdleMinutes = -1,
-    [string]$Hotkey = ""
+    [string]$Hotkey = "",
+    [ValidateSet("", "lan", "smartthings")]
+    [string]$ControlMethod = "",
+    [Nullable[bool]]$EnableVolumeControl = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +23,11 @@ $LegacyStartupShortcut = Join-Path $StartupDir "QN990F Picture Controller.lnk"
 $ProgramsDir = [Environment]::GetFolderPath("Programs")
 $StartMenuDir = Join-Path $ProgramsDir "Samsung TV Picture Controller"
 $LegacyStartMenuDir = Join-Path $ProgramsDir "QN990F Controller"
+$SmartThingsProfile = "local.qn990f.picture-controller"
+$SmartThingsCliVersion = "2.1.1"
+$SmartThingsCliAsset = "smartthings-windows-x64.zip"
+$SmartThingsCliSha256 = "3f634dd76e77fded35a4f71485b5810f29f39351fc604733551a1e01ea773563"
+$SmartThingsCliPath = Join-Path $AppDir "smartthings.exe"
 
 function Write-Step([string]$Text) {
     Write-Host ""
@@ -27,27 +35,47 @@ function Write-Step([string]$Text) {
 }
 
 function Stop-ExistingController {
+    $ExpectedProcessPaths = @(
+        (Join-Path $VenvDir "Scripts\python.exe"),
+        (Join-Path $VenvDir "Scripts\pythonw.exe")
+    )
+    $ControllerPids = @()
+    try {
+        $ControllerPids = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object {
+                $_.Name -in @("python.exe", "pythonw.exe") -and
+                $_.CommandLine -and
+                ([string]$_.CommandLine).IndexOf(
+                    $ControllerPath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            } |
+            ForEach-Object { [int]$_.ProcessId })
+    } catch {}
+
     if (Test-Path $PidPath) {
         try {
             $ControllerPid = [int](Get-Content $PidPath -ErrorAction Stop)
             $Process = Get-Process -Id $ControllerPid -ErrorAction SilentlyContinue
-            if ($Process) {
-                $ExpectedProcessPaths = @(
-                    (Join-Path $VenvDir "Scripts\python.exe"),
-                    (Join-Path $VenvDir "Scripts\pythonw.exe")
-                )
-                $ProcessPath = $Process.Path
-                if ($ProcessPath -and ($ExpectedProcessPaths -contains $ProcessPath)) {
-                    Write-Host "Stopping existing Samsung TV Picture Controller (PID $ControllerPid)..."
-                    Stop-Process -Id $ControllerPid -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Milliseconds 300
-                } else {
-                    Write-Warning "Ignoring stale controller PID $ControllerPid because it belongs to another process."
-                }
+            if ($Process -and
+                (($ControllerPids -contains $ControllerPid) -or
+                 ($Process.Path -and ($ExpectedProcessPaths -contains $Process.Path)))) {
+                $ControllerPids += $ControllerPid
+            } elseif ($Process) {
+                Write-Warning "Ignoring stale controller PID $ControllerPid because it belongs to another process."
             }
         } catch {
             # Stale PID file; ignore.
         }
+    }
+
+    $ControllerPids = @($ControllerPids | Sort-Object -Unique)
+    if ($ControllerPids.Count -gt 0) {
+        Write-Host "Stopping existing Samsung TV Picture Controller (PID $($ControllerPids -join ', '))..."
+        foreach ($ControllerPid in $ControllerPids) {
+            Stop-Process -Id $ControllerPid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 300
     }
     Remove-Item $PidPath -Force -ErrorAction SilentlyContinue
 }
@@ -190,19 +218,133 @@ $ExistingTokenBytes = if ($HadExistingToken) {
     $null
 }
 
-if ((-not $PSBoundParameters.ContainsKey("TvIp")) -and $ExistingConfig) {
-    $TvIp = [string]$ExistingConfig.tv_ip
+if (-not $ControlMethod) {
+    if ($ExistingConfig -and ($ExistingConfig.PSObject.Properties.Name -contains "control_method")) {
+        $ControlMethod = [string]$ExistingConfig.control_method
+    } else {
+        Write-Host "Control connection:"
+        Write-Host "  1. Direct LAN WebSocket"
+        Write-Host "  2. SmartThings cloud"
+        $ConnectionChoice = Read-Host "Choose connection [1]"
+        $ControlMethod = if ($ConnectionChoice -eq "2") { "smartthings" } else { "lan" }
+    }
 }
 
-if ([string]::IsNullOrWhiteSpace($TvIp)) {
-    $TvIp = Read-Host "Enter the Samsung TV LAN IP address (example: 192.168.1.50)"
+function Invoke-SmartThingsCliProcess {
+    param(
+        [string]$Path,
+        [string]$Arguments,
+        [int]$TimeoutMilliseconds
+    )
+    $CliProcess = $null
+    try {
+        $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $StartInfo.FileName = $Path
+        $StartInfo.Arguments = $Arguments
+        $StartInfo.UseShellExecute = $false
+        $StartInfo.CreateNoWindow = $true
+        $StartInfo.RedirectStandardOutput = $true
+        $StartInfo.RedirectStandardError = $true
+        $CliProcess = New-Object System.Diagnostics.Process
+        $CliProcess.StartInfo = $StartInfo
+        if (-not $CliProcess.Start()) {
+            throw "The SmartThings CLI process could not start."
+        }
+        $StdOutTask = $CliProcess.StandardOutput.ReadToEndAsync()
+        $StdErrTask = $CliProcess.StandardError.ReadToEndAsync()
+        if (-not $CliProcess.WaitForExit($TimeoutMilliseconds)) {
+            $CliProcess.Kill()
+            [void]$CliProcess.WaitForExit(5000)
+            throw "The SmartThings CLI command timed out."
+        }
+        if ((-not $StdOutTask.Wait(5000)) -or (-not $StdErrTask.Wait(5000))) {
+            throw "The SmartThings CLI output did not close after the command exited."
+        }
+        return [PSCustomObject]@{
+            ExitCode = $CliProcess.ExitCode
+            StdOut = $StdOutTask.Result
+            StdErr = $StdErrTask.Result
+        }
+    } finally {
+        if ($CliProcess) { $CliProcess.Dispose() }
+    }
 }
-if ([string]::IsNullOrWhiteSpace($TvIp)) {
-    throw "TV IP address cannot be empty."
+
+function Get-SmartThingsCliVersion([string]$Path) {
+    try {
+        $Result = Invoke-SmartThingsCliProcess -Path $Path -Arguments "--version" `
+            -TimeoutMilliseconds 15000
+        if ($Result.ExitCode -eq 0) {
+            return ($Result.StdOut + $Result.StdErr).Trim()
+        }
+    } catch {}
+    return ""
 }
-$TvIp = $TvIp.Trim()
+
+function Install-PrivateSmartThingsCli {
+    $ExpectedVersionPattern = "(^|[/\s])$([regex]::Escape($SmartThingsCliVersion))($|\s)"
+    if (Test-Path $SmartThingsCliPath) {
+        $InstalledVersion = Get-SmartThingsCliVersion $SmartThingsCliPath
+        if ($InstalledVersion -match $ExpectedVersionPattern) {
+            Write-Host "Using SmartThings CLI ${SmartThingsCliVersion}: $SmartThingsCliPath"
+            return
+        }
+        Write-Warning "Replacing an unusable or unsupported private SmartThings CLI in $AppDir."
+    }
+
+    $ReleaseTag = [Uri]::EscapeDataString("@smartthings/cli@$SmartThingsCliVersion")
+    $DownloadUrl = "https://github.com/SmartThingsCommunity/smartthings-cli/releases/download/$ReleaseTag/$SmartThingsCliAsset"
+    $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("qn990f-smartthings-" + [Guid]::NewGuid().ToString("N"))
+    $ArchivePath = Join-Path $TempDir $SmartThingsCliAsset
+    $ExtractDir = Join-Path $TempDir "extracted"
+    $ExtractedCli = Join-Path $ExtractDir "smartthings.exe"
+
+    try {
+        New-Item -ItemType Directory -Path $TempDir | Out-Null
+        Write-Host "Downloading SmartThings CLI $SmartThingsCliVersion from the official GitHub release..."
+        Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $ArchivePath
+
+        $ActualSha256 = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($ActualSha256 -ne $SmartThingsCliSha256) {
+            throw "SmartThings CLI download failed SHA-256 verification. Expected $SmartThingsCliSha256 but received $ActualSha256."
+        }
+
+        Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractDir
+        if (-not (Test-Path $ExtractedCli)) {
+            throw "The verified SmartThings CLI archive did not contain smartthings.exe."
+        }
+        $DownloadedVersion = Get-SmartThingsCliVersion $ExtractedCli
+        if ($DownloadedVersion -notmatch $ExpectedVersionPattern) {
+            throw "The downloaded SmartThings CLI could not start or reported an unexpected version: $DownloadedVersion"
+        }
+
+        Copy-Item -LiteralPath $ExtractedCli -Destination $SmartThingsCliPath -Force
+        Write-Host "Installed private SmartThings CLI ${SmartThingsCliVersion}: $SmartThingsCliPath"
+    } catch {
+        throw "Could not install the official SmartThings CLI $SmartThingsCliVersion. Check internet access and try again. $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($ControlMethod -eq "lan") {
+    if ((-not $PSBoundParameters.ContainsKey("TvIp")) -and $ExistingConfig) {
+        $TvIp = [string]$ExistingConfig.tv_ip
+    }
+    if ([string]::IsNullOrWhiteSpace($TvIp)) {
+        $TvIp = Read-Host "Enter the Samsung TV LAN IP address (example: 192.168.1.50)"
+    }
+    if ([string]::IsNullOrWhiteSpace($TvIp)) {
+        throw "TV IP address cannot be empty."
+    }
+    $TvIp = $TvIp.Trim()
+} else {
+    $TvIp = ""
+}
 $TvIpChanged = $ExistingConfig -and
     (([string]$ExistingConfig.tv_ip).Trim() -ne $TvIp)
+$ControlMethodChanged = $ExistingConfig -and
+    ([string]$ExistingConfig.control_method).Trim().ToLowerInvariant() -ne $ControlMethod
 
 $IdleWasChanged = $PSBoundParameters.ContainsKey("IdleMinutes")
 if ((-not $IdleWasChanged) -and $ExistingConfig -and
@@ -235,7 +377,27 @@ if ([string]::IsNullOrWhiteSpace($Hotkey)) {
     $Hotkey = "Ctrl+Alt+P"
 }
 $Hotkey = $Hotkey.Trim()
-$NeedsPairing = (-not $IsUpgrade) -or (-not $HadExistingToken) -or $TvIpChanged
+$VolumeDefault = $true
+if ($ExistingConfig -and
+    ($ExistingConfig.PSObject.Properties.Name -contains "enable_volume_control")) {
+    $VolumeDefault = [bool]$ExistingConfig.enable_volume_control
+}
+if ($null -eq $EnableVolumeControl) {
+    $VolumeDefaultText = if ($VolumeDefault) { "Y" } else { "N" }
+    $VolumeChoice = Read-Host "Enable integrated system/TV volume-key control? [$VolumeDefaultText]"
+    if ([string]::IsNullOrWhiteSpace($VolumeChoice)) {
+        $EnableVolumeControl = $VolumeDefault
+    } elseif ($VolumeChoice -match '^[Yy]') {
+        $EnableVolumeControl = $true
+    } elseif ($VolumeChoice -match '^[Nn]') {
+        $EnableVolumeControl = $false
+    } else {
+        throw "Volume control must be Y or N."
+    }
+}
+$EnableVolumeControl = [bool]$EnableVolumeControl
+$NeedsPairing = $ControlMethod -eq "smartthings" -or (-not $IsUpgrade) -or
+    (-not $HadExistingToken) -or $TvIpChanged -or $ControlMethodChanged
 
 function Restore-PreviousInstallation {
     if ($ExistingConfig) {
@@ -321,6 +483,76 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to update pip inside the virtual enviro
 & $VenvPython -m pip install --disable-pip-version-check "samsungtvws==3.0.5"
 if ($LASTEXITCODE -ne 0) { throw "Failed to install samsungtvws." }
 
+$SmartThingsCli = ""
+$SmartThingsDeviceId = ""
+if ($ControlMethod -eq "smartthings") {
+    Write-Step "Installing the official SmartThings CLI"
+    Install-PrivateSmartThingsCli
+    $SmartThingsCli = $SmartThingsCliPath
+
+    if ($ExistingConfig -and -not $ControlMethodChanged -and
+        ($ExistingConfig.PSObject.Properties.Name -contains "smartthings_device_id")) {
+        $SmartThingsDeviceId = [string]$ExistingConfig.smartthings_device_id
+    }
+    if ([string]::IsNullOrWhiteSpace($SmartThingsDeviceId)) {
+        Write-Step "Signing in to SmartThings and selecting a TV"
+        Write-Host "Your browser may open for Samsung account sign-in and device authorization."
+        $env:SMARTTHINGS_TOKEN = $null
+        $DeviceArguments = "devices --json --profile `"$SmartThingsProfile`" --token `"`" --language NONE"
+        $DevicesResult = Invoke-SmartThingsCliProcess -Path $SmartThingsCli `
+            -Arguments $DeviceArguments -TimeoutMilliseconds 300000
+        if ($DevicesResult.ExitCode -ne 0) {
+            throw "Could not list SmartThings devices. Check sign-in and internet access."
+        }
+        $DevicesJson = $DevicesResult.StdOut
+        $DevicesValue = $DevicesJson | ConvertFrom-Json
+        $Devices = if ($DevicesValue -is [array]) {
+            @($DevicesValue)
+        } elseif ($DevicesValue.PSObject.Properties.Name -contains "items") {
+            @($DevicesValue.items)
+        } else {
+            @($DevicesValue)
+        }
+        $CompatibleTvs = @($Devices | Where-Object {
+            $Device = $_
+            if ($Device.manufacturerName -ne "Samsung Electronics" -or $Device.type -ne "OCF") {
+                return $false
+            }
+            $Main = @($Device.components | Where-Object { $_.id -eq "main" }) | Select-Object -First 1
+            if (-not $Main) { return $false }
+            $CapabilityIds = @($Main.capabilities | ForEach-Object {
+                if ($_ -is [string]) { $_ } else { $_.id }
+            })
+            $CategoryNames = @($Main.categories | ForEach-Object {
+                if ($_ -is [string]) { $_ } else { $_.name }
+            })
+            return ($CapabilityIds -contains "execute") -and
+                ($CapabilityIds -contains "samsungvd.remoteControl") -and
+                ((-not $EnableVolumeControl) -or
+                 ($CapabilityIds -contains "audioVolume")) -and
+                ($CategoryNames -contains "Television")
+        })
+        if ($CompatibleTvs.Count -eq 0) {
+            $VolumeRequirement = if ($EnableVolumeControl) { " and audio-volume" } else { "" }
+            throw "No compatible Samsung SmartThings TV with remote${VolumeRequirement} control was found."
+        }
+        Write-Host "SmartThings TVs:"
+        for ($Index = 0; $Index -lt $CompatibleTvs.Count; $Index++) {
+            $Device = $CompatibleTvs[$Index]
+            $Label = if ($Device.label) { $Device.label } else { $Device.name }
+            Write-Host "  $($Index + 1). $Label [$($Device.deviceId)]"
+        }
+        $ChoiceText = Read-Host "Choose the TV [1]"
+        if ([string]::IsNullOrWhiteSpace($ChoiceText)) { $ChoiceText = "1" }
+        $Choice = 0
+        if ((-not [int]::TryParse($ChoiceText, [ref]$Choice)) -or
+            $Choice -lt 1 -or $Choice -gt $CompatibleTvs.Count) {
+            throw "Invalid SmartThings TV selection."
+        }
+        $SmartThingsDeviceId = [string]$CompatibleTvs[$Choice - 1].deviceId
+    }
+}
+
 Write-Step "Checking the controller package"
 & $VenvPython $SourceControllerPath --self-test
 if ($LASTEXITCODE -ne 0) {
@@ -370,6 +602,7 @@ try {
         }
 
         $Config = [ordered]@{
+            control_method = $ControlMethod
             tv_ip = $TvIp
             port = 8002
             idle_minutes = [double]$IdleMinutes
@@ -389,6 +622,13 @@ try {
             mouse_wake_threshold_counts = 24
             mouse_motion_window_ms = 500
             ignored_input_device_substrings = @()
+            smartthings_cli = $SmartThingsCli
+            smartthings_profile = $SmartThingsProfile
+            smartthings_device_id = $SmartThingsDeviceId
+            smartthings_command_timeout_seconds = 20.0
+            enable_volume_control = $EnableVolumeControl
+            tv_volume_floor = 10
+            tv_volume_refresh_seconds = 3.0
         }
         if ($ExistingConfig) {
             foreach ($Property in $ExistingConfig.PSObject.Properties) {
@@ -399,12 +639,19 @@ try {
             }
         }
         $Config["tv_ip"] = $TvIp
+        $Config["control_method"] = $ControlMethod
+        if ($ControlMethod -eq "smartthings") {
+            $Config["smartthings_cli"] = $SmartThingsCli
+            $Config["smartthings_profile"] = $SmartThingsProfile
+            $Config["smartthings_device_id"] = $SmartThingsDeviceId
+        }
         $Config["idle_minutes"] = [double]$IdleMinutes
         if ((-not $ExistingConfig) -or $IdleWasChanged -or
             (-not ($ExistingConfig.PSObject.Properties.Name -contains "enable_idle_off"))) {
             $Config["enable_idle_off"] = ($IdleMinutes -gt 0)
         }
         $Config["hotkey"] = $Hotkey
+        $Config["enable_volume_control"] = $EnableVolumeControl
         $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigPath -Encoding UTF8
 
         Write-Step "Checking the global hotkey"
@@ -414,14 +661,22 @@ try {
         }
 
         if ($NeedsPairing) {
-            Write-Step "Pairing with the TV"
-            Write-Host "Turn the Samsung TV on and keep it on the same LAN/subnet as this PC."
-            Write-Host "When the TV asks whether to allow $($Config['remote_name']), choose Allow." -ForegroundColor Yellow
-            if ($TvIpChanged) {
-                Remove-Item $TokenPath -Force -ErrorAction SilentlyContinue
+            if ($ControlMethod -eq "smartthings") {
+                Write-Step "Validating SmartThings cloud control"
+                Write-Host "Keep the selected TV on and connected to the internet."
+            } else {
+                Write-Step "Pairing with the TV"
+                Write-Host "Turn the Samsung TV on and keep it on the same LAN/subnet as this PC."
+                Write-Host "When the TV asks whether to allow $($Config['remote_name']), choose Allow." -ForegroundColor Yellow
+                if ($TvIpChanged) {
+                    Remove-Item $TokenPath -Force -ErrorAction SilentlyContinue
+                }
             }
             & $VenvPython $SourceControllerPath --pair
             if ($LASTEXITCODE -ne 0) {
+                if ($ControlMethod -eq "smartthings") {
+                    throw "SmartThings validation failed. Check sign-in, internet access, and the selected TV."
+                }
                 throw "Pairing failed. Check the TV IP, LAN connectivity, and Samsung Device Connection Manager permissions."
             }
         } else {
@@ -522,6 +777,7 @@ if ($IsUpgrade) {
     Write-Host "Installed." -ForegroundColor Green
 }
 Write-Host "  Hotkey:           $Hotkey"
+Write-Host "  Connection:       $ControlMethod"
 if ([bool]($Config["enable_idle_off"])) {
     Write-Host "  Automatic blank:  after $IdleMinutes minute(s) of keyboard/mouse inactivity"
 } else {
@@ -529,6 +785,11 @@ if ([bool]($Config["enable_idle_off"])) {
 }
 Write-Host "  Wake:             key, mouse button, or wheel"
 Write-Host "  Pointer movement: ignored by default"
+if ($EnableVolumeControl) {
+    Write-Host "  Volume control:   enabled; TV above 10 first"
+} else {
+    Write-Host "  Volume control:   disabled"
+}
 Write-Host "  Config/logs:      $AppDir"
 Write-Host ""
 Write-Host "For reliable use, reserve the TV's IP in your router/DHCP settings."

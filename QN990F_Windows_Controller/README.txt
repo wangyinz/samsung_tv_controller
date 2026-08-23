@@ -17,6 +17,10 @@ Makes a compatible Samsung TV behave more like a PC monitor on Windows:
    Media/presentation apps that explicitly tell Windows "keep the display on"
    should therefore suppress automatic blanking.
 
+5) Optionally integrates the keyboard volume buttons with TV volume. Volume Up controls
+   Windows until it reaches maximum, then controls the TV. In SmartThings mode,
+   Volume Down lowers TV volume to 10 before continuing with Windows volume.
+
 This controller was developed and validated with a Samsung QN990F. Other
 Samsung TVs may work when they expose the encrypted Tizen WebSocket remote on
 TCP port 8002 and their firmware accepts KEY_PICTURE_OFF plus the configured
@@ -68,7 +72,11 @@ INSTALL
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-QN990FController.ps1
 
 For a new installation, the installer will:
-- Ask for the Samsung TV's LAN IP.
+- Ask whether to use Direct LAN or SmartThings cloud.
+- In LAN mode, ask for the Samsung TV's LAN IP.
+- In cloud mode, download a pinned official SmartThings CLI into the private
+  application directory, verify its SHA-256 checksum, open the Samsung sign-in
+  flow, and ask which compatible TV to control. No separate MSI is required.
 - Ask for the idle timeout (default 10 minutes; 0 disables it).
 - Use an existing Python 3.9+ if available.
 - If Python is absent, install Python 3.12 with winget.
@@ -92,11 +100,15 @@ and samsung-token.txt, including the TV IP, hotkey, idle timeout, pairing token,
 and advanced input settings. It updates the program/runtime and restarts the
 controller without sending the Picture Off / wake visual test. Ordinary upgrades
 also skip pairing; repair mode pairs only when the token is missing or you
-explicitly supply a different TV IP.
+explicitly supply a different TV IP. The volume-control prompt defaults to the
+existing choice; press Enter to preserve it.
 
 
 FIRST PAIRING
 -------------
+These instructions apply to Direct LAN mode. SmartThings mode validates the TV
+through the Samsung account selected during installation.
+
 Keep the TV on and on the same LAN/subnet as the PC.
 
 On a new installation, when the Samsung TV asks whether to allow
@@ -122,6 +134,17 @@ Automatic idle behavior:
     After the configured idle time, KEY_PICTURE_OFF is sent.
     The next qualifying keyboard/mouse input wakes it.
 
+Volume keys:
+    Integrated volume control is optional during installation. Rerun
+    INSTALL-ME.cmd to enable or disable it; press Enter to keep the current choice.
+    Volume Up -> Windows volume until maximum, then TV volume.
+    Volume Down in SmartThings mode -> TV volume down to 10, then Windows.
+    SmartThings TV-volume steps within 200 ms are combined into one target;
+    volume-up and volume-down steps cancel each other within that buffer.
+
+Direct LAN can send a TV volume key but cannot read the current TV volume, so
+the TV-first Volume Down rule is intentionally limited to SmartThings mode.
+
 
 CONFIGURATION
 -------------
@@ -129,7 +152,7 @@ Use Start menu:
     Samsung TV Picture Controller -> Configure Samsung TV Picture Controller
 
 You can change:
-- TV IP
+- TV IP in Direct LAN mode
 - Idle timeout (0 disables automatic blanking)
 - Global hotkey
 - Whether to respect Windows display-required/media power requests
@@ -198,6 +221,10 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 
 - This does not power the TV into standby. It uses Picture Off, so wake is much
   faster and avoids HDMI re-enumeration.
+
+- SmartThings mode requires a Samsung OCF Television exposing execute and
+  samsungvd.remoteControl. Optional volume control also requires audioVolume. Background commands use the
+  official CLI's saved OAuth profile; config.json does not store its token.
 
 
 MANUAL TEST COMMANDS

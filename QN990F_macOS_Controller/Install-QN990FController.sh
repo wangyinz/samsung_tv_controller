@@ -95,7 +95,7 @@ echo "Default hotkey: Control + Command + P -> Picture Off"
 echo "After this controller blanks the TV: key, mouse button, or wheel input -> wake"
 echo "Pointer movement alone is ignored to prevent unattended synthetic wake events."
 echo
-echo "No Accessibility or Input Monitoring permission is required."
+echo "Wake detection does not require Input Monitoring permission."
 echo
 echo "Control connection:"
 echo "  1. Direct LAN WebSocket (original mode)"
@@ -127,6 +127,34 @@ case "$CONNECTION_CHOICE" in
     exit 1
     ;;
 esac
+
+ENABLE_VOLUME_DEFAULT="true"
+if [[ -f "$CONFIG" ]]; then
+  EXISTING_ENABLE_VOLUME="$(
+    plutil -extract enable_volume_control raw -o - "$CONFIG" 2>/dev/null || true
+  )"
+  if [[ "$EXISTING_ENABLE_VOLUME" == "false" ]]; then
+    ENABLE_VOLUME_DEFAULT="false"
+  fi
+fi
+if [[ "$ENABLE_VOLUME_DEFAULT" == "true" ]]; then
+  VOLUME_DEFAULT_LABEL="Y"
+else
+  VOLUME_DEFAULT_LABEL="N"
+fi
+read -r -p "Enable integrated system/TV volume-key control? [$VOLUME_DEFAULT_LABEL]: " ENABLE_VOLUME_CHOICE
+case "$ENABLE_VOLUME_CHOICE" in
+  "") ENABLE_VOLUME="$ENABLE_VOLUME_DEFAULT" ;;
+  [Yy]*) ENABLE_VOLUME="true" ;;
+  [Nn]*) ENABLE_VOLUME="false" ;;
+  *)
+    echo "Volume control must be Y or N."
+    exit 1
+    ;;
+esac
+if [[ "$ENABLE_VOLUME" == "true" ]]; then
+  echo "Volume-key routing requires Accessibility permission for the installed Python runtime."
+fi
 
 if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
   MACOS_VERSION="$(sw_vers -productVersion)"
@@ -199,10 +227,11 @@ if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
   fi
 
   FILTERED_JSON="$TEMP_DIR/tvs.json"
-  DEVICE_COUNT="$("$PYTHON" - "$DEVICE_JSON" "$FILTERED_JSON" <<'PY'
+  DEVICE_COUNT="$("$PYTHON" - "$DEVICE_JSON" "$FILTERED_JSON" "$ENABLE_VOLUME" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
     value = json.load(f)
+require_volume = sys.argv[3].lower() == "true"
 devices = value if isinstance(value, list) else value.get("items", [])
 def is_compatible_tv(device):
     if device.get("manufacturerName") != "Samsung Electronics":
@@ -217,7 +246,9 @@ def is_compatible_tv(device):
             c if isinstance(c, str) else c.get("name")
             for c in component.get("categories", [])
         ]
-        if "execute" in ids and "samsungvd.remoteControl" in ids and "Television" in categories:
+        if "execute" in ids and "samsungvd.remoteControl" in ids and \
+                (not require_volume or "audioVolume" in ids) and \
+                "Television" in categories:
             return True
     return False
 devices = [device for device in devices if is_compatible_tv(device)]
@@ -299,12 +330,13 @@ fi
 "$PYTHON" - \
   "$CONFIG" "$CONTROL_METHOD" "$TV_IP" "$IDLE" "$HOTKEY" "$ENABLE_IDLE" \
   "$SMARTTHINGS" "$SMARTTHINGS_NO_BROWSER_DIR" \
-  "$SMARTTHINGS_PROFILE" "$SMARTTHINGS_DEVICE_ID" "$REMOTE_NAME" <<'PY'
+  "$SMARTTHINGS_PROFILE" "$SMARTTHINGS_DEVICE_ID" "$ENABLE_VOLUME" \
+  "$REMOTE_NAME" <<'PY'
 import json, sys
 (
     path, method, ip, idle, hotkey, enable_idle, smartthings_cli,
     smartthings_no_browser_dir, smartthings_profile, smartthings_device_id,
-    remote_name,
+    enable_volume, remote_name,
 ) = sys.argv[1:]
 config = {
     "control_method": method,
@@ -330,6 +362,9 @@ config = {
     "smartthings_profile": smartthings_profile,
     "smartthings_device_id": smartthings_device_id,
     "smartthings_command_timeout_seconds": 20.0,
+    "enable_volume_control": enable_volume.lower() == "true",
+    "tv_volume_floor": 10,
+    "tv_volume_refresh_seconds": 3.0,
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
@@ -337,6 +372,16 @@ PY
 
 step "Checking the global shortcut"
 "$PYTHON" "$CONTROLLER" --check-hotkey
+
+if [[ "$ENABLE_VOLUME" == "true" ]]; then
+  step "Checking volume-key access"
+  if ! "$PYTHON" "$CONTROLLER" --check-volume-keys; then
+    echo "Open System Settings -> Privacy & Security -> Accessibility."
+    echo "Add and enable: $PYTHON"
+    echo "Then rerun INSTALL.command."
+    exit 2
+  fi
+fi
 
 step "Checking macOS idle-input API"
 IDLE_NOW="$("$PYTHON" "$CONTROLLER" --idle)"
@@ -425,6 +470,11 @@ else
   echo "  Automatic blank: disabled"
 fi
 echo "  Wake:            key, mouse button, or wheel"
+if [[ "$ENABLE_VOLUME" == "true" ]]; then
+  echo "  Volume control:  enabled; TV above 10 first"
+else
+  echo "  Volume control:  disabled"
+fi
 if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
   echo "  Connection:      SmartThings cloud ($SMARTTHINGS_DEVICE_LABEL)"
 else

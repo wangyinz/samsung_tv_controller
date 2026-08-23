@@ -27,6 +27,8 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import queue
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -50,6 +52,7 @@ STATUS_FILE = APP_DIR / "status.json"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
+    "control_method": "lan",
     "tv_ip": "",
     "port": 8002,
     "idle_minutes": 10.0,
@@ -69,6 +72,13 @@ DEFAULT_CONFIG = {
     "mouse_wake_threshold_counts": 24,
     "mouse_motion_window_ms": 500,
     "ignored_input_device_substrings": [],
+    "smartthings_cli": str(APP_DIR / "smartthings.exe"),
+    "smartthings_profile": "local.qn990f.picture-controller",
+    "smartthings_device_id": "",
+    "smartthings_command_timeout_seconds": 20.0,
+    "enable_volume_control": True,
+    "tv_volume_floor": 10,
+    "tv_volume_refresh_seconds": 3.0,
 }
 
 logger = logging.getLogger("QN990FController")
@@ -83,11 +93,16 @@ if not logger.handlers:
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 powrprof = ctypes.WinDLL("powrprof", use_last_error=True)
+ole32 = ctypes.WinDLL("ole32")
 
 WM_INPUT = 0x00FF
 WM_INPUT_DEVICE_CHANGE = 0x00FE
 WM_HOTKEY = 0x0312
 WM_DESTROY = 0x0002
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -95,6 +110,13 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 HOTKEY_ID = 0x5199
+WH_KEYBOARD_LL = 13
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP = 0xAF
+CLSCTX_ALL = 23
+COINIT_APARTMENTTHREADED = 2
+E_RENDER = 0
+E_CONSOLE = 0
 
 ERROR_ALREADY_EXISTS = 183
 ERROR_CLASS_ALREADY_EXISTS = 1410
@@ -278,6 +300,25 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
 # ---------------- API prototypes ----------------
 
 user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
@@ -361,6 +402,30 @@ powrprof.CallNtPowerInformation.argtypes = [
 ]
 powrprof.CallNtPowerInformation.restype = wintypes.ULONG
 
+HOOKPROC = ctypes.WINFUNCTYPE(
+    LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+)
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+user32.SetWindowsHookExW.restype = wintypes.HANDLE
+user32.CallNextHookEx.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+]
+user32.CallNextHookEx.restype = LRESULT
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+
+ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(GUID)]
+ole32.CLSIDFromString.restype = wintypes.LONG
+ole32.CoInitializeEx.argtypes = [wintypes.LPVOID, wintypes.DWORD]
+ole32.CoInitializeEx.restype = wintypes.LONG
+ole32.CoUninitialize.argtypes = []
+ole32.CoUninitialize.restype = None
+ole32.CoCreateInstance.argtypes = [
+    ctypes.POINTER(GUID), wintypes.LPVOID, wintypes.DWORD,
+    ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+]
+ole32.CoCreateInstance.restype = wintypes.LONG
+
 
 def self_test_structures() -> tuple[bool, str]:
     """
@@ -402,9 +467,48 @@ def self_test_structures() -> tuple[bool, str]:
         if probe.pending_input_wake_at <= 0.0:
             return False, "Opt-in mouse-movement wake self-test failed"
 
+        class ProbeTV:
+            def __init__(self):
+                self.set_volumes = []
+                self.volume_set = threading.Event()
+
+            def get_volume(self):
+                return None
+
+            def send(self, _key):
+                return True
+
+            def set_volume(self, value):
+                self.set_volumes.append(value)
+                self.volume_set.set()
+                return True
+
+        probe_tv = ProbeTV()
+        volume = VolumeCoordinator(probe_config, probe_tv)
+        with volume._lock:
+            volume._tv_volume = 11
+        if not volume.handle_key("down") or volume.handle_key("down"):
+            volume.stop()
+            return False, "TV volume-floor routing self-test failed"
+        if not probe_tv.volume_set.wait(1.0) or probe_tv.set_volumes != [10]:
+            volume.stop()
+            return False, "Explicit TV volume target self-test failed"
+        if volume.handle_key("up", False) or not volume.handle_key("up", True):
+            volume.stop()
+            return False, "System volume-maximum routing self-test failed"
+        volume.stop()
+        probe.stop()
+
+        endpoint = WindowsEndpointVolume()
+        try:
+            endpoint.open()
+            endpoint.is_max()
+        finally:
+            endpoint.close()
+
         return True, (
             f"Controller self-test passed (RAWMOUSE size={size}; "
-            "mouse movement disabled by default)"
+            "mouse movement disabled by default; volume routing and endpoint passed)"
         )
     except Exception as exc:
         return False, f"Controller self-test failed: {exc!r}"
@@ -438,6 +542,148 @@ def display_is_explicitly_required() -> bool:
         logger.debug("CallNtPowerInformation failed with status %s", status)
         return False
     return bool(int(state.value) & ES_DISPLAY_REQUIRED)
+
+
+def _guid(text: str) -> GUID:
+    value = GUID()
+    result = ole32.CLSIDFromString(text, ctypes.byref(value))
+    if result < 0:
+        raise OSError(f"CLSIDFromString failed: HRESULT 0x{result & 0xFFFFFFFF:08X}")
+    return value
+
+
+def _com_method(pointer, index, restype, *argtypes):
+    vtable = ctypes.cast(
+        pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+    ).contents
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[index])
+
+
+def _check_hresult(result, operation):
+    if result < 0:
+        raise OSError(f"{operation} failed: HRESULT 0x{result & 0xFFFFFFFF:08X}")
+
+
+class WindowsEndpointVolume:
+    CLSID_MMDEVICE_ENUMERATOR = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+    IID_IMMDEVICE_ENUMERATOR = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+    IID_IAUDIO_ENDPOINT_VOLUME = "{5CDF2C82-841E-4546-9722-0CF74078229A}"
+
+    def __init__(self):
+        self._initialized = False
+        self._enumerator = ctypes.c_void_p()
+
+    def open(self) -> None:
+        result = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        # S_OK and S_FALSE both require a matching CoUninitialize.
+        if result in (0, 1):
+            self._initialized = True
+        elif result < 0:
+            _check_hresult(result, "CoInitializeEx")
+
+        clsid = _guid(self.CLSID_MMDEVICE_ENUMERATOR)
+        iid_enumerator = _guid(self.IID_IMMDEVICE_ENUMERATOR)
+        result = ole32.CoCreateInstance(
+            ctypes.byref(clsid), None, CLSCTX_ALL,
+            ctypes.byref(iid_enumerator), ctypes.byref(self._enumerator),
+        )
+        _check_hresult(result, "CoCreateInstance(MMDeviceEnumerator)")
+
+    def is_max(self) -> bool:
+        device = ctypes.c_void_p()
+        endpoint = ctypes.c_void_p()
+        get_default = _com_method(
+            self._enumerator, 4, wintypes.LONG,
+            ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p),
+        )
+        result = get_default(
+            self._enumerator, E_RENDER, E_CONSOLE, ctypes.byref(device)
+        )
+        _check_hresult(result, "IMMDeviceEnumerator.GetDefaultAudioEndpoint")
+
+        try:
+            iid_endpoint = _guid(self.IID_IAUDIO_ENDPOINT_VOLUME)
+            activate = _com_method(
+                device, 3, wintypes.LONG,
+                ctypes.POINTER(GUID), wintypes.DWORD, wintypes.LPVOID,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            result = activate(
+                device, ctypes.byref(iid_endpoint), CLSCTX_ALL, None,
+                ctypes.byref(endpoint),
+            )
+            _check_hresult(result, "IMMDevice.Activate(IAudioEndpointVolume)")
+
+            value = ctypes.c_float()
+            get_scalar = _com_method(
+                endpoint, 9, wintypes.LONG, ctypes.POINTER(ctypes.c_float)
+            )
+            result = get_scalar(endpoint, ctypes.byref(value))
+            _check_hresult(result, "IAudioEndpointVolume.GetMasterVolumeLevelScalar")
+            return float(value.value) >= 0.999
+        finally:
+            self._release(endpoint)
+            self._release(device)
+
+    @staticmethod
+    def _release(pointer) -> None:
+        if pointer:
+            release = _com_method(pointer, 2, wintypes.ULONG)
+            release(pointer)
+
+    def close(self) -> None:
+        self._release(self._enumerator)
+        self._enumerator = ctypes.c_void_p()
+        if self._initialized:
+            ole32.CoUninitialize()
+            self._initialized = False
+
+
+class LowLevelVolumeHook:
+    def __init__(self, handler):
+        self.handler = handler
+        self.handle = None
+        self.endpoint_volume = WindowsEndpointVolume()
+        self._consumed = set()
+        self._callback = HOOKPROC(self._hook_proc)
+
+    def install(self) -> None:
+        self.endpoint_volume.open()
+        self.handle = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._callback, kernel32.GetModuleHandleW(None), 0
+        )
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _hook_proc(self, code, wparam, lparam):
+        if code >= 0 and int(wparam) in {
+            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        }:
+            data = ctypes.cast(
+                lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)
+            ).contents
+            vkey = int(data.vkCode)
+            if vkey in {VK_VOLUME_UP, VK_VOLUME_DOWN}:
+                if int(wparam) in {WM_KEYDOWN, WM_SYSKEYDOWN}:
+                    direction = "up" if vkey == VK_VOLUME_UP else "down"
+                    try:
+                        at_max = direction == "up" and self.endpoint_volume.is_max()
+                        if self.handler(direction, at_max):
+                            self._consumed.add(vkey)
+                            return 1
+                    except Exception as exc:
+                        logger.warning("Volume-key routing failed: %r", exc)
+                elif vkey in self._consumed:
+                    self._consumed.discard(vkey)
+                    return 1
+        return user32.CallNextHookEx(self.handle, code, wparam, lparam)
+
+    def close(self) -> None:
+        if self.handle:
+            user32.UnhookWindowsHookEx(self.handle)
+        self.handle = None
+        self._consumed.clear()
+        self.endpoint_volume.close()
 
 
 def parse_hotkey(spec: str) -> tuple[int, int]:
@@ -478,8 +724,11 @@ def load_config() -> dict:
     if "remote_name" not in user_config:
         config["remote_name"] = "QN990F-PC-Controller"
 
+    config["control_method"] = str(config.get("control_method", "lan")).strip().lower()
+    if config["control_method"] not in {"lan", "smartthings"}:
+        raise ValueError("control_method must be 'lan' or 'smartthings'.")
     config["tv_ip"] = str(config.get("tv_ip", "")).strip()
-    if not config["tv_ip"]:
+    if config["control_method"] == "lan" and not config["tv_ip"]:
         raise ValueError("config.json has an empty tv_ip.")
 
     config["port"] = int(config.get("port", 8002))
@@ -510,6 +759,36 @@ def load_config() -> dict:
     config["mouse_motion_window_ms"] = max(
         100, int(config.get("mouse_motion_window_ms", 500))
     )
+    config["enable_volume_control"] = bool(config.get("enable_volume_control", True))
+    config["tv_volume_floor"] = min(
+        100, max(0, int(config.get("tv_volume_floor", 10)))
+    )
+    config["tv_volume_refresh_seconds"] = max(
+        1.0, float(config.get("tv_volume_refresh_seconds", 3.0))
+    )
+
+    if config["control_method"] == "smartthings":
+        config["smartthings_cli"] = str(config.get("smartthings_cli", "")).strip()
+        config["smartthings_profile"] = str(
+            config.get("smartthings_profile", "local.qn990f.picture-controller")
+        ).strip()
+        config["smartthings_device_id"] = str(
+            config.get("smartthings_device_id", "")
+        ).strip()
+        if not config["smartthings_cli"]:
+            raise ValueError("smartthings_cli is empty.")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", config["smartthings_profile"]):
+            raise ValueError("smartthings_profile contains unsupported characters.")
+        if not re.fullmatch(
+            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+            config["smartthings_device_id"],
+        ):
+            raise ValueError("smartthings_device_id is not a UUID.")
+        config["smartthings_command_timeout_seconds"] = min(
+            20.0,
+            max(5.0, float(config.get("smartthings_command_timeout_seconds", 20.0))),
+        )
 
     ignored = config.get("ignored_input_device_substrings", [])
     if not isinstance(ignored, list):
@@ -857,9 +1136,317 @@ class TVClient:
                         time.sleep(0.12)
             return False
 
+    def get_volume(self):
+        # The LAN WebSocket accepts volume keys but has no volume-state query.
+        return None
+
     def close(self) -> None:
         with self._lock:
             self._reset()
+
+
+class SmartThingsTVClient:
+    EXECUTE_CAPABILITY = "execute"
+    REMOTE_MARKER_CAPABILITY = "samsungvd.remoteControl"
+    AUDIO_VOLUME_CAPABILITY = "audioVolume"
+    REMOTE_RESOURCE = "/sec/tv/remotecontrol"
+
+    def __init__(self, config: dict):
+        self.config = config
+        self._lock = threading.Lock()
+        self._command_times = []
+
+    def _run(self, *args, timeout=None, allow_login=False):
+        cli = Path(str(self.config["smartthings_cli"])).expanduser()
+        if not cli.is_file():
+            raise RuntimeError(f"SmartThings CLI is missing: {cli}")
+        command = [
+            str(cli), *args,
+            "--profile", str(self.config["smartthings_profile"]),
+            "--token", "",
+            "--language", "NONE",
+        ]
+        environment = os.environ.copy()
+        environment.pop("SMARTTHINGS_TOKEN", None)
+        if not allow_login:
+            environment["BROWSER"] = "none"
+        command_timeout = (
+            float(self.config["smartthings_command_timeout_seconds"])
+            if timeout is None else float(timeout)
+        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=command_timeout,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "SmartThings command timed out. Run Configure from the Start menu."
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            if len(detail) > 1200:
+                detail = detail[-1200:]
+            raise RuntimeError(detail or f"SmartThings CLI exited with {result.returncode}")
+        return result.stdout
+
+    def pair(self):
+        output = self._run(
+            "devices", str(self.config["smartthings_device_id"]), "--json",
+            timeout=650,
+            allow_login=True,
+        )
+        try:
+            device = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("SmartThings CLI returned invalid device data.") from exc
+        capabilities = set()
+        categories = set()
+        for component in device.get("components", []):
+            if component.get("id") != "main":
+                continue
+            for capability in component.get("capabilities", []):
+                capabilities.add(
+                    capability if isinstance(capability, str)
+                    else str(capability.get("id", ""))
+                )
+            for category in component.get("categories", []):
+                categories.add(
+                    category if isinstance(category, str)
+                    else str(category.get("name", ""))
+                )
+        required = {self.EXECUTE_CAPABILITY, self.REMOTE_MARKER_CAPABILITY}
+        if self.config["enable_volume_control"]:
+            required.add(self.AUDIO_VOLUME_CAPABILITY)
+        if not required.issubset(capabilities) or "Television" not in categories:
+            raise RuntimeError(
+                "Selected device does not expose the required SmartThings TV controls."
+            )
+        if device.get("manufacturerName") != "Samsung Electronics" or \
+           device.get("type") != "OCF":
+            raise RuntimeError("Selected SmartThings device is not a Samsung OCF TV.")
+        return str(device.get("label") or device.get("name") or "Samsung TV")
+
+    def _ensure_command_budget(self, needed):
+        cutoff = time.monotonic() - 60.0
+        self._command_times = [stamp for stamp in self._command_times if stamp > cutoff]
+        if len(self._command_times) + needed > 100:
+            raise RuntimeError("SmartThings command limit reached; wait one minute.")
+
+    def _send_ocf_remote(self, remote_key):
+        payload = {
+            "x.com.samsung.tv.keyvalue": remote_key,
+            "x.com.samsung.tv.keystatus": "pressAndRelease",
+        }
+        argument = "main:{capability}:execute({resource},{payload})".format(
+            capability=self.EXECUTE_CAPABILITY,
+            resource=json.dumps(self.REMOTE_RESOURCE),
+            payload=json.dumps(payload, separators=(",", ":")),
+        )
+        self._command_times.append(time.monotonic())
+        self._run(
+            "devices:commands", str(self.config["smartthings_device_id"]), argument
+        )
+        logger.info("SmartThings sent OCF remote key %s", remote_key)
+
+    def _send_volume_command(self, remote_key):
+        command = "volumeUp" if remote_key == "KEY_VOLUP" else "volumeDown"
+        self._command_times.append(time.monotonic())
+        self._run(
+            "devices:commands",
+            str(self.config["smartthings_device_id"]),
+            f"main:{self.AUDIO_VOLUME_CAPABILITY}:{command}()",
+        )
+        logger.info("SmartThings sent audioVolume.%s", command)
+
+    def send(self, key: str) -> bool:
+        with self._lock:
+            try:
+                allowed = {
+                    str(self.config["picture_off_key"]),
+                    str(self.config["wake_key"]),
+                    "KEY_VOLUP",
+                    "KEY_VOLDOWN",
+                }
+                if key not in allowed:
+                    raise ValueError(f"Unsupported SmartThings action: {key}")
+                self._ensure_command_budget(1)
+                if key in {"KEY_VOLUP", "KEY_VOLDOWN"}:
+                    self._send_volume_command(key)
+                else:
+                    self._send_ocf_remote(key)
+                return True
+            except Exception as exc:
+                logger.warning("SmartThings action %s failed: %r", key, exc)
+                return False
+
+    def get_volume(self):
+        with self._lock:
+            try:
+                self._ensure_command_budget(1)
+                self._command_times.append(time.monotonic())
+                self._run(
+                    "devices:commands",
+                    str(self.config["smartthings_device_id"]),
+                    "main:refresh:refresh()",
+                )
+                time.sleep(0.5)
+                output = self._run(
+                    "devices:status", str(self.config["smartthings_device_id"]), "--json"
+                )
+                status = json.loads(output)
+                value = status["components"]["main"]["audioVolume"]["volume"]["value"]
+                return min(100, max(0, int(value)))
+            except Exception as exc:
+                logger.warning("SmartThings volume query failed: %r", exc)
+                return None
+
+    def set_volume(self, value: int) -> bool:
+        with self._lock:
+            try:
+                target = min(100, max(0, int(value)))
+                self._ensure_command_budget(1)
+                self._command_times.append(time.monotonic())
+                self._run(
+                    "devices:commands",
+                    str(self.config["smartthings_device_id"]),
+                    f"main:{self.AUDIO_VOLUME_CAPABILITY}:setVolume({target})",
+                )
+                logger.info("SmartThings set audioVolume to %d", target)
+                return True
+            except Exception as exc:
+                logger.warning("SmartThings set volume failed: %r", exc)
+                return False
+
+    def close(self) -> None:
+        pass
+
+
+def make_tv_client(config: dict):
+    if config["control_method"] == "smartthings":
+        return SmartThingsTVClient(config)
+    return TVClient(config)
+
+
+class VolumeCoordinator:
+    BUFFER_SECONDS = 0.2
+
+    def __init__(self, config: dict, tv):
+        self.config = config
+        self.tv = tv
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._commands = queue.SimpleQueue()
+        self._tv_volume = None
+        self._estimate_valid_until = 0.0
+        self._buffer_start_volume = None
+        self._buffer_deadline = 0.0
+        self._worker = threading.Thread(
+            target=self._run, daemon=True, name="QN990F-VolumeControl"
+        )
+        self._worker.start()
+
+    def handle_key(self, direction: str, system_is_max=False) -> bool:
+        if direction == "up":
+            if not system_is_max:
+                return False
+            with self._lock:
+                if self._tv_volume is None:
+                    self._commands.put("KEY_VOLUP")
+                    return True
+                if self._tv_volume >= 100:
+                    return True
+                notify = self._buffer_deadline == 0.0
+                if notify:
+                    self._buffer_start_volume = self._tv_volume
+                self._tv_volume += 1
+                now = time.monotonic()
+                self._buffer_deadline = now + self.BUFFER_SECONDS
+                self._estimate_valid_until = now + max(
+                    5.0, float(self.config["tv_volume_refresh_seconds"]) * 2
+                )
+            if notify:
+                self._commands.put("flush_volume")
+            return True
+
+        floor = int(self.config["tv_volume_floor"])
+        with self._lock:
+            if self._tv_volume is None or self._tv_volume <= floor:
+                return False
+            notify = self._buffer_deadline == 0.0
+            if notify:
+                self._buffer_start_volume = self._tv_volume
+            self._tv_volume -= 1
+            now = time.monotonic()
+            self._buffer_deadline = now + self.BUFFER_SECONDS
+            self._estimate_valid_until = now + max(
+                5.0, float(self.config["tv_volume_refresh_seconds"]) * 2
+            )
+        if notify:
+            self._commands.put("flush_volume")
+        return True
+
+    def _flush_volume_buffer(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                remaining = self._buffer_deadline - time.monotonic()
+            if remaining > 0:
+                if self._stop.wait(remaining):
+                    return
+                continue
+            with self._lock:
+                target = self._tv_volume
+                start = self._buffer_start_volume
+                self._buffer_deadline = 0.0
+                self._buffer_start_volume = None
+            if target is None or target == start:
+                return
+            if not self.tv.set_volume(target):
+                with self._lock:
+                    self._tv_volume = None
+                    self._estimate_valid_until = 0.0
+            return
+
+    def _run(self) -> None:
+        refresh_at = 0.0
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now >= refresh_at:
+                with self._lock:
+                    estimate_is_current = now < self._estimate_valid_until
+                if not estimate_is_current:
+                    volume = self.tv.get_volume()
+                    if volume is not None:
+                        with self._lock:
+                            self._tv_volume = volume
+                refresh_at = time.monotonic() + float(
+                    self.config["tv_volume_refresh_seconds"]
+                )
+            if self._stop.is_set():
+                break
+            try:
+                command = self._commands.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if command == "flush_volume":
+                self._flush_volume_buffer()
+                with self._lock:
+                    if self._tv_volume is None:
+                        refresh_at = 0.0
+            else:
+                self.tv.send(command)
+
+    def stop(self) -> None:
+        self._stop.set()
+        timeout = float(
+            self.config.get("smartthings_command_timeout_seconds", 0.0)
+        ) + 1.0
+        self._worker.join(timeout=max(1.0, timeout))
 
 
 # ---------------- Controller state machine ----------------
@@ -867,7 +1454,11 @@ class TVClient:
 class Controller:
     def __init__(self, config: dict):
         self.config = config
-        self.tv = TVClient(config)
+        self.tv = make_tv_client(config)
+        self.volume = (
+            VolumeCoordinator(config, self.tv)
+            if config["enable_volume_control"] else None
+        )
         self._operation_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._input_lock = threading.Lock()
@@ -888,6 +1479,11 @@ class Controller:
 
         self._display_required_cache = False
         self._display_required_checked_at = 0.0
+
+    def handle_volume_key(self, direction: str, system_is_max=False) -> bool:
+        if self.volume is None:
+            return False
+        return self.volume.handle_key(direction, system_is_max)
 
     def _set_picture_off_state(self, off: bool) -> None:
         with self._state_lock:
@@ -1215,6 +1811,8 @@ class Controller:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.volume:
+            self.volume.stop()
         self.tv.close()
 
 
@@ -1270,6 +1868,7 @@ def run_daemon(config: dict) -> int:
     mutex = None
     controller = None
     input_window = None
+    volume_hook = None
 
     try:
         mutex = acquire_single_instance()
@@ -1280,6 +1879,9 @@ def run_daemon(config: dict) -> int:
         controller = Controller(config)
         input_window = RawInputWindow(config)
         input_window.create()
+        if config["enable_volume_control"]:
+            volume_hook = LowLevelVolumeHook(controller.handle_volume_key)
+            volume_hook.install()
 
         monitor = threading.Thread(
             target=controller.monitor_loop,
@@ -1289,8 +1891,9 @@ def run_daemon(config: dict) -> int:
         monitor.start()
 
         logger.info(
-            "Controller v3.1 started. TV=%s:%s hotkey=%s idle=%s min auto=%s "
+            "Controller v3.2 started. connection=%s TV=%s:%s hotkey=%s idle=%s min auto=%s "
             "mouse_move_wake=%s mouse_threshold=%s",
+            config["control_method"],
             config["tv_ip"],
             config["port"],
             config["hotkey"],
@@ -1302,7 +1905,7 @@ def run_daemon(config: dict) -> int:
         write_status(
             running=True,
             state="awake",
-            version="3.1",
+            version="3.2",
             hotkey=config["hotkey"],
         )
 
@@ -1334,11 +1937,13 @@ def run_daemon(config: dict) -> int:
         write_status(
             running=False,
             state="error",
-            version="3.1",
+            version="3.2",
             error=str(exc),
         )
         return 1
     finally:
+        if volume_hook is not None:
+            volume_hook.close()
         if controller is not None:
             controller.stop()
         if input_window is not None:
@@ -1346,7 +1951,7 @@ def run_daemon(config: dict) -> int:
         if mutex:
             kernel32.CloseHandle(mutex)
         remove_pid_file()
-        write_status(running=False, state="stopped", version="3.1")
+        write_status(running=False, state="stopped", version="3.2")
 
 
 # ---------------- CLI ----------------
@@ -1379,19 +1984,26 @@ def main() -> int:
     if args.check_hotkey:
         return check_hotkey(config)
 
-    client = TVClient(config)
+    client = make_tv_client(config)
 
     if args.pair:
-        print(
-            f"Connecting to Samsung TV at "
-            f"{config['tv_ip']}:{config['port']}..."
-        )
-        print(
-            "If the TV asks whether to allow remote control, choose Allow."
-        )
+        if config["control_method"] == "smartthings":
+            print("Validating SmartThings cloud access...")
+            print("A browser will open if SmartThings sign-in is required.")
+        else:
+            print(
+                f"Connecting to Samsung TV at "
+                f"{config['tv_ip']}:{config['port']}..."
+            )
+            print(
+                "If the TV asks whether to allow remote control, choose Allow."
+            )
         try:
-            client.pair()
-            print(f"Pairing succeeded. Token file: {TOKEN_FILE}")
+            label = client.pair()
+            if config["control_method"] == "smartthings":
+                print(f"SmartThings cloud access succeeded: {label}")
+            else:
+                print(f"Pairing succeeded. Token file: {TOKEN_FILE}")
             return 0
         except Exception as exc:
             print(f"Pairing failed: {exc}", file=sys.stderr)

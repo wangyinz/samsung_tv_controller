@@ -28,6 +28,9 @@ monitor.
 - Per-user background startup with no separate server or always-on device.
 - Bounded diagnostic logs: one active 1 MB log and three 1 MB backups.
 - Isolated Python environment installed without modifying system Python packages.
+- Optional keyboard volume integration: local volume is used first when increasing;
+  after it reaches maximum, further presses increase TV volume. In SmartThings
+  mode, decreasing lowers TV volume to 10 before lowering system volume.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -41,15 +44,16 @@ This tool depends on TV capabilities rather than a model-name allowlist:
   service on TCP port `8002`, plus firmware support for `KEY_PICTURE_OFF` and a
   wake key such as `KEY_RETURN`.
 - **SmartThings cloud control** requires a Samsung OCF Television device exposing
-  the `execute` and `samsungvd.remoteControl` capabilities. Discovery confirms
-  the API shape, not that the firmware will execute `Picture Off`, so visual
-  confirmation remains mandatory.
+  the `execute` and `samsungvd.remoteControl` capabilities. The optional integrated
+  volume control additionally requires `audioVolume`. Discovery confirms the API
+  shape, not that the firmware will execute `Picture Off`, so visual confirmation
+  remains mandatory.
 
 | Scope | Status |
 | --- | --- |
 | Samsung QN990F | Primary development and validation model |
 | Other Samsung Tizen TVs with the required LAN keys | Potentially compatible; not yet verified |
-| Other Samsung OCF TVs with the required SmartThings capabilities | Potentially compatible on macOS; not yet verified |
+| Other Samsung OCF TVs with the required SmartThings capabilities | Potentially compatible; not yet verified |
 | TVs without Samsung `Picture Off` support | Not compatible |
 
 Compatibility can vary by model, region, firmware version, and enabled TV
@@ -60,7 +64,8 @@ settings. Reports for additional models are welcome.
 | Capability | macOS | Windows |
 | --- | --- | --- |
 | Direct LAN WebSocket | Yes | Yes |
-| SmartThings cloud | Yes | No |
+| SmartThings cloud | Yes | Yes |
+| Optional integrated system/TV volume keys | Yes | Yes |
 | Default hotkey | `Control+Command+P` | `Ctrl+Alt+P` |
 | Intentional input wake | Keyboard, mouse button, or wheel | Keyboard, mouse button, or wheel |
 | Pointer anti-jitter | Disabled by default; optional 24 screen-coordinate points within 500 ms | Disabled by default; optional 24 Raw Input counts per device within 500 ms |
@@ -70,12 +75,12 @@ settings. Reports for additional models are welcome.
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
 | Elevated privileges | Not required | Not required for the controller; the installer may use `winget` to install a missing user-scoped Python runtime |
 
-The macOS controller does not require Accessibility or Input Monitoring
-permission. It observes system event counters and pointer position rather than
-installing an event tap or reading typed text. The Windows controller uses a
-hidden Raw Input window; it classifies key-down events to exclude modifiers but
-does not capture text or continuous key sequences. Its log may contain the
-single virtual-key code that triggered a wake.
+When volume control is enabled, the macOS controller uses an event tap only for
+the two hardware volume keys, so macOS Accessibility permission is required.
+Wake detection
+continues to use anonymous system event counters and does not read typed text.
+The Windows controller uses Raw Input for wake detection and a low-level hook
+limited to `Volume Up` and `Volume Down`.
 
 ## Connection modes
 
@@ -89,20 +94,22 @@ The computer and TV generally need to be reachable on the same local network.
 A full-tunnel or centrally managed VPN may intentionally block local-network
 traffic even when both devices use addresses on the same subnet. When that
 happens, use an administrator-approved local-network access policy, disconnect
-the VPN when permitted, or use SmartThings cloud mode on macOS. This project
+the VPN when permitted, or use SmartThings cloud mode. This project
 does not modify routes or bypass VPN security policy.
 
 ### SmartThings cloud
 
-SmartThings cloud mode is available on macOS 13.5 or later. It uses the public
-SmartThings HTTPS service through a pinned version of the official SmartThings
-CLI, so it can work when a VPN or network policy blocks direct access to the TV's
-private LAN address.
+SmartThings cloud mode is available on macOS 13.5 or later and on Windows. It
+uses the public SmartThings HTTPS service through the official SmartThings CLI,
+so it can work when a VPN or network policy blocks direct access to the TV's
+private LAN address. The macOS installer supplies a pinned CLI; Windows users
+also receive a private pinned CLI automatically. Both installers verify the
+official release archive before using it; no separate Windows MSI is required.
 
 Requirements:
 
 - The TV appears in the SmartThings mobile app under the same Samsung account.
-- The TV and Mac both have internet access.
+- The TV and computer both have internet access.
 - The network permits access to Samsung's sign-in and SmartThings services.
 - The discovered TV exposes the required OCF remote-control capabilities.
 
@@ -125,8 +132,9 @@ directory together.
 
 If Gatekeeper blocks the downloaded script, Control-click `INSTALL.command`,
 choose **Open**, and confirm once more. Homebrew, Xcode Command Line Tools,
-`sudo`, Accessibility permission, and Input Monitoring permission are not
-required.
+`sudo` and Input Monitoring permission are not required. For volume-key
+routing, add the installed controller Python runtime to **System Settings →
+Privacy & Security → Accessibility** when macOS prompts.
 
 See the [macOS guide](QN990F_macOS_Controller/README.txt) for detailed setup,
 configuration, file locations, and manual commands.
@@ -135,8 +143,10 @@ configuration, file locations, and manual commands.
 
 1. Open [`QN990F_Windows_Controller`](QN990F_Windows_Controller/).
 2. Double-click [`INSTALL-ME.cmd`](QN990F_Windows_Controller/INSTALL-ME.cmd).
-3. Enter the TV's LAN address and choose **Allow** on the TV's pairing prompt.
-4. Approve the two-second `Picture Off` and restore test, then confirm what you
+3. Choose Direct LAN or SmartThings cloud. In cloud mode, the installer
+   downloads and verifies its private copy of the official SmartThings CLI.
+4. Choose whether to install integrated volume-key control.
+5. Approve the two-second `Picture Off` and restore test, then confirm what you
    observed.
 
 The installer uses an existing Python 3.9 or later when available. Otherwise,
@@ -161,6 +171,20 @@ Press the configured hotkey to blank the picture:
 
 Afterward, press a non-modifier key, click a mouse button, or use the wheel to
 restore the picture. Modifier keys alone do not wake it.
+
+The hardware volume keys form one control range across the computer and TV:
+
+Integrated volume control is optional during installation. Rerun the installer
+to enable or disable it; an upgrade keeps the current choice when the prompt is
+left blank.
+
+- `Volume Up` changes system volume until it is full, then sends TV volume-up.
+- In SmartThings mode, `Volume Down` lowers TV volume to the configured floor
+  (10 by default), then resumes normal system-volume reduction.
+- SmartThings TV-volume steps received within 200 ms are combined locally. Up
+  and down steps cancel each other, and one final target volume is sent.
+- Direct LAN can send TV volume keys but cannot query the TV's current volume,
+  so the safe TV-first decrease rule is available only in SmartThings mode.
 
 Pointer movement alone is disabled as a wake source on both platforms by
 default. Advanced users can set `enable_mouse_move_wake` to `true` in
@@ -192,7 +216,7 @@ Reconfiguration tools are installed with each platform version:
   access token.
 - Background cloud commands are non-interactive. If token refresh fails, the
   command stops instead of opening a sign-in page; reauthenticate through the
-  macOS configuration tool.
+  platform configuration tool.
 - The project adds no application telemetry. It writes local status and
   diagnostic files only. Windows logs may include Raw Input device paths; macOS
   logs input categories but not typed text. Windows wake records may also
@@ -201,8 +225,8 @@ Reconfiguration tools are installed with each platform version:
   per installation.
 
 Installers download runtime components and dependencies from their documented
-upstream sources. The macOS installer verifies the pinned SmartThings CLI
-archive checksum.
+upstream sources. Both installers verify the pinned SmartThings CLI archive
+checksum.
 
 ## Limitations
 
@@ -226,6 +250,8 @@ archive checksum.
   or remove that behavior.
 - SmartThings rate limits apply. Avoid repeatedly sending `Picture Off` and wake
   commands in quick succession.
+- Volume-key interception depends on the active user's desktop session. macOS
+  requires Accessibility approval for the installed Python runtime.
 
 ## Troubleshooting
 
@@ -244,7 +270,7 @@ archive checksum.
 - Add the TV to the SmartThings mobile app and confirm it is online.
 - Sign in with the same Samsung account used by the mobile app.
 - Confirm the network permits Samsung sign-in and SmartThings API access.
-- If credentials have expired, run the macOS configuration tool and sign in
+- If credentials have expired, run the platform configuration tool and sign in
   again during its interactive verification step.
 
 ### The hotkey does nothing
@@ -281,8 +307,8 @@ the picture is acceptable.
 
 Uninstallation stops background startup and removes the controller's local
 configuration, LAN pairing token, private runtime, status, and logs. It does not
-change the TV or revoke its Device Connection Manager entry. On macOS, it also
-leaves the SmartThings CLI's shared OAuth profile unchanged.
+change the TV or revoke its Device Connection Manager entry. On both platforms,
+it also leaves the SmartThings CLI's shared OAuth profile unchanged.
 
 ## Development and tests
 

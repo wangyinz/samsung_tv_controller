@@ -10,6 +10,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import queue
 import re
 import signal
 import subprocess
@@ -56,6 +57,9 @@ DEFAULT_CONFIG = {
     "smartthings_profile": "local.qn990f.picture-controller",
     "smartthings_device_id": "",
     "smartthings_command_timeout_seconds": 20.0,
+    "enable_volume_control": True,
+    "tv_volume_floor": 10,
+    "tv_volume_refresh_seconds": 3.0,
 }
 
 logger = logging.getLogger("QN990FController")
@@ -90,6 +94,14 @@ class CGPoint(Structure):
     _fields_ = [("x", c_double), ("y", c_double)]
 
 
+class AudioObjectPropertyAddress(Structure):
+    _fields_ = [
+        ("mSelector", c_uint32),
+        ("mScope", c_uint32),
+        ("mElement", c_uint32),
+    ]
+
+
 class MacOSBackend:
     K_EVENT_CLASS_KEYBOARD = fourcc("keyb")
     K_EVENT_HOTKEY_PRESSED = 5
@@ -106,6 +118,21 @@ class MacOSBackend:
     K_CG_EVENT_KEY_DOWN = 10
     K_CG_EVENT_SCROLL_WHEEL = 22
     K_CG_EVENT_OTHER_MOUSE_DOWN = 25
+    K_CG_EVENT_SYSTEM_DEFINED = 14
+    K_CG_EVENT_DATA1 = 55
+    K_CG_SESSION_EVENT_TAP = 1
+    K_CG_HEAD_INSERT_EVENT_TAP = 0
+    K_CG_EVENT_TAP_OPTION_DEFAULT = 0
+    NX_KEYTYPE_SOUND_UP = 0
+    NX_KEYTYPE_SOUND_DOWN = 1
+    NX_KEY_STATE_DOWN = 0x0A
+    NX_KEY_STATE_UP = 0x0B
+    K_AUDIO_OBJECT_SYSTEM_OBJECT = 1
+    K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN = 0
+    K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE = fourcc("dOut")
+    K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL = fourcc("glob")
+    K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR = fourcc("volm")
+    K_AUDIO_DEVICE_PROPERTY_SCOPE_OUTPUT = fourcc("outp")
 
     KEY_CODES = {
         "A":0x00,"S":0x01,"D":0x02,"F":0x03,"H":0x04,"G":0x05,
@@ -118,14 +145,19 @@ class MacOSBackend:
     }
 
     CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p)
+    EVENT_TAP_CALLBACK = ctypes.CFUNCTYPE(
+        c_void_p, c_void_p, c_int32, c_void_p, c_void_p
+    )
 
     def __init__(self):
         ht = "/System/Library/Frameworks/Carbon.framework/Frameworks/HIToolbox.framework/HIToolbox"
         cg = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
         cf = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        ca = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
         self.hitoolbox = ctypes.CDLL(ht)
         self.coregraphics = ctypes.CDLL(cg)
         self.corefoundation = ctypes.CDLL(cf)
+        self.coreaudio = ctypes.CDLL(ca)
 
         self.hitoolbox.GetApplicationEventTarget.argtypes = []
         self.hitoolbox.GetApplicationEventTarget.restype = c_void_p
@@ -161,8 +193,37 @@ class MacOSBackend:
         self.coregraphics.CGEventCreate.restype = c_void_p
         self.coregraphics.CGEventGetLocation.argtypes = [c_void_p]
         self.coregraphics.CGEventGetLocation.restype = CGPoint
+        self.coregraphics.CGEventGetIntegerValueField.argtypes = [c_void_p, c_int32]
+        self.coregraphics.CGEventGetIntegerValueField.restype = ctypes.c_int64
+        self.coregraphics.CGEventTapCreate.argtypes = [
+            c_uint32, c_uint32, c_uint32, ctypes.c_uint64,
+            self.EVENT_TAP_CALLBACK, c_void_p,
+        ]
+        self.coregraphics.CGEventTapCreate.restype = c_void_p
+        self.coregraphics.CGEventTapEnable.argtypes = [c_void_p, c_uint8]
+        self.coregraphics.CGEventTapEnable.restype = None
         self.corefoundation.CFRelease.argtypes = [c_void_p]
         self.corefoundation.CFRelease.restype = None
+        self.corefoundation.CFMachPortCreateRunLoopSource.argtypes = [
+            c_void_p, c_void_p, c_int32,
+        ]
+        self.corefoundation.CFMachPortCreateRunLoopSource.restype = c_void_p
+        self.corefoundation.CFRunLoopGetCurrent.argtypes = []
+        self.corefoundation.CFRunLoopGetCurrent.restype = c_void_p
+        self.corefoundation.CFRunLoopAddSource.argtypes = [c_void_p, c_void_p, c_void_p]
+        self.corefoundation.CFRunLoopAddSource.restype = None
+        self.corefoundation.CFRunLoopRun.argtypes = []
+        self.corefoundation.CFRunLoopRun.restype = None
+        self.corefoundation.CFRunLoopStop.argtypes = [c_void_p]
+        self.corefoundation.CFRunLoopStop.restype = None
+        self._run_loop_default_mode = c_void_p.in_dll(
+            self.corefoundation, "kCFRunLoopDefaultMode"
+        )
+        self.coreaudio.AudioObjectGetPropertyData.argtypes = [
+            c_uint32, POINTER(AudioObjectPropertyAddress), c_uint32,
+            c_void_p, POINTER(c_uint32), c_void_p,
+        ]
+        self.coreaudio.AudioObjectGetPropertyData.restype = c_int32
 
         self._handler_ref = c_void_p()
         self._hotkey_ref = c_void_p()
@@ -172,12 +233,142 @@ class MacOSBackend:
         self._dispatcher_target = c_void_p()
         self._input_poll_lock = threading.Lock()
         self._last_input_snapshot = None
+        self._volume_tap = c_void_p()
+        self._volume_tap_callback = None
+        self._volume_run_loop = c_void_p()
+        self._volume_thread = None
+        self._consumed_volume_keys = set()
 
     def idle_seconds(self) -> float:
         return max(0.0, float(self.coregraphics.CGEventSourceSecondsSinceLastEventType(
             self.K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION,
             self.K_CG_ANY_INPUT_EVENT_TYPE
         )))
+
+    def _audio_property(self, object_id, selector, scope, value, element=0):
+        address = AudioObjectPropertyAddress(
+            selector, scope, element
+        )
+        size = c_uint32(ctypes.sizeof(value))
+        status = self.coreaudio.AudioObjectGetPropertyData(
+            object_id, ctypes.byref(address), 0, None,
+            ctypes.byref(size), ctypes.byref(value),
+        )
+        if status != 0:
+            raise RuntimeError(f"AudioObjectGetPropertyData failed: OSStatus {status}")
+        return value.value
+
+    def system_volume_is_max(self) -> bool:
+        device_id = c_uint32()
+        self._audio_property(
+            self.K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            self.K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            self.K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            device_id,
+        )
+        volumes = []
+        for element in (0, 1, 2):
+            volume = ctypes.c_float()
+            try:
+                self._audio_property(
+                    device_id.value,
+                    self.K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+                    self.K_AUDIO_DEVICE_PROPERTY_SCOPE_OUTPUT,
+                    volume,
+                    element,
+                )
+            except RuntimeError:
+                continue
+            volumes.append(float(volume.value))
+        # Fixed-volume HDMI devices expose no writable scalar; in that case
+        # local volume is effectively already at its ceiling.
+        return not volumes or all(value >= 0.999 for value in volumes)
+
+    def register_volume_keys(self, handler):
+        ready = threading.Event()
+        failure = []
+
+        def callback(_proxy, event_type, event, _user):
+            if event_type in (-2, -1):
+                if self._volume_tap:
+                    self.coregraphics.CGEventTapEnable(self._volume_tap, True)
+                return event
+            if event_type != self.K_CG_EVENT_SYSTEM_DEFINED:
+                return event
+            data = int(self.coregraphics.CGEventGetIntegerValueField(
+                event, self.K_CG_EVENT_DATA1
+            ))
+            key_code = (data >> 16) & 0xFFFF
+            key_state = (data >> 8) & 0xFF
+            if key_code not in (self.NX_KEYTYPE_SOUND_UP, self.NX_KEYTYPE_SOUND_DOWN):
+                return event
+            direction = "up" if key_code == self.NX_KEYTYPE_SOUND_UP else "down"
+            if key_state == self.NX_KEY_STATE_DOWN:
+                try:
+                    if handler(direction):
+                        self._consumed_volume_keys.add(key_code)
+                        return None
+                except Exception as exc:
+                    logger.warning("Volume-key routing failed: %r", exc)
+            elif key_state == self.NX_KEY_STATE_UP and key_code in self._consumed_volume_keys:
+                self._consumed_volume_keys.discard(key_code)
+                return None
+            return event
+
+        self._volume_tap_callback = self.EVENT_TAP_CALLBACK(callback)
+
+        def run_tap():
+            mask = 1 << self.K_CG_EVENT_SYSTEM_DEFINED
+            tap = self.coregraphics.CGEventTapCreate(
+                self.K_CG_SESSION_EVENT_TAP,
+                self.K_CG_HEAD_INSERT_EVENT_TAP,
+                self.K_CG_EVENT_TAP_OPTION_DEFAULT,
+                mask,
+                self._volume_tap_callback,
+                None,
+            )
+            if not tap:
+                failure.append(
+                    "macOS denied the volume-key event tap; grant Accessibility "
+                    "permission to the controller's Python runtime."
+                )
+                ready.set()
+                return
+            self._volume_tap = c_void_p(tap)
+            source = self.corefoundation.CFMachPortCreateRunLoopSource(None, tap, 0)
+            if not source:
+                failure.append("CFMachPortCreateRunLoopSource returned NULL.")
+                ready.set()
+                return
+            self._volume_run_loop = c_void_p(self.corefoundation.CFRunLoopGetCurrent())
+            self.corefoundation.CFRunLoopAddSource(
+                self._volume_run_loop, source, self._run_loop_default_mode
+            )
+            self.coregraphics.CGEventTapEnable(tap, True)
+            ready.set()
+            self.corefoundation.CFRunLoopRun()
+            self.corefoundation.CFRelease(source)
+            self.corefoundation.CFRelease(tap)
+
+        self._volume_thread = threading.Thread(
+            target=run_tap, daemon=True, name="QN990F-VolumeKeys"
+        )
+        self._volume_thread.start()
+        if not ready.wait(2.0):
+            raise RuntimeError("Timed out while starting the volume-key event tap.")
+        if failure:
+            raise RuntimeError(failure[0])
+
+    def unregister_volume_keys(self):
+        if self._volume_run_loop:
+            self.corefoundation.CFRunLoopStop(self._volume_run_loop)
+        if self._volume_thread:
+            self._volume_thread.join(timeout=1.0)
+        self._volume_tap = c_void_p()
+        self._volume_run_loop = c_void_p()
+        self._volume_thread = None
+        self._volume_tap_callback = None
+        self._consumed_volume_keys.clear()
 
     def _input_snapshot(self):
         counter = self.coregraphics.CGEventSourceCounterForEventType
@@ -352,6 +543,11 @@ def load_config():
     )
     cfg["socket_timeout_seconds"] = max(1.0, float(cfg.get("socket_timeout_seconds",5)))
     cfg["key_press_delay_seconds"] = max(0.0, float(cfg.get("key_press_delay_seconds",0.05)))
+    cfg["enable_volume_control"] = bool(cfg.get("enable_volume_control", True))
+    cfg["tv_volume_floor"] = min(100, max(0, int(cfg.get("tv_volume_floor", 10))))
+    cfg["tv_volume_refresh_seconds"] = max(
+        1.0, float(cfg.get("tv_volume_refresh_seconds", 3.0))
+    )
     cfg["remote_name"] = str(cfg.get("remote_name", "")).strip()
     if not cfg["remote_name"]:
         raise ValueError("remote_name cannot be empty.")
@@ -507,6 +703,11 @@ class TVClient:
                     if attempt == 0: time.sleep(0.15)
             return False
 
+    def get_volume(self):
+        # The Samsung LAN remote protocol can send volume keys but does not
+        # expose the current volume. SmartThings supplies that state.
+        return None
+
     def close(self):
         with self._lock:
             self._reset()
@@ -517,6 +718,7 @@ class SmartThingsTVClient:
     # KEY_PICTURE_OFF/Click, then maps Click to this OCF pressAndRelease write.
     EXECUTE_CAPABILITY = "execute"
     REMOTE_MARKER_CAPABILITY = "samsungvd.remoteControl"
+    AUDIO_VOLUME_CAPABILITY = "audioVolume"
     REMOTE_RESOURCE = "/sec/tv/remotecontrol"
 
     def __init__(self, cfg):
@@ -606,9 +808,11 @@ class SmartThingsTVClient:
             self.EXECUTE_CAPABILITY,
             self.REMOTE_MARKER_CAPABILITY,
         }
+        if self.cfg["enable_volume_control"]:
+            required_capabilities.add(self.AUDIO_VOLUME_CAPABILITY)
         if not required_capabilities.issubset(capabilities):
             raise RuntimeError(
-                "Selected device does not expose SmartThings TV remote control."
+                "Selected device does not expose the required SmartThings TV controls."
             )
         if "Television" not in categories:
             raise RuntimeError("Selected SmartThings device is not a television.")
@@ -620,7 +824,7 @@ class SmartThingsTVClient:
     def _ensure_command_budget(self, needed):
         cutoff = time.monotonic() - 60.0
         self._command_times = [stamp for stamp in self._command_times if stamp > cutoff]
-        if len(self._command_times) + needed > 12:
+        if len(self._command_times) + needed > 100:
             raise RuntimeError("SmartThings command limit reached; wait one minute.")
 
     def _send_ocf_remote(self, remote_key):
@@ -639,6 +843,54 @@ class SmartThingsTVClient:
         )
         logger.info("SmartThings sent OCF remote key %s", remote_key)
 
+    def _send_volume_command(self, remote_key):
+        command = "volumeUp" if remote_key == "KEY_VOLUP" else "volumeDown"
+        self._command_times.append(time.monotonic())
+        self._run(
+            "devices:commands",
+            str(self.cfg["smartthings_device_id"]),
+            f"main:{self.AUDIO_VOLUME_CAPABILITY}:{command}()",
+        )
+        logger.info("SmartThings sent audioVolume.%s", command)
+
+    def get_volume(self):
+        with self._lock:
+            try:
+                self._ensure_command_budget(1)
+                self._command_times.append(time.monotonic())
+                self._run(
+                    "devices:commands",
+                    str(self.cfg["smartthings_device_id"]),
+                    "main:refresh:refresh()",
+                )
+                time.sleep(0.5)
+                output = self._run(
+                    "devices:status", str(self.cfg["smartthings_device_id"]), "--json"
+                )
+                status = json.loads(output)
+                value = status["components"]["main"]["audioVolume"]["volume"]["value"]
+                return min(100, max(0, int(value)))
+            except Exception as exc:
+                logger.warning("SmartThings volume query failed: %r", exc)
+                return None
+
+    def set_volume(self, value):
+        with self._lock:
+            try:
+                target = min(100, max(0, int(value)))
+                self._ensure_command_budget(1)
+                self._command_times.append(time.monotonic())
+                self._run(
+                    "devices:commands",
+                    str(self.cfg["smartthings_device_id"]),
+                    f"main:{self.AUDIO_VOLUME_CAPABILITY}:setVolume({target})",
+                )
+                logger.info("SmartThings set audioVolume to %d", target)
+                return True
+            except Exception as exc:
+                logger.warning("SmartThings set volume failed: %r", exc)
+                return False
+
     def send(self, key):
         with self._lock:
             try:
@@ -648,6 +900,9 @@ class SmartThingsTVClient:
                 elif key == str(self.cfg["wake_key"]):
                     self._ensure_command_budget(1)
                     self._send_ocf_remote(key)
+                elif key in {"KEY_VOLUP", "KEY_VOLDOWN"}:
+                    self._ensure_command_budget(1)
+                    self._send_volume_command(key)
                 else:
                     raise ValueError(f"Unsupported SmartThings action: {key}")
                 return True
@@ -665,11 +920,126 @@ def make_tv_client(cfg):
     return TVClient(cfg)
 
 
+class VolumeCoordinator:
+    BUFFER_SECONDS = 0.2
+
+    def __init__(self, cfg, tv):
+        self.cfg = cfg
+        self.tv = tv
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._commands = queue.SimpleQueue()
+        self._tv_volume = None
+        self._estimate_valid_until = 0.0
+        self._buffer_start_volume = None
+        self._buffer_deadline = 0.0
+        self._worker = threading.Thread(
+            target=self._run, daemon=True, name="QN990F-VolumeControl"
+        )
+        self._worker.start()
+
+    def handle_key(self, direction, system_is_max=False):
+        if direction == "up":
+            if not system_is_max:
+                return False
+            with self._lock:
+                if self._tv_volume is None:
+                    self._commands.put("KEY_VOLUP")
+                    return True
+                if self._tv_volume >= 100:
+                    return True
+                notify = self._buffer_deadline == 0.0
+                if notify:
+                    self._buffer_start_volume = self._tv_volume
+                self._tv_volume += 1
+                now = time.monotonic()
+                self._buffer_deadline = now + self.BUFFER_SECONDS
+                self._estimate_valid_until = now + max(
+                    5.0, float(self.cfg["tv_volume_refresh_seconds"]) * 2
+                )
+            if notify:
+                self._commands.put("flush_volume")
+            return True
+
+        floor = int(self.cfg["tv_volume_floor"])
+        with self._lock:
+            if self._tv_volume is None or self._tv_volume <= floor:
+                return False
+            notify = self._buffer_deadline == 0.0
+            if notify:
+                self._buffer_start_volume = self._tv_volume
+            self._tv_volume -= 1
+            now = time.monotonic()
+            self._buffer_deadline = now + self.BUFFER_SECONDS
+            self._estimate_valid_until = now + max(
+                5.0, float(self.cfg["tv_volume_refresh_seconds"]) * 2
+            )
+        if notify:
+            self._commands.put("flush_volume")
+        return True
+
+    def _flush_volume_buffer(self):
+        while not self._stop.is_set():
+            with self._lock:
+                remaining = self._buffer_deadline - time.monotonic()
+            if remaining > 0:
+                if self._stop.wait(remaining):
+                    return
+                continue
+            with self._lock:
+                target = self._tv_volume
+                start = self._buffer_start_volume
+                self._buffer_deadline = 0.0
+                self._buffer_start_volume = None
+            if target is None or target == start:
+                return
+            if not self.tv.set_volume(target):
+                with self._lock:
+                    self._tv_volume = None
+                    self._estimate_valid_until = 0.0
+            return
+
+    def _run(self):
+        refresh_at = 0.0
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now >= refresh_at:
+                with self._lock:
+                    estimate_is_current = now < self._estimate_valid_until
+                if not estimate_is_current:
+                    volume = self.tv.get_volume()
+                    if volume is not None:
+                        with self._lock:
+                            self._tv_volume = volume
+                refresh_at = time.monotonic() + float(
+                    self.cfg["tv_volume_refresh_seconds"]
+                )
+            if self._stop.is_set():
+                break
+            try:
+                command = self._commands.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if command == "flush_volume":
+                self._flush_volume_buffer()
+                with self._lock:
+                    if self._tv_volume is None:
+                        refresh_at = 0.0
+            else:
+                self.tv.send(command)
+
+    def stop(self):
+        self._stop.set()
+        timeout = float(self.cfg.get("smartthings_command_timeout_seconds", 0.0)) + 1.0
+        self._worker.join(timeout=max(1.0, timeout))
+
+
 class Controller:
     def __init__(self, cfg, backend):
         self.cfg = cfg
         self.backend = backend
         self.tv = make_tv_client(cfg)
+        self.volume = VolumeCoordinator(cfg, self.tv) if cfg["enable_volume_control"] else None
         self._op_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._input_lock = threading.Lock()
@@ -686,6 +1056,12 @@ class Controller:
         self._assert_cache = False
         self._assert_checked = 0.0
         self.backend.reset_input_baseline()
+
+    def handle_volume_key(self, direction):
+        if self.volume is None:
+            return False
+        system_is_max = direction == "up" and self.backend.system_volume_is_max()
+        return self.volume.handle_key(direction, system_is_max)
 
     def is_off(self):
         with self._state_lock: return self.picture_off
@@ -895,6 +1271,8 @@ class Controller:
 
     def stop(self):
         self._stop.set()
+        if self.volume:
+            self.volume.stop()
         self.tv.close()
 
 
@@ -922,6 +1300,19 @@ def check_hotkey(cfg):
         b.unregister_hotkey()
 
 
+def check_volume_keys():
+    backend = MacOSBackend()
+    try:
+        backend.register_volume_keys(lambda _direction: False)
+        print("Volume-key event tap registration succeeded.")
+        return 0
+    except Exception as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    finally:
+        backend.unregister_volume_keys()
+
+
 def run_daemon(cfg):
     backend = MacOSBackend()
     ctrl = None
@@ -934,6 +1325,8 @@ def run_daemon(cfg):
         lock = acquire_lock()
         backend.register_hotkey(str(cfg["hotkey"]))
         ctrl = Controller(cfg, backend)
+        if cfg["enable_volume_control"]:
+            backend.register_volume_keys(ctrl.handle_volume_key)
         threading.Thread(target=ctrl.monitor, daemon=True, name="QN990F-IdleMonitor").start()
         write_status(
             running=True, state="awake", hotkey=cfg["hotkey"],
@@ -949,6 +1342,7 @@ def run_daemon(cfg):
         write_status(running=False,state="error",error=str(exc))
         return 1
     finally:
+        backend.unregister_volume_keys()
         if ctrl: ctrl.stop()
         backend.unregister_hotkey()
         if lock:
@@ -966,6 +1360,7 @@ def main():
     g.add_argument("--off",action="store_true")
     g.add_argument("--wake",action="store_true")
     g.add_argument("--check-hotkey",action="store_true")
+    g.add_argument("--check-volume-keys",action="store_true")
     g.add_argument("--idle",action="store_true")
     a = ap.parse_args()
     try:
@@ -975,6 +1370,7 @@ def main():
         return 2
 
     if a.check_hotkey: return check_hotkey(cfg)
+    if a.check_volume_keys: return check_volume_keys()
     if a.idle:
         print(f"{MacOSBackend().idle_seconds():.3f}")
         return 0
