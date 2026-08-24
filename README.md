@@ -77,11 +77,11 @@ settings. Reports for additional models are welcome.
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
 | Elevated privileges | Not required | Not required for the controller; the installer may use `winget` to install a missing user-scoped Python runtime |
 
-When volume control is enabled, the macOS controller uses IOHID matching only
-for the standard Volume Up and Volume Down usages, so macOS Input Monitoring
-permission is required.
-Wake detection
-continues to use anonymous system event counters and does not read typed text.
+The macOS controller uses IOHID matching only for the standard scroll-wheel,
+Volume Up, and Volume Down usages; macOS may require Input Monitoring
+permission for wheel wake and integrated volume routing. Keyboard and mouse-
+button wake continue to use anonymous system event counters, and the controller
+does not read typed text.
 The Windows controller uses Raw Input for wake detection and a low-level hook
 limited to `Volume Up` and `Volume Down`.
 
@@ -154,11 +154,10 @@ directory together.
 
 If Gatekeeper blocks the downloaded script, Control-click `INSTALL.command`,
 choose **Open**, and confirm once more. Homebrew, Xcode Command Line Tools,
-and `sudo` are not required. Input Monitoring is needed only for optional
-volume-key routing; add the installed controller Python runtime to **System
-Settings → Privacy & Security → Input Monitoring** when macOS prompts. If
-permission is not granted, Picture Off control continues and only volume-key
-routing is disabled for that run.
+and `sudo` are not required. Add the installed controller Python runtime to
+**System Settings → Privacy & Security → Input Monitoring** if macOS denies
+direct HID access. Without that access, Picture Off and keyboard/button wake
+continue, but wheel wake and volume-key routing are disabled for that run.
 
 See the [macOS guide](QN990F_macOS_Controller/README.txt) for detailed setup,
 configuration, file locations, and manual commands.

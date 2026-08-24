@@ -157,8 +157,10 @@ class MacOSBackend:
     K_IOHID_REQUEST_TYPE_LISTEN_EVENT = 1
     K_IOHID_ACCESS_TYPE_GRANTED = 0
     K_IO_RETURN_EXCLUSIVE_ACCESS = ctypes.c_int32(0xE00002C5).value
+    K_HID_PAGE_GENERIC_DESKTOP = 0x01
     K_HID_PAGE_KEYBOARD = 0x07
     K_HID_PAGE_CONSUMER = 0x0C
+    K_HID_USAGE_GENERIC_DESKTOP_WHEEL = 0x38
     K_HID_USAGE_KEYBOARD_VOLUME_UP = 0x80
     K_HID_USAGE_KEYBOARD_VOLUME_DOWN = 0x81
     K_HID_USAGE_CONSUMER_VOLUME_INCREMENT = 0xE9
@@ -389,6 +391,16 @@ class MacOSBackend:
             return "down"
         return None
 
+    @classmethod
+    def _hid_input_for_usage(cls, usage_page, usage, value):
+        if (
+            usage_page == cls.K_HID_PAGE_GENERIC_DESKTOP
+            and usage == cls.K_HID_USAGE_GENERIC_DESKTOP_WHEEL
+        ):
+            return "mouse_wheel" if value != 0 else None
+        direction = cls._volume_direction_for_hid_usage(usage_page, usage)
+        return f"volume_{direction}" if direction and value > 0 else None
+
     def _create_volume_hid_matching(self):
         refs = []
 
@@ -415,6 +427,10 @@ class MacOSBackend:
         usage_key = cf_string("Usage")
         dictionaries = []
         for usage_page, usage in (
+            (
+                self.K_HID_PAGE_GENERIC_DESKTOP,
+                self.K_HID_USAGE_GENERIC_DESKTOP_WHEEL,
+            ),
             (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_UP),
             (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_DOWN),
             (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT),
@@ -440,14 +456,16 @@ class MacOSBackend:
         refs.append(c_void_p(array))
         return array, refs
 
-    def register_volume_keys(self, handler, request_access=False):
+    def register_volume_keys(
+        self, handler=None, wheel_handler=None, request_access=False
+    ):
         access = self.iokit.IOHIDCheckAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
         if access != self.K_IOHID_ACCESS_TYPE_GRANTED and request_access:
             self.iokit.IOHIDRequestAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
             access = self.iokit.IOHIDCheckAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
         if access != self.K_IOHID_ACCESS_TYPE_GRANTED:
             raise RuntimeError(
-                "macOS denied direct volume-key input; grant Input Monitoring "
+                "macOS denied direct HID input; grant Input Monitoring "
                 "permission to the controller's Python runtime."
             )
 
@@ -458,13 +476,19 @@ class MacOSBackend:
             if result != 0 or not value:
                 return
             element = self.iokit.IOHIDValueGetElement(value)
-            if not element or self.iokit.IOHIDValueGetIntegerValue(value) <= 0:
+            if not element:
                 return
+            raw_value = int(self.iokit.IOHIDValueGetIntegerValue(value))
             usage_page = self.iokit.IOHIDElementGetUsagePage(element)
             usage = self.iokit.IOHIDElementGetUsage(element)
-            direction = self._volume_direction_for_hid_usage(usage_page, usage)
-            if direction is None:
+            hid_input = self._hid_input_for_usage(usage_page, usage, raw_value)
+            if hid_input == "mouse_wheel":
+                if wheel_handler is not None:
+                    wheel_handler()
                 return
+            if not hid_input or handler is None:
+                return
+            direction = hid_input.removeprefix("volume_")
             logger.info("Volume HID input received: direction=%s", direction)
             try:
                 routed = handler(direction)
@@ -514,7 +538,7 @@ class MacOSBackend:
                     raise RuntimeError(f"IOHIDManagerOpen failed: IOReturn {status}.")
                 self._volume_run_loop = run_loop
                 self._volume_hid_manager = manager
-                logger.info("Direct volume-key HID manager started: access=%d", access)
+                logger.info("Direct HID input manager started: access=%d", access)
                 ready.set()
                 self.corefoundation.CFRunLoopRun()
             except Exception as exc:
@@ -535,7 +559,7 @@ class MacOSBackend:
                     ready.set()
 
         self._volume_thread = threading.Thread(
-            target=run_hid_manager, daemon=True, name="QN990F-VolumeKeys"
+            target=run_hid_manager, daemon=True, name="QN990F-HIDInput"
         )
         self._volume_thread.start()
         if not ready.wait(2.0):
@@ -1663,7 +1687,7 @@ def check_volume_keys():
     backend = MacOSBackend()
     try:
         backend.register_volume_keys(lambda _direction: False, request_access=True)
-        print("Direct volume-key input registration succeeded.")
+        print("Direct HID input registration succeeded.")
         return 0
     except Exception as exc:
         print(exc, file=sys.stderr)
@@ -1685,15 +1709,17 @@ def run_daemon(cfg):
         backend.register_hotkey(str(cfg["hotkey"]))
         ctrl = Controller(cfg, backend)
         ctrl.start_authorization_monitor()
-        if cfg["enable_volume_control"]:
-            try:
-                backend.register_volume_keys(ctrl.handle_volume_key)
-            except RuntimeError as exc:
-                logger.warning("Volume-key control disabled for this run: %s", exc)
-                backend.unregister_volume_keys()
-                if ctrl.volume:
-                    ctrl.volume.stop()
-                    ctrl.volume = None
+        try:
+            backend.register_volume_keys(
+                ctrl.handle_volume_key if cfg["enable_volume_control"] else None,
+                wheel_handler=lambda: ctrl.handle_input({"kind": "mouse_wheel"}),
+            )
+        except RuntimeError as exc:
+            logger.warning("Direct HID input disabled for this run: %s", exc)
+            backend.unregister_volume_keys()
+            if ctrl.volume:
+                ctrl.volume.stop()
+                ctrl.volume = None
         threading.Thread(target=ctrl.monitor, daemon=True, name="QN990F-IdleMonitor").start()
         write_status(
             running=True, state="awake", hotkey=cfg["hotkey"],

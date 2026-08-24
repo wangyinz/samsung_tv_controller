@@ -125,33 +125,33 @@ Not Required
 - Xcode / Command Line Tools
 - sudo / root
 
-macOS may require Input Monitoring permission only when optional integrated
-volume control is enabled.
+macOS may require Input Monitoring permission for scroll-wheel wake and
+optional integrated volume control.
 
 
 macOS Privacy Permission
 ------------------------
-When enabled, integrated volume routing uses IOHIDManager matching limited to
-the standard keyboard and consumer Volume Up and Volume Down usages. If macOS
-denies access, add the installed venv Python runtime to System Settings ->
-Privacy & Security -> Input
-Monitoring when macOS prompts. The controller does not subscribe to ordinary
-typed-key usages. If permission is unavailable, Picture Off control continues
-and only volume routing is disabled for that run.
+The controller uses IOHIDManager matching limited to the standard scroll-wheel,
+Volume Up, and Volume Down usages. If macOS denies access, add the installed
+venv Python runtime to System Settings -> Privacy & Security -> Input Monitoring
+when macOS prompts. The controller does not subscribe to ordinary typed-key
+usages. If permission is unavailable, Picture Off and keyboard/button wake
+continue, but wheel wake and volume routing are disabled for that run.
 
-Why Wake Detection Does Not Need Input Monitoring
---------------------------------------------------
+Wake Input and Privacy
+----------------------
 The global hotkey uses macOS Carbon RegisterEventHotKey.
 
 Wake detection after Picture Off uses:
     CGEventSourceCounterForEventType(kCGEventSourceStateHIDSystemState, ...)
 
-The controller compares cumulative macOS event counters for keyboard key-down,
-mouse-button down, and scroll-wheel input. It also observes mouse movement only when the
-advanced enable_mouse_move_wake setting is explicitly enabled. This wake path does not
-read specific keys, typed text, or event contents. Because it observes only
-the key-down counter, pressing Control, Command, Option, or Shift alone does not wake the
-picture.
+The controller compares cumulative macOS event counters for keyboard key-down
+and mouse-button down. Scroll-wheel wake uses the limited IOHID matching above
+because some pointing devices do not update the Quartz scroll counter. Mouse
+movement is observed only when the advanced enable_mouse_move_wake setting is
+explicitly enabled. The controller does not read specific keys or typed text.
+Because it observes only the key-down counter, pressing Control, Command,
+Option, or Shift alone does not wake the picture.
 
 Pointer movement alone is disabled as a wake source by default. macOS includes
 software-posted cursor movement in the zero-permission counters, but does not provide
@@ -164,8 +164,9 @@ synthetic movement or ignore a particular device as Windows Raw Input can.
 Automatic idle Picture Off uses this API separately:
     CGEventSourceSecondsSinceLastEventType(..., kCGAnyInputEventType)
 
-These system-level counters and the current pointer position do not require Accessibility
-or Input Monitoring permission.
+These system-level counters and the current pointer position do not require
+Accessibility or Input Monitoring permission. The limited scroll-wheel HID
+listener may require Input Monitoring permission.
 
 
 Normal Use

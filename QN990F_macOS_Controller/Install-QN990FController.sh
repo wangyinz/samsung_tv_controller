@@ -119,7 +119,7 @@ echo "Default hotkey: Control + Command + P -> Picture Off"
 echo "After this controller blanks the TV: key, mouse button, or wheel input -> wake"
 echo "Pointer movement alone is ignored to prevent unattended synthetic wake events."
 echo
-echo "Wake detection does not require Input Monitoring permission."
+echo "Keyboard/button wake needs no permission; wheel wake may require Input Monitoring."
 echo
 echo "Control connection:"
 echo "  1. Direct LAN WebSocket (original mode)"
@@ -400,14 +400,12 @@ PY
 step "Checking the global shortcut"
 "$PYTHON" "$CONTROLLER" --check-hotkey
 
-if [[ "$ENABLE_VOLUME" == "true" ]]; then
-  step "Checking volume-key access"
-  if ! "$PYTHON" "$CONTROLLER" --check-volume-keys; then
-    echo "Open System Settings -> Privacy & Security -> Input Monitoring."
-    echo "Add and enable: $PYTHON"
-    echo "Then rerun INSTALL.command."
-    exit 2
-  fi
+step "Checking direct HID input access"
+if ! "$PYTHON" "$CONTROLLER" --check-volume-keys; then
+  echo "Open System Settings -> Privacy & Security -> Input Monitoring."
+  echo "Add and enable: $PYTHON"
+  echo "Then rerun INSTALL.command."
+  exit 2
 fi
 
 step "Checking macOS idle-input API"

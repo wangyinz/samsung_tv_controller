@@ -228,6 +228,29 @@ class MacOSBackendTests(unittest.TestCase):
             )
         )
 
+    def test_hid_wheel_accepts_both_directions_but_not_zero(self):
+        backend = controller.MacOSBackend
+        page = backend.K_HID_PAGE_GENERIC_DESKTOP
+        usage = backend.K_HID_USAGE_GENERIC_DESKTOP_WHEEL
+
+        self.assertEqual(
+            backend._hid_input_for_usage(page, usage, 1), "mouse_wheel"
+        )
+        self.assertEqual(
+            backend._hid_input_for_usage(page, usage, -1), "mouse_wheel"
+        )
+        self.assertIsNone(backend._hid_input_for_usage(page, usage, 0))
+
+    def test_hid_volume_classification_ignores_key_release(self):
+        backend = controller.MacOSBackend
+        page = backend.K_HID_PAGE_CONSUMER
+        usage = backend.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT
+
+        self.assertEqual(
+            backend._hid_input_for_usage(page, usage, 1), "volume_up"
+        )
+        self.assertIsNone(backend._hid_input_for_usage(page, usage, 0))
+
     def test_manual_carbon_pump_dispatches_and_releases_event(self):
         calls = []
         backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
