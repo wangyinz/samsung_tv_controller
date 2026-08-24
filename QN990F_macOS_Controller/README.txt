@@ -131,7 +131,9 @@ macOS Privacy Permission
 When enabled, integrated volume routing uses a CGEvent tap limited to the hardware Volume Up
 and Volume Down controls. Add the installed venv Python runtime to System
 Settings -> Privacy & Security -> Accessibility when macOS prompts. The
-controller does not inspect ordinary typed keys through this tap.
+controller does not inspect ordinary typed keys through this tap. If permission
+is unavailable, Picture Off control continues and only volume routing is disabled
+for that run.
 
 Why Wake Detection Does Not Need Input Monitoring
 --------------------------------------------------
@@ -204,8 +206,12 @@ Each Picture Off or restore action in cloud mode requires one HTTPS command, so 
 usually slower than LAN mode. Avoid triggering it repeatedly in quick succession during
 normal use.
 Background control never opens a sign-in page by itself. If OAuth refresh fails, commands
-stop. Run Configure.command, sign in again during its interactive verification step, and
-then resume using the hotkey.
+stop and one authorization alert is shown. The controller performs a read-only TV lookup
+at startup and every 30 minutes so the official CLI can refresh credentials before a
+hotkey is needed. This detects failures early but cannot prevent SmartThings from revoking
+a refresh token. Choose Reauthorize in the alert, or double-click Reauthorize.command;
+the helper stops the controller, completes browser sign-in, and restarts it without
+sending a TV command.
 
 
 Video and Presentation Protection
@@ -232,6 +238,9 @@ You can change:
 - The TV IP address in LAN mode
 
 Rerun the original INSTALL.command to select another SmartThings TV or switch connection modes.
+To renew only the SmartThings sign-in, double-click:
+
+~/Library/Application Support/QN990FController/Reauthorize.command
 
 Hotkey examples:
     Ctrl+Cmd+P
@@ -257,6 +266,10 @@ existing installations. They do not restrict TV model compatibility.
 
 ~/Library/Application Support/QN990FController/smartthings
     Pinned version of the official SmartThings CLI used in cloud mode.
+
+~/Library/Application Support/QN990FController/Reauthorize.command
+    Stops the controller, renews SmartThings OAuth interactively, and restarts it.
+    It validates access with a read-only request and sends no TV command.
 
 The official CLI stores the SmartThings OAuth access and refresh tokens in its user-level
 data directory with 0600 file permissions. The controller uses a separate profile:
@@ -295,9 +308,11 @@ Important Limitations
    or mouse input that meets the wake rules. Pointer movement does not re-enable it unless
    movement wake was explicitly enabled.
 
-5. When SmartThings credentials expire, background commands fail within a bounded period
-   instead of opening a browser. Run Configure.command to sign in interactively again and
-   reverify the TV.
+5. SmartThings credential checks are read-only, run at startup and every 30 minutes, and
+   are serialized with cloud commands and interactive sign-in. When refresh fails, the
+   controller shows one alert and stops cloud commands instead of opening a browser by
+   itself. The check detects failure earlier but cannot prevent server-side revocation.
+   Run Reauthorize.command to sign in again without sending a TV command.
 
 6. Samsung firmware may silently ignore some KEY_* commands. If KEY_RETURN cannot restore
    the picture, change wake_key in config.json to KEY_UP, then run Configure.command.

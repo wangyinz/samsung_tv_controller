@@ -415,6 +415,31 @@ class SmartThingsTVClientTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["PATH"], self.temp_dir.name)
         self.assertNotIn("shell", kwargs)
 
+    def test_refresh_401_is_reported_as_interactive_authorization(self):
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="Request failed with status code 401"
+        )
+        with mock.patch.object(
+            controller.subprocess, "run", return_value=completed
+        ):
+            with self.assertRaises(controller.SmartThingsAuthRequired):
+                self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertTrue(self.client.authorization_required())
+
+    def test_authorization_check_is_read_only_and_serialized_by_client(self):
+        with mock.patch.object(self.client, "_run", return_value="{}") as run:
+            self.assertTrue(self.client.check_authorization())
+
+        run.assert_called_once_with("devices", DEVICE_ID, "--json")
+
+    def test_authorization_check_stops_after_interactive_login_is_required(self):
+        self.client._authorization_required = True
+        with mock.patch.object(self.client, "_run") as run:
+            self.assertFalse(self.client.check_authorization())
+
+        run.assert_not_called()
+
     def test_pair_accepts_samsung_ocf_tv_shape_with_null_device_type_name(self):
         device = {
             "label": '65" Neo QLED 8K',
@@ -671,6 +696,27 @@ class ControllerInputTests(unittest.TestCase):
     @staticmethod
     def enable_mouse_move_wake(instance):
         instance.cfg["enable_mouse_move_wake"] = True
+
+    def test_authorization_monitor_reports_failed_refresh_once(self):
+        instance, _backend = self.make_controller("smartthings")
+        instance.tv = mock.Mock()
+        instance.tv.check_authorization.return_value = False
+
+        with mock.patch.object(instance._stop, "wait", return_value=False), \
+             mock.patch.object(instance, "_report_authorization_required") as report:
+            instance._authorization_monitor()
+
+        report.assert_called_once_with()
+
+    def test_authorization_prompt_is_only_started_once(self):
+        instance, _backend = self.make_controller("smartthings")
+
+        with mock.patch.object(controller.threading, "Thread") as thread:
+            instance._report_authorization_required()
+            instance._report_authorization_required()
+
+        thread.assert_called_once()
+        thread.return_value.start.assert_called_once_with()
 
     def test_hotkey_is_one_way_picture_off_even_when_already_off(self):
         instance, backend = self.make_controller()

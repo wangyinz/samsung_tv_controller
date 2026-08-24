@@ -29,6 +29,7 @@ TOKEN_FILE = APP_DIR / "samsung-token.txt"
 LOG_FILE = APP_DIR / "controller.log"
 STATUS_FILE = APP_DIR / "status.json"
 LOCK_FILE = APP_DIR / "controller.lock"
+SMARTTHINGS_LOCK_FILE = APP_DIR / "smartthings.lock"
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 3
 APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,6 +58,7 @@ DEFAULT_CONFIG = {
     "smartthings_profile": "local.qn990f.picture-controller",
     "smartthings_device_id": "",
     "smartthings_command_timeout_seconds": 20.0,
+    "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": True,
     "tv_volume_floor": 10,
     "tv_volume_refresh_seconds": 3.0,
@@ -576,6 +578,13 @@ def load_config():
             20.0,
             max(5.0, float(cfg.get("smartthings_command_timeout_seconds", 20.0))),
         )
+        cfg["smartthings_auth_check_interval_seconds"] = min(
+            3600.0,
+            max(
+                300.0,
+                float(cfg.get("smartthings_auth_check_interval_seconds", 1800.0)),
+            ),
+        )
     MacOSBackend().parse_hotkey(str(cfg.get("hotkey","Ctrl+Cmd+P")))
     return cfg
 
@@ -587,6 +596,31 @@ def write_status(**kwargs):
         }, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+def show_smartthings_auth_prompt():
+    helper = APP_DIR / "Reauthorize.command"
+    if not helper.is_file():
+        logger.error("SmartThings reauthorization helper is missing: %s", helper)
+        return
+    script = r'''
+on run argv
+    set reply to display dialog "SmartThings authorization needs renewal. Picture Off commands cannot run until you sign in again." with title "Samsung TV Picture Controller" buttons {"Later", "Reauthorize"} default button "Reauthorize" cancel button "Later" giving up after 60 with icon caution
+    if gave up of reply is false and button returned of reply is "Reauthorize" then
+        do shell script "/usr/bin/open " & quoted form of item 1 of argv
+    end if
+end run
+'''
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", script, str(helper)],
+            capture_output=True,
+            text=True,
+            timeout=70,
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("Could not show SmartThings authorization prompt: %r", exc)
 
 
 def display_is_explicitly_required() -> bool:
@@ -713,6 +747,10 @@ class TVClient:
             self._reset()
 
 
+class SmartThingsAuthRequired(RuntimeError):
+    pass
+
+
 class SmartThingsTVClient:
     # Samsung's TV web plugin maps the Accessibility Mode button to
     # KEY_PICTURE_OFF/Click, then maps Click to this OCF pressAndRelease write.
@@ -725,6 +763,34 @@ class SmartThingsTVClient:
         self.cfg = cfg
         self._lock = threading.Lock()
         self._command_times = []
+        self._authorization_required = False
+
+    def _acquire_process_lock(self, timeout):
+        handle = SMARTTHINGS_LOCK_FILE.open("a+")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise RuntimeError("Timed out waiting for another SmartThings operation.")
+                time.sleep(0.1)
+
+    @staticmethod
+    def _is_auth_error(detail):
+        detail = detail.lower()
+        return any(marker in detail for marker in (
+            "spawn open enoent",
+            "invalid_grant",
+            "refresh token",
+            "401",
+            "authorization requires user interaction",
+        ))
+
+    def authorization_required(self):
+        return self._authorization_required
 
     def _run(self, *args, timeout=None, allow_login=False):
         cli = Path(str(self.cfg["smartthings_cli"])).expanduser()
@@ -754,30 +820,55 @@ class SmartThingsTVClient:
             float(self.cfg["smartthings_command_timeout_seconds"])
             if timeout is None else float(timeout)
         )
+        process_lock = self._acquire_process_lock(command_timeout)
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                env=environment,
-                timeout=command_timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "SmartThings command timed out. Run Configure.command to sign in again."
-            ) from exc
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    timeout=command_timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "SmartThings command timed out. Check the network connection."
+                ) from exc
+        finally:
+            fcntl.flock(process_lock.fileno(), fcntl.LOCK_UN)
+            process_lock.close()
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
+            detail = "\n".join(
+                part for part in (result.stdout, result.stderr) if part
+            ).strip()
             if len(detail) > 1200:
                 detail = detail[-1200:]
-            if "spawn open ENOENT" in detail:
-                raise RuntimeError(
+            if self._is_auth_error(detail):
+                self._authorization_required = True
+                raise SmartThingsAuthRequired(
                     "SmartThings authorization requires user interaction; "
-                    "run Configure.command."
+                    "run Reauthorize.command."
                 )
             raise RuntimeError(detail or f"SmartThings CLI exited with {result.returncode}")
         return result.stdout
+
+    def check_authorization(self):
+        with self._lock:
+            if self._authorization_required:
+                return False
+            try:
+                self._run(
+                    "devices", str(self.cfg["smartthings_device_id"]), "--json"
+                )
+                logger.info("SmartThings authorization check succeeded")
+                return True
+            except SmartThingsAuthRequired as exc:
+                logger.error("SmartThings authorization check failed: %s", exc)
+                return False
+            except Exception as exc:
+                logger.warning("SmartThings authorization check unavailable: %r", exc)
+                return None
 
     def pair(self):
         output = self._run(
@@ -1044,6 +1135,8 @@ class Controller:
         self._state_lock = threading.Lock()
         self._input_lock = threading.Lock()
         self._stop = threading.Event()
+        self._auth_notice_sent = False
+        self._auth_thread = None
         self.picture_off = False
         self.wake_not_before = 0.0
         self.next_off_attempt = 0.0
@@ -1056,6 +1149,54 @@ class Controller:
         self._assert_cache = False
         self._assert_checked = 0.0
         self.backend.reset_input_baseline()
+
+    def start_authorization_monitor(self):
+        if self.cfg["control_method"] != "smartthings":
+            return
+        self._auth_thread = threading.Thread(
+            target=self._authorization_monitor,
+            daemon=True,
+            name="QN990F-SmartThingsAuth",
+        )
+        self._auth_thread.start()
+
+    def _report_authorization_required(self):
+        with self._state_lock:
+            if self._auth_notice_sent:
+                return
+            self._auth_notice_sent = True
+        logger.error("SmartThings authorization requires interactive sign-in")
+        write_status(
+            running=True,
+            state="authorization_required",
+            last_action="smartthings_auth_failed",
+            reason="reauthorization_required",
+        )
+        threading.Thread(
+            target=show_smartthings_auth_prompt,
+            daemon=True,
+            name="QN990F-SmartThingsAuthPrompt",
+        ).start()
+
+    def _authorization_monitor(self):
+        if self._stop.wait(5.0):
+            return
+        interval = float(self.cfg["smartthings_auth_check_interval_seconds"])
+        while not self._stop.is_set():
+            result = self.tv.check_authorization()
+            if result is False:
+                self._report_authorization_required()
+                return
+            delay = interval if result is True else min(interval, 300.0)
+            if self._stop.wait(delay):
+                return
+
+    def _report_auth_after_failure(self):
+        if self.cfg["control_method"] == "smartthings" and \
+           getattr(self.tv, "authorization_required", lambda: False)():
+            self._report_authorization_required()
+            return True
+        return False
 
     def handle_volume_key(self, direction):
         if self.volume is None:
@@ -1085,7 +1226,8 @@ class Controller:
                     self.next_off_attempt = time.monotonic() + 5
                 else:
                     self.next_off_attempt = float("inf")
-                write_status(running=True,state="error",last_action="blank_failed",reason=reason)
+                if not self._report_auth_after_failure():
+                    write_status(running=True,state="error",last_action="blank_failed",reason=reason)
                 return False
 
             self.backend.reset_input_baseline()
@@ -1109,7 +1251,8 @@ class Controller:
             if now < self.next_wake_attempt: return False
             if not self.tv.send(str(self.cfg["wake_key"])):
                 self.next_wake_attempt = now + 1
-                write_status(running=True,state="error",last_action="wake_failed",reason=reason)
+                if not self._report_auth_after_failure():
+                    write_status(running=True,state="error",last_action="wake_failed",reason=reason)
                 return False
             self.set_off(False)
             self._clear_pending_wake()
@@ -1271,6 +1414,9 @@ class Controller:
 
     def stop(self):
         self._stop.set()
+        if self._auth_thread:
+            timeout = float(self.cfg["smartthings_command_timeout_seconds"]) + 1.0
+            self._auth_thread.join(timeout=timeout)
         if self.volume:
             self.volume.stop()
         self.tv.close()
@@ -1325,8 +1471,16 @@ def run_daemon(cfg):
         lock = acquire_lock()
         backend.register_hotkey(str(cfg["hotkey"]))
         ctrl = Controller(cfg, backend)
+        ctrl.start_authorization_monitor()
         if cfg["enable_volume_control"]:
-            backend.register_volume_keys(ctrl.handle_volume_key)
+            try:
+                backend.register_volume_keys(ctrl.handle_volume_key)
+            except RuntimeError as exc:
+                logger.warning("Volume-key control disabled for this run: %s", exc)
+                backend.unregister_volume_keys()
+                if ctrl.volume:
+                    ctrl.volume.stop()
+                    ctrl.volume = None
         threading.Thread(target=ctrl.monitor, daemon=True, name="QN990F-IdleMonitor").start()
         write_status(
             running=True, state="awake", hotkey=cfg["hotkey"],

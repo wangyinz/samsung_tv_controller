@@ -562,6 +562,7 @@ if ($LASTEXITCODE -ne 0) {
 $InstalledFileNames = @(
     "QN990FController.py",
     "Configure-QN990FController.ps1",
+    "Reauthorize-SmartThings.ps1",
     "Uninstall-QN990FController.ps1",
     "README.txt"
 )
@@ -626,6 +627,7 @@ try {
             smartthings_profile = $SmartThingsProfile
             smartthings_device_id = $SmartThingsDeviceId
             smartthings_command_timeout_seconds = 20.0
+            smartthings_auth_check_interval_seconds = 1800.0
             enable_volume_control = $EnableVolumeControl
             tv_volume_floor = 10
             tv_volume_refresh_seconds = 3.0
@@ -706,6 +708,7 @@ try {
         Write-Step "Copying controller files"
         Copy-Item $SourceControllerPath $ControllerPath -Force
         Copy-Item (Join-Path $PSScriptRoot "Configure-QN990FController.ps1") (Join-Path $AppDir "Configure-QN990FController.ps1") -Force
+        Copy-Item (Join-Path $PSScriptRoot "Reauthorize-SmartThings.ps1") (Join-Path $AppDir "Reauthorize-SmartThings.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "Uninstall-QN990FController.ps1") (Join-Path $AppDir "Uninstall-QN990FController.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "README.txt") (Join-Path $AppDir "README.txt") -Force
 
@@ -723,6 +726,14 @@ try {
             -Target $PowerShellExe `
             -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Configure-QN990FController.ps1`"" `
             -WorkingDirectory $AppDir
+        Remove-Item (Join-Path $StartMenuDir "Reauthorize SmartThings.lnk") -Force -ErrorAction SilentlyContinue
+        if ($ControlMethod -eq "smartthings") {
+            New-Shortcut `
+                -Path (Join-Path $StartMenuDir "Reauthorize SmartThings.lnk") `
+                -Target $PowerShellExe `
+                -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$AppDir\Reauthorize-SmartThings.ps1`"" `
+                -WorkingDirectory $AppDir
+        }
         New-Shortcut `
             -Path (Join-Path $StartMenuDir "Uninstall Samsung TV Picture Controller.lnk") `
             -Target $PowerShellExe `

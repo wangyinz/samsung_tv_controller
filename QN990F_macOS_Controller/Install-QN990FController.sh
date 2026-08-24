@@ -184,9 +184,11 @@ rm -f "$APP_DIR/launchd.out.log" "$APP_DIR/launchd.err.log"
 step "Copying controller files"
 cp "$SCRIPT_DIR/QN990FController.py" "$CONTROLLER"
 cp "$SCRIPT_DIR/Configure.command" "$APP_DIR/Configure.command"
+cp "$SCRIPT_DIR/Reauthorize.command" "$APP_DIR/Reauthorize.command"
 cp "$SCRIPT_DIR/Uninstall.command" "$APP_DIR/Uninstall.command"
 cp "$SCRIPT_DIR/README.txt" "$APP_DIR/README.txt"
-chmod 755 "$CONTROLLER" "$APP_DIR/Configure.command" "$APP_DIR/Uninstall.command"
+chmod 755 "$CONTROLLER" "$APP_DIR/Configure.command" \
+  "$APP_DIR/Reauthorize.command" "$APP_DIR/Uninstall.command"
 
 step "Installing an isolated Python runtime"
 mkdir -p "$UV_DIR"
@@ -362,6 +364,7 @@ config = {
     "smartthings_profile": smartthings_profile,
     "smartthings_device_id": smartthings_device_id,
     "smartthings_command_timeout_seconds": 20.0,
+    "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": enable_volume.lower() == "true",
     "tv_volume_floor": 10,
     "tv_volume_refresh_seconds": 3.0,
@@ -493,3 +496,7 @@ fi
 echo
 echo "To reconfigure later, double-click:"
 echo "  $APP_DIR/Configure.command"
+if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
+  echo "To renew SmartThings sign-in without sending a TV command, double-click:"
+  echo "  $APP_DIR/Reauthorize.command"
+fi

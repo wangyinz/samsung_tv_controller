@@ -115,7 +115,10 @@ Requirements:
 
 Cloud mode does not silently fall back to LAN mode. It depends on an internet
 service, is usually slower than local control, and may be affected by API or
-firmware changes.
+firmware changes. The controller makes a read-only SmartThings device request
+at startup and every 30 minutes. This lets the official CLI refresh credentials
+before a hotkey is needed and detects failed refreshes early; it does not prevent
+SmartThings from revoking a refresh token.
 
 ## Installation
 
@@ -134,7 +137,9 @@ If Gatekeeper blocks the downloaded script, Control-click `INSTALL.command`,
 choose **Open**, and confirm once more. Homebrew, Xcode Command Line Tools,
 `sudo` and Input Monitoring permission are not required. For volume-key
 routing, add the installed controller Python runtime to **System Settings →
-Privacy & Security → Accessibility** when macOS prompts.
+Privacy & Security → Accessibility** when macOS prompts. If permission is not
+granted, Picture Off control continues and only volume-key routing is disabled
+for that run.
 
 See the [macOS guide](QN990F_macOS_Controller/README.txt) for detailed setup,
 configuration, file locations, and manual commands.
@@ -214,9 +219,11 @@ Reconfiguration tools are installed with each platform version:
   and stores its tokens in its own user-level data directory with restrictive
   permissions. The controller's `config.json` does not contain a SmartThings
   access token.
-- Background cloud commands are non-interactive. If token refresh fails, the
-  command stops instead of opening a sign-in page; reauthenticate through the
-  platform configuration tool.
+- Background cloud commands are non-interactive and serialized across controller
+  processes. If token refresh fails, the command stops and the controller shows
+  one authorization alert. Choosing **Reauthorize** opens a dedicated helper
+  that stops the controller, completes browser sign-in, and restarts it without
+  sending a TV command.
 - The project adds no application telemetry. It writes local status and
   diagnostic files only. Windows logs may include Raw Input device paths; macOS
   logs input categories but not typed text. Windows wake records may also
@@ -250,6 +257,9 @@ checksum.
   or remove that behavior.
 - SmartThings rate limits apply. Avoid repeatedly sending `Picture Off` and wake
   commands in quick succession.
+- SmartThings cloud authentication remains dependent on Samsung's OAuth service
+  and the official CLI. The proactive check detects failures earlier but cannot
+  guarantee that SmartThings will continue accepting a saved refresh token.
 - Volume-key interception depends on the active user's desktop session. macOS
   requires Accessibility approval for the installed Python runtime.
 
@@ -270,8 +280,9 @@ checksum.
 - Add the TV to the SmartThings mobile app and confirm it is online.
 - Sign in with the same Samsung account used by the mobile app.
 - Confirm the network permits Samsung sign-in and SmartThings API access.
-- If credentials have expired, run the platform configuration tool and sign in
-  again during its interactive verification step.
+- If authorization has expired, choose **Reauthorize** in the alert, run
+  `Reauthorize.command` on macOS, or choose **Reauthorize SmartThings** from the
+  Windows Start menu. This validation is read-only and sends no TV command.
 
 ### The hotkey does nothing
 

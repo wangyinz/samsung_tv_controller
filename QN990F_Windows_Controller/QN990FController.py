@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "smartthings_profile": "local.qn990f.picture-controller",
     "smartthings_device_id": "",
     "smartthings_command_timeout_seconds": 20.0,
+    "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": True,
     "tv_volume_floor": 10,
     "tv_volume_refresh_seconds": 3.0,
@@ -117,6 +118,9 @@ CLSCTX_ALL = 23
 COINIT_APARTMENTTHREADED = 2
 E_RENDER = 0
 E_CONSOLE = 0
+WAIT_OBJECT_0 = 0
+WAIT_ABANDONED = 0x00000080
+WAIT_TIMEOUT = 0x00000102
 
 ERROR_ALREADY_EXISTS = 183
 ERROR_CLASS_ALREADY_EXISTS = 1410
@@ -331,6 +335,10 @@ user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wi
 user32.RegisterHotKey.restype = wintypes.BOOL
 user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.MessageBoxW.argtypes = [
+    wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT
+]
+user32.MessageBoxW.restype = ctypes.c_int
 
 user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
 user32.GetMessageW.restype = ctypes.c_int
@@ -390,6 +398,10 @@ user32.GetRawInputDeviceInfoW.restype = wintypes.UINT
 
 kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+kernel32.ReleaseMutex.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -789,6 +801,13 @@ def load_config() -> dict:
             20.0,
             max(5.0, float(config.get("smartthings_command_timeout_seconds", 20.0))),
         )
+        config["smartthings_auth_check_interval_seconds"] = min(
+            3600.0,
+            max(
+                300.0,
+                float(config.get("smartthings_auth_check_interval_seconds", 1800.0)),
+            ),
+        )
 
     ignored = config.get("ignored_input_device_substrings", [])
     if not isinstance(ignored, list):
@@ -811,6 +830,40 @@ def write_status(**kwargs) -> None:
         STATUS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+def show_smartthings_auth_prompt() -> None:
+    helper = APP_DIR / "Reauthorize-SmartThings.ps1"
+    if not helper.is_file():
+        logger.error("SmartThings reauthorization helper is missing: %s", helper)
+        return
+    message = (
+        "SmartThings authorization needs renewal. Picture Off commands cannot run "
+        "until you sign in again.\n\nReauthorize now?"
+    )
+    result = user32.MessageBoxW(
+        None,
+        message,
+        "Samsung TV Picture Controller",
+        0x00000004 | 0x00000030 | 0x00010000,
+    )
+    if result != 6:
+        return
+    try:
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(helper),
+            ],
+            cwd=str(APP_DIR),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+    except Exception as exc:
+        logger.warning("Could not open SmartThings reauthorization: %r", exc)
 
 
 # ---------------- Raw Input window ----------------
@@ -1145,6 +1198,10 @@ class TVClient:
             self._reset()
 
 
+class SmartThingsAuthRequired(RuntimeError):
+    pass
+
+
 class SmartThingsTVClient:
     EXECUTE_CAPABILITY = "execute"
     REMOTE_MARKER_CAPABILITY = "samsungvd.remoteControl"
@@ -1155,6 +1212,37 @@ class SmartThingsTVClient:
         self.config = config
         self._lock = threading.Lock()
         self._command_times = []
+        self._authorization_required = False
+
+    @staticmethod
+    def _acquire_process_lock(timeout):
+        handle = kernel32.CreateMutexW(
+            None, False, "Local\\SamsungTVPictureControllerSmartThings"
+        )
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        result = kernel32.WaitForSingleObject(handle, max(1, int(timeout * 1000)))
+        if result not in {WAIT_OBJECT_0, WAIT_ABANDONED}:
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            if result == WAIT_TIMEOUT:
+                raise RuntimeError("Timed out waiting for another SmartThings operation.")
+            raise ctypes.WinError(error)
+        return handle
+
+    @staticmethod
+    def _is_auth_error(detail):
+        detail = detail.lower()
+        return any(marker in detail for marker in (
+            "spawn none enoent",
+            "invalid_grant",
+            "refresh token",
+            "401",
+            "authorization requires user interaction",
+        ))
+
+    def authorization_required(self):
+        return self._authorization_required
 
     def _run(self, *args, timeout=None, allow_login=False):
         cli = Path(str(self.config["smartthings_cli"])).expanduser()
@@ -1174,26 +1262,56 @@ class SmartThingsTVClient:
             float(self.config["smartthings_command_timeout_seconds"])
             if timeout is None else float(timeout)
         )
+        process_lock = self._acquire_process_lock(command_timeout)
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                env=environment,
-                timeout=command_timeout,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "SmartThings command timed out. Run Configure from the Start menu."
-            ) from exc
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    timeout=command_timeout,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "SmartThings command timed out. Check the network connection."
+                ) from exc
+        finally:
+            kernel32.ReleaseMutex(process_lock)
+            kernel32.CloseHandle(process_lock)
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
+            detail = "\n".join(
+                part for part in (result.stdout, result.stderr) if part
+            ).strip()
             if len(detail) > 1200:
                 detail = detail[-1200:]
+            if self._is_auth_error(detail):
+                self._authorization_required = True
+                raise SmartThingsAuthRequired(
+                    "SmartThings authorization requires user interaction; "
+                    "run Reauthorize SmartThings from the Start menu."
+                )
             raise RuntimeError(detail or f"SmartThings CLI exited with {result.returncode}")
         return result.stdout
+
+    def check_authorization(self):
+        with self._lock:
+            if self._authorization_required:
+                return False
+            try:
+                self._run(
+                    "devices", str(self.config["smartthings_device_id"]), "--json"
+                )
+                logger.info("SmartThings authorization check succeeded")
+                return True
+            except SmartThingsAuthRequired as exc:
+                logger.error("SmartThings authorization check failed: %s", exc)
+                return False
+            except Exception as exc:
+                logger.warning("SmartThings authorization check unavailable: %r", exc)
+                return None
 
     def pair(self):
         output = self._run(
@@ -1463,6 +1581,8 @@ class Controller:
         self._state_lock = threading.Lock()
         self._input_lock = threading.Lock()
         self._stop = threading.Event()
+        self._auth_notice_sent = False
+        self._auth_thread = None
 
         self.picture_off = False
         self.wake_not_before = 0.0
@@ -1479,6 +1599,54 @@ class Controller:
 
         self._display_required_cache = False
         self._display_required_checked_at = 0.0
+
+    def start_authorization_monitor(self) -> None:
+        if self.config["control_method"] != "smartthings":
+            return
+        self._auth_thread = threading.Thread(
+            target=self._authorization_monitor,
+            daemon=True,
+            name="QN990F-SmartThingsAuth",
+        )
+        self._auth_thread.start()
+
+    def _report_authorization_required(self) -> None:
+        with self._state_lock:
+            if self._auth_notice_sent:
+                return
+            self._auth_notice_sent = True
+        logger.error("SmartThings authorization requires interactive sign-in")
+        write_status(
+            running=True,
+            state="authorization_required",
+            last_action="smartthings_auth_failed",
+            reason="reauthorization_required",
+        )
+        threading.Thread(
+            target=show_smartthings_auth_prompt,
+            daemon=True,
+            name="QN990F-SmartThingsAuthPrompt",
+        ).start()
+
+    def _authorization_monitor(self) -> None:
+        if self._stop.wait(5.0):
+            return
+        interval = float(self.config["smartthings_auth_check_interval_seconds"])
+        while not self._stop.is_set():
+            result = self.tv.check_authorization()
+            if result is False:
+                self._report_authorization_required()
+                return
+            delay = interval if result is True else min(interval, 300.0)
+            if self._stop.wait(delay):
+                return
+
+    def _report_auth_after_failure(self) -> bool:
+        if self.config["control_method"] == "smartthings" and \
+           getattr(self.tv, "authorization_required", lambda: False)():
+            self._report_authorization_required()
+            return True
+        return False
 
     def handle_volume_key(self, direction: str, system_is_max=False) -> bool:
         if self.volume is None:
@@ -1508,12 +1676,13 @@ class Controller:
             ok = self.tv.send(str(self.config["picture_off_key"]))
             if not ok:
                 self.next_off_attempt = time.monotonic() + 5.0
-                write_status(
-                    running=True,
-                    state="error",
-                    last_action="blank_failed",
-                    reason=reason,
-                )
+                if not self._report_auth_after_failure():
+                    write_status(
+                        running=True,
+                        state="error",
+                        last_action="blank_failed",
+                        reason=reason,
+                    )
                 return False
 
             now = time.monotonic()
@@ -1550,12 +1719,13 @@ class Controller:
             ok = self.tv.send(str(self.config["wake_key"]))
             if not ok:
                 self.next_wake_attempt = now + 1.0
-                write_status(
-                    running=True,
-                    state="error",
-                    last_action="wake_failed",
-                    reason=reason,
-                )
+                if not self._report_auth_after_failure():
+                    write_status(
+                        running=True,
+                        state="error",
+                        last_action="wake_failed",
+                        reason=reason,
+                    )
                 return False
 
             self._set_picture_off_state(False)
@@ -1811,6 +1981,9 @@ class Controller:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._auth_thread:
+            timeout = float(self.config["smartthings_command_timeout_seconds"]) + 1.0
+            self._auth_thread.join(timeout=timeout)
         if self.volume:
             self.volume.stop()
         self.tv.close()
@@ -1877,6 +2050,7 @@ def run_daemon(config: dict) -> int:
         atexit.register(remove_pid_file)
 
         controller = Controller(config)
+        controller.start_authorization_monitor()
         input_window = RawInputWindow(config)
         input_window.create()
         if config["enable_volume_control"]:

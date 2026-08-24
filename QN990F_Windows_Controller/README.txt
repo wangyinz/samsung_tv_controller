@@ -151,6 +151,12 @@ CONFIGURATION
 Use Start menu:
     Samsung TV Picture Controller -> Configure Samsung TV Picture Controller
 
+For SmartThings sign-in only, use:
+    Samsung TV Picture Controller -> Reauthorize SmartThings
+
+The reauthorization helper stops the background controller, completes browser
+sign-in, and restarts it without sending a TV command.
+
 You can change:
 - TV IP in Direct LAN mode
 - Idle timeout (0 disables automatic blanking)
@@ -186,6 +192,10 @@ for in-place upgrades. It does not restrict which compatible TV can be used.
 
 %LOCALAPPDATA%\QN990FController\status.json
     Current/last daemon status.
+
+%LOCALAPPDATA%\QN990FController\Reauthorize-SmartThings.ps1
+    Stops the controller, renews SmartThings OAuth interactively, and restarts it.
+    It validates access with a read-only request and sends no TV command.
 
 
 IMPORTANT BEHAVIOR / LIMITATIONS
@@ -225,6 +235,12 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 - SmartThings mode requires a Samsung OCF Television exposing execute and
   samsungvd.remoteControl. Optional volume control also requires audioVolume. Background commands use the
   official CLI's saved OAuth profile; config.json does not store its token.
+
+- SmartThings authorization is checked with a read-only device request at startup
+  and every 30 minutes. Cloud CLI operations are serialized across controller
+  processes. A failed refresh shows one alert with a Reauthorize option. This
+  detects failures before a hotkey is needed but cannot prevent SmartThings from
+  revoking a saved refresh token.
 
 
 MANUAL TEST COMMANDS
