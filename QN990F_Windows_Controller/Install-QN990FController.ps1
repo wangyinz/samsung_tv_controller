@@ -237,7 +237,20 @@ function Invoke-SmartThingsCliProcess {
         [int]$TimeoutMilliseconds
     )
     $CliProcess = $null
+    $SmartThingsMutex = New-Object System.Threading.Mutex(
+        $false,
+        "Local\SamsungTVPictureControllerSmartThings"
+    )
+    $HasSmartThingsMutex = $false
     try {
+        try {
+            $HasSmartThingsMutex = $SmartThingsMutex.WaitOne($TimeoutMilliseconds)
+        } catch [System.Threading.AbandonedMutexException] {
+            $HasSmartThingsMutex = $true
+        }
+        if (-not $HasSmartThingsMutex) {
+            throw "Timed out waiting for another SmartThings operation."
+        }
         $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
         $StartInfo.FileName = $Path
         $StartInfo.Arguments = $Arguments
@@ -267,6 +280,8 @@ function Invoke-SmartThingsCliProcess {
         }
     } finally {
         if ($CliProcess) { $CliProcess.Dispose() }
+        if ($HasSmartThingsMutex) { $SmartThingsMutex.ReleaseMutex() }
+        $SmartThingsMutex.Dispose()
     }
 }
 
@@ -630,7 +645,7 @@ try {
             smartthings_auth_check_interval_seconds = 1800.0
             enable_volume_control = $EnableVolumeControl
             tv_volume_floor = 10
-            tv_volume_refresh_seconds = 3.0
+            tv_volume_refresh_seconds = 30.0
         }
         if ($ExistingConfig) {
             foreach ($Property in $ExistingConfig.PSObject.Properties) {
@@ -654,6 +669,9 @@ try {
         }
         $Config["hotkey"] = $Hotkey
         $Config["enable_volume_control"] = $EnableVolumeControl
+        $Config["tv_volume_refresh_seconds"] = [Math]::Max(
+            30.0, [double]$Config["tv_volume_refresh_seconds"]
+        )
         $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigPath -Encoding UTF8
 
         Write-Step "Checking the global hotkey"

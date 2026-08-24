@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
     "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": True,
     "tv_volume_floor": 10,
-    "tv_volume_refresh_seconds": 3.0,
+    "tv_volume_refresh_seconds": 30.0,
 }
 
 logger = logging.getLogger("QN990FController")
@@ -121,6 +121,9 @@ E_CONSOLE = 0
 WAIT_OBJECT_0 = 0
 WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
+JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS = 2
+CREATE_SUSPENDED = 0x00000004
 
 ERROR_ALREADY_EXISTS = 183
 ERROR_CLASS_ALREADY_EXISTS = 1410
@@ -323,6 +326,20 @@ class GUID(ctypes.Structure):
     ]
 
 
+class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
 # ---------------- API prototypes ----------------
 
 user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
@@ -402,8 +419,20 @@ kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
 kernel32.ReleaseMutex.restype = wintypes.BOOL
+kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+kernel32.SetInformationJobObject.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD
+]
+kernel32.SetInformationJobObject.restype = wintypes.BOOL
+kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
+
+ntdll = ctypes.WinDLL("ntdll")
+ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+ntdll.NtResumeProcess.restype = wintypes.LONG
 
 powrprof.CallNtPowerInformation.argtypes = [
     ctypes.c_int,
@@ -776,7 +805,7 @@ def load_config() -> dict:
         100, max(0, int(config.get("tv_volume_floor", 10)))
     )
     config["tv_volume_refresh_seconds"] = max(
-        1.0, float(config.get("tv_volume_refresh_seconds", 3.0))
+        30.0, float(config.get("tv_volume_refresh_seconds", 30.0))
     )
 
     if config["control_method"] == "smartthings":
@@ -1234,7 +1263,7 @@ class SmartThingsTVClient:
     def _is_auth_error(detail):
         detail = detail.lower()
         return any(marker in detail for marker in (
-            "spawn none enoent",
+            "enoent",
             "invalid_grant",
             "refresh token",
             "401",
@@ -1244,7 +1273,61 @@ class SmartThingsTVClient:
     def authorization_required(self):
         return self._authorization_required
 
+    @staticmethod
+    def _run_noninteractive(command, environment, timeout):
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = JOBOBJECT_BASIC_LIMIT_INFORMATION()
+        limits.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        limits.ActiveProcessLimit = 1
+        process = None
+        try:
+            if not kernel32.SetInformationJobObject(
+                job,
+                JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0) | CREATE_SUSPENDED
+                ),
+            )
+            process_handle = wintypes.HANDLE(int(process._handle))
+            if not kernel32.AssignProcessToJobObject(job, process_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            resume_status = ntdll.NtResumeProcess(process_handle)
+            if resume_status < 0:
+                raise OSError(
+                    f"NtResumeProcess failed: NTSTATUS "
+                    f"0x{resume_status & 0xFFFFFFFF:08X}"
+                )
+            stdout, stderr = process.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr
+            )
+        except Exception:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+            raise
+        finally:
+            kernel32.CloseHandle(job)
+
     def _run(self, *args, timeout=None, allow_login=False):
+        auth_message = (
+            "SmartThings authorization requires user interaction; "
+            "run Reauthorize SmartThings from the Start menu."
+        )
+        if self._authorization_required and not allow_login:
+            raise SmartThingsAuthRequired(auth_message)
         cli = Path(str(self.config["smartthings_cli"])).expanduser()
         if not cli.is_file():
             raise RuntimeError(f"SmartThings CLI is missing: {cli}")
@@ -1265,15 +1348,20 @@ class SmartThingsTVClient:
         process_lock = self._acquire_process_lock(command_timeout)
         try:
             try:
-                result = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    env=environment,
-                    timeout=command_timeout,
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
+                if allow_login:
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                        timeout=command_timeout,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                else:
+                    result = self._run_noninteractive(
+                        command, environment, command_timeout
+                    )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
                     "SmartThings command timed out. Check the network connection."
@@ -1289,11 +1377,10 @@ class SmartThingsTVClient:
                 detail = detail[-1200:]
             if self._is_auth_error(detail):
                 self._authorization_required = True
-                raise SmartThingsAuthRequired(
-                    "SmartThings authorization requires user interaction; "
-                    "run Reauthorize SmartThings from the Start menu."
-                )
+                raise SmartThingsAuthRequired(auth_message)
             raise RuntimeError(detail or f"SmartThings CLI exited with {result.returncode}")
+        if allow_login:
+            self._authorization_required = False
         return result.stdout
 
     def check_authorization(self):
@@ -1462,6 +1549,8 @@ class VolumeCoordinator:
         self._worker.start()
 
     def handle_key(self, direction: str, system_is_max=False) -> bool:
+        if getattr(self.tv, "authorization_required", lambda: False)():
+            return False
         if direction == "up":
             if not system_is_max:
                 return False
@@ -1525,6 +1614,8 @@ class VolumeCoordinator:
     def _run(self) -> None:
         refresh_at = 0.0
         while not self._stop.is_set():
+            if getattr(self.tv, "authorization_required", lambda: False)():
+                return
             now = time.monotonic()
             if now >= refresh_at:
                 with self._lock:
@@ -1534,6 +1625,10 @@ class VolumeCoordinator:
                     if volume is not None:
                         with self._lock:
                             self._tv_volume = volume
+                    elif getattr(
+                        self.tv, "authorization_required", lambda: False
+                    )():
+                        return
                 refresh_at = time.monotonic() + float(
                     self.config["tv_volume_refresh_seconds"]
                 )
@@ -1624,13 +1719,21 @@ class Controller:
         if self._stop.wait(5.0):
             return
         interval = float(self.config["smartthings_auth_check_interval_seconds"])
+        check_at = 0.0
         while not self._stop.is_set():
-            result = self.tv.check_authorization()
-            if result is False:
+            if self.tv.authorization_required():
                 self._report_authorization_required()
                 return
-            delay = interval if result is True else min(interval, 300.0)
-            if self._stop.wait(delay):
+            now = time.monotonic()
+            if now >= check_at:
+                result = self.tv.check_authorization()
+                if result is False:
+                    self._report_authorization_required()
+                    return
+                check_at = now + (
+                    interval if result is True else min(interval, 300.0)
+                )
+            if self._stop.wait(min(1.0, max(0.0, check_at - time.monotonic()))):
                 return
 
     def _report_auth_after_failure(self) -> bool:

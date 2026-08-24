@@ -126,8 +126,18 @@ Cloud mode does not silently fall back to LAN mode. It depends on an internet
 service, is usually slower than local control, and may be affected by API or
 firmware changes. The controller makes a read-only SmartThings device request
 at startup and every 30 minutes. This lets the official CLI refresh credentials
-before a hotkey is needed and detects failed refreshes early; it does not prevent
-SmartThings from revoking a refresh token.
+before a hotkey is needed and detects failed refreshes early.
+
+SmartThings sets the access-token lifetime (normally about 24 hours); this
+project cannot extend it to a week or month. The official CLI automatically
+exchanges an expired access token and the current single-use refresh token for
+new access and refresh tokens. The controller and both installers serialize
+every CLI operation across processes so that two refreshes cannot consume the
+same refresh token or overwrite the newly rotated token. In normal operation,
+one browser authorization is therefore sufficient. Another authorization is
+needed only if access is revoked, the saved CLI credentials are removed or
+damaged, or SmartThings rejects the current refresh token. See SmartThings'
+[token-management documentation](https://developer.smartthings.com/docs/service-integrations/token-management#token-expiry).
 
 ## Installation
 
@@ -198,6 +208,7 @@ left blank.
   fixed-volume output changes this floor to 0 automatically.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
+- Cloud volume state is refreshed no more than once every 30 seconds.
 - Direct LAN can send TV volume keys but cannot query the TV's current volume,
   so the safe TV-first decrease rule is available only in SmartThings mode.
 
@@ -229,9 +240,11 @@ Reconfiguration tools are installed with each platform version:
   and stores its tokens in its own user-level data directory with restrictive
   permissions. The controller's `config.json` does not contain a SmartThings
   access token.
-- Background cloud commands are non-interactive and serialized across controller
-  processes. If token refresh fails, the command stops and the controller shows
-  one authorization alert. Choosing **Reauthorize** opens a dedicated helper
+- Background cloud commands are non-interactive and cannot create browser child
+  processes. All CLI calls from the controller, installer, and reauthorization
+  helper use the same cross-process lock. A network timeout is treated as
+  transient and retried later; only an actual OAuth/refresh failure stops cloud
+  activity and shows one authorization alert. Choosing **Reauthorize** opens a dedicated helper
   that stops the controller, completes browser sign-in, and restarts it without
   sending a TV command.
 - The project adds no application telemetry. It writes local status and
@@ -268,8 +281,9 @@ checksum.
 - SmartThings rate limits apply. Avoid repeatedly sending `Picture Off` and wake
   commands in quick succession.
 - SmartThings cloud authentication remains dependent on Samsung's OAuth service
-  and the official CLI. The proactive check detects failures earlier but cannot
-  guarantee that SmartThings will continue accepting a saved refresh token.
+  and the official CLI. The periodic check keeps the CLI's automatic token
+  rotation active and detects failures earlier, but it cannot override
+  server-side revocation.
 - Volume-key interception depends on the active user's desktop session. If
   macOS denies access, approve Input Monitoring for the installed Python
   runtime.

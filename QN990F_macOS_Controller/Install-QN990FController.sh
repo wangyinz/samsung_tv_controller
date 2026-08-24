@@ -42,7 +42,31 @@ stop_agent() {
 }
 
 run_smartthings() {
-  env -u SMARTTHINGS_TOKEN "$SMARTTHINGS" "$@" --token ""
+  env -u SMARTTHINGS_TOKEN "$PYTHON" - \
+    "$APP_DIR/smartthings.lock" "$SMARTTHINGS" "$@" --token "" <<'PY'
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+
+lock_path, *command = sys.argv[1:]
+with open(lock_path, "a+", encoding="utf-8") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    process = subprocess.Popen(command, start_new_session=True)
+    try:
+        return_code = process.wait(timeout=600)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        print("SmartThings sign-in timed out after 10 minutes.", file=sys.stderr)
+        return_code = 124
+sys.exit(return_code)
+PY
 }
 
 install_smartthings_cli() {
@@ -367,7 +391,7 @@ config = {
     "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": enable_volume.lower() == "true",
     "tv_volume_floor": 10,
-    "tv_volume_refresh_seconds": 3.0,
+    "tv_volume_refresh_seconds": 30.0,
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)

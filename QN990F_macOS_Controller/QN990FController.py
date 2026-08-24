@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
     "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": True,
     "tv_volume_floor": 10,
-    "tv_volume_refresh_seconds": 3.0,
+    "tv_volume_refresh_seconds": 30.0,
 }
 
 logger = logging.getLogger("QN990FController")
@@ -730,7 +730,7 @@ def load_config():
     cfg["enable_volume_control"] = bool(cfg.get("enable_volume_control", True))
     cfg["tv_volume_floor"] = min(100, max(0, int(cfg.get("tv_volume_floor", 10))))
     cfg["tv_volume_refresh_seconds"] = max(
-        1.0, float(cfg.get("tv_volume_refresh_seconds", 3.0))
+        30.0, float(cfg.get("tv_volume_refresh_seconds", 30.0))
     )
     cfg["remote_name"] = str(cfg.get("remote_name", "")).strip()
     if not cfg["remote_name"]:
@@ -975,6 +975,12 @@ class SmartThingsTVClient:
         return self._authorization_required
 
     def _run(self, *args, timeout=None, allow_login=False):
+        auth_message = (
+            "SmartThings authorization requires user interaction; "
+            "run Reauthorize.command."
+        )
+        if self._authorization_required and not allow_login:
+            raise SmartThingsAuthRequired(auth_message)
         cli = Path(str(self.cfg["smartthings_cli"])).expanduser()
         if not cli.is_file() or not os.access(cli, os.X_OK):
             raise RuntimeError(f"SmartThings CLI is missing or not executable: {cli}")
@@ -998,6 +1004,7 @@ class SmartThingsTVClient:
             # macOS `open` executable. An intentionally empty PATH makes that
             # fallback fail immediately while normal token refresh stays usable.
             environment["PATH"] = str(no_browser_dir)
+            environment["BROWSER"] = "none"
         command_timeout = (
             float(self.cfg["smartthings_command_timeout_seconds"])
             if timeout is None else float(timeout)
@@ -1028,11 +1035,10 @@ class SmartThingsTVClient:
                 detail = detail[-1200:]
             if self._is_auth_error(detail):
                 self._authorization_required = True
-                raise SmartThingsAuthRequired(
-                    "SmartThings authorization requires user interaction; "
-                    "run Reauthorize.command."
-                )
+                raise SmartThingsAuthRequired(auth_message)
             raise RuntimeError(detail or f"SmartThings CLI exited with {result.returncode}")
+        if allow_login:
+            self._authorization_required = False
         return result.stdout
 
     def check_authorization(self):
@@ -1206,6 +1212,8 @@ class VolumeCoordinator:
     def handle_key(
         self, direction, system_is_max=False, system_is_adjustable=True
     ):
+        if getattr(self.tv, "authorization_required", lambda: False)():
+            return False
         if direction == "up":
             if not system_is_max:
                 return False
@@ -1274,6 +1282,8 @@ class VolumeCoordinator:
     def _run(self):
         refresh_at = 0.0
         while not self._stop.is_set():
+            if getattr(self.tv, "authorization_required", lambda: False)():
+                return
             now = time.monotonic()
             if now >= refresh_at:
                 with self._lock:
@@ -1283,6 +1293,10 @@ class VolumeCoordinator:
                     if volume is not None:
                         with self._lock:
                             self._tv_volume = volume
+                    elif getattr(
+                        self.tv, "authorization_required", lambda: False
+                    )():
+                        return
                 refresh_at = time.monotonic() + float(
                     self.cfg["tv_volume_refresh_seconds"]
                 )
@@ -1363,13 +1377,21 @@ class Controller:
         if self._stop.wait(5.0):
             return
         interval = float(self.cfg["smartthings_auth_check_interval_seconds"])
+        check_at = 0.0
         while not self._stop.is_set():
-            result = self.tv.check_authorization()
-            if result is False:
+            if self.tv.authorization_required():
                 self._report_authorization_required()
                 return
-            delay = interval if result is True else min(interval, 300.0)
-            if self._stop.wait(delay):
+            now = time.monotonic()
+            if now >= check_at:
+                result = self.tv.check_authorization()
+                if result is False:
+                    self._report_authorization_required()
+                    return
+                check_at = now + (
+                    interval if result is True else min(interval, 300.0)
+                )
+            if self._stop.wait(min(1.0, max(0.0, check_at - time.monotonic()))):
                 return
 
     def _report_auth_after_failure(self):

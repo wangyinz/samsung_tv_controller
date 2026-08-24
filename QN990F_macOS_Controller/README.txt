@@ -186,6 +186,7 @@ Volume keys:
     current macOS output has no adjustable volume, the TV floor is 0 instead.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
+    Cloud volume state is refreshed no more than once every 30 seconds.
 
     Native audio keys can have only one exclusive owner. If BetterDisplay is
     installed, open BetterDisplay -> Settings -> Keyboard -> Native (Apple)
@@ -218,8 +219,12 @@ normal use.
 Background control never opens a sign-in page by itself. If OAuth refresh fails, commands
 stop and one authorization alert is shown. The controller performs a read-only TV lookup
 at startup and every 30 minutes so the official CLI can refresh credentials before a
-hotkey is needed. This detects failures early but cannot prevent SmartThings from revoking
-a refresh token. Choose Reauthorize in the alert, or double-click Reauthorize.command;
+hotkey is needed. SmartThings sets the access-token lifetime (normally about 24 hours),
+and the official CLI automatically replaces both the access token and the single-use
+refresh token. Controller, installer, and reauthorization CLI calls share one process
+lock so two refreshes cannot corrupt that rotation. Network timeouts are retried later;
+only an actual OAuth/refresh failure requires another sign-in. Choose Reauthorize in the
+alert, or double-click Reauthorize.command;
 the helper stops the controller, completes browser sign-in, and restarts it without
 sending a TV command.
 
@@ -321,7 +326,8 @@ Important Limitations
 5. SmartThings credential checks are read-only, run at startup and every 30 minutes, and
    are serialized with cloud commands and interactive sign-in. When refresh fails, the
    controller shows one alert and stops cloud commands instead of opening a browser by
-   itself. The check detects failure earlier but cannot prevent server-side revocation.
+   itself. Transient network timeouts do not invalidate the saved authorization. The
+   check detects failure earlier but cannot prevent server-side revocation.
    Run Reauthorize.command to sign in again without sending a TV command.
 
 6. Samsung firmware may silently ignore some KEY_* commands. If KEY_RETURN cannot restore

@@ -95,6 +95,10 @@ class RecordingTV:
         self.set_volumes = []
         self.volume_set = threading.Event()
         self.results = list(results or [])
+        self.auth_required = False
+
+    def authorization_required(self):
+        return self.auth_required
 
     def send(self, key):
         self.sent.append(key)
@@ -428,11 +432,37 @@ class SmartThingsTVClientTests(unittest.TestCase):
         )
         self.assertNotIn("SMARTTHINGS_TOKEN", kwargs["env"])
         self.assertEqual(kwargs["env"]["PATH"], self.temp_dir.name)
+        self.assertEqual(kwargs["env"]["BROWSER"], "none")
         self.assertNotIn("shell", kwargs)
 
     def test_refresh_401_is_reported_as_interactive_authorization(self):
         completed = subprocess.CompletedProcess(
             [], 1, stdout="", stderr="Request failed with status code 401"
+        )
+        with mock.patch.object(
+            controller.subprocess, "run", return_value=completed
+        ):
+            with self.assertRaises(controller.SmartThingsAuthRequired):
+                self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertTrue(self.client.authorization_required())
+
+    def test_background_timeout_is_transient_and_can_retry(self):
+        timeout = subprocess.TimeoutExpired(["smartthings"], 20)
+        with mock.patch.object(
+            controller.subprocess, "run", side_effect=timeout
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "network connection"):
+                self.client._run("devices", DEVICE_ID, "--json")
+            with self.assertRaisesRegex(RuntimeError, "network connection"):
+                self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertFalse(self.client.authorization_required())
+        self.assertEqual(run.call_count, 2)
+
+    def test_blocked_background_browser_fallback_latches_authorization(self):
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="Error: spawn open ENOENT"
         )
         with mock.patch.object(
             controller.subprocess, "run", return_value=completed
@@ -587,6 +617,23 @@ class CloudConfigTests(unittest.TestCase):
         self.assertEqual(loaded["idle_minutes"], 7.5)
         self.assertTrue(loaded["enable_idle_off"])
 
+    def test_legacy_fast_volume_refresh_is_clamped_for_cloud_use(self):
+        config = {
+            **controller.DEFAULT_CONFIG,
+            **cloud_config(TEST_HOME.name),
+            "tv_volume_refresh_seconds": 3.0,
+        }
+        controller.CONFIG_FILE.write_text(json.dumps(config), encoding="utf-8")
+
+        class BackendWithoutFrameworks:
+            def parse_hotkey(self, _spec):
+                return 0, 0
+
+        with mock.patch.object(controller, "MacOSBackend", BackendWithoutFrameworks):
+            loaded = controller.load_config()
+
+        self.assertEqual(loaded["tv_volume_refresh_seconds"], 30.0)
+
     def test_legacy_lan_config_keeps_existing_pairing_identity(self):
         config = {
             **controller.DEFAULT_CONFIG,
@@ -647,6 +694,12 @@ class VolumeCoordinatorTests(unittest.TestCase):
     def test_volume_up_routes_to_tv_only_after_system_reaches_maximum(self):
         self.assertFalse(self.volume.handle_key("up", system_is_max=False))
         self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+
+    def test_volume_keys_are_released_after_authorization_failure(self):
+        self.tv.auth_required = True
+
+        self.assertFalse(self.volume.handle_key("up", system_is_max=True))
+        self.assertFalse(self.volume.handle_key("down"))
 
     def test_volume_down_stops_tv_at_floor_then_returns_to_system(self):
         with self.volume._lock:
@@ -738,6 +791,7 @@ class ControllerInputTests(unittest.TestCase):
     def test_authorization_monitor_reports_failed_refresh_once(self):
         instance, _backend = self.make_controller("smartthings")
         instance.tv = mock.Mock()
+        instance.tv.authorization_required.return_value = False
         instance.tv.check_authorization.return_value = False
 
         with mock.patch.object(instance._stop, "wait", return_value=False), \
@@ -745,6 +799,18 @@ class ControllerInputTests(unittest.TestCase):
             instance._authorization_monitor()
 
         report.assert_called_once_with()
+
+    def test_authorization_monitor_reports_a_latched_background_failure(self):
+        instance, _backend = self.make_controller("smartthings")
+        instance.tv = mock.Mock()
+        instance.tv.authorization_required.return_value = True
+
+        with mock.patch.object(instance._stop, "wait", return_value=False), \
+             mock.patch.object(instance, "_report_authorization_required") as report:
+            instance._authorization_monitor()
+
+        report.assert_called_once_with()
+        instance.tv.check_authorization.assert_not_called()
 
     def test_authorization_prompt_is_only_started_once(self):
         instance, _backend = self.make_controller("smartthings")

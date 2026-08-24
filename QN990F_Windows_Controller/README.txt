@@ -141,6 +141,7 @@ Volume keys:
     Volume Down in SmartThings mode -> TV volume down to 10, then Windows.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
+    Cloud volume state is refreshed no more than once every 30 seconds.
 
 Direct LAN can send a TV volume key but cannot read the current TV volume, so
 the TV-first Volume Down rule is intentionally limited to SmartThings mode.
@@ -237,10 +238,13 @@ IMPORTANT BEHAVIOR / LIMITATIONS
   official CLI's saved OAuth profile; config.json does not store its token.
 
 - SmartThings authorization is checked with a read-only device request at startup
-  and every 30 minutes. Cloud CLI operations are serialized across controller
-  processes. A failed refresh shows one alert with a Reauthorize option. This
-  detects failures before a hotkey is needed but cannot prevent SmartThings from
-  revoking a saved refresh token.
+  and every 30 minutes. SmartThings sets the access-token lifetime (normally
+  about 24 hours); the official CLI automatically rotates both the access token
+  and the single-use refresh token. CLI operations from the controller,
+  installer, and reauthorization flow share one cross-process lock, and
+  background jobs cannot create browser child processes. Network timeouts are
+  retried later. An actual failed refresh shows one alert with a Reauthorize
+  option; server-side revocation still requires another sign-in.
 
 
 MANUAL TEST COMMANDS
