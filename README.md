@@ -30,7 +30,9 @@ monitor.
 - Isolated Python environment installed without modifying system Python packages.
 - Optional keyboard volume integration: local volume is used first when increasing;
   after it reaches maximum, further presses increase TV volume. In SmartThings
-  mode, decreasing lowers TV volume to 10 before lowering system volume.
+  mode, decreasing lowers TV volume to 10 before lowering system volume. On
+  macOS fixed-volume outputs such as HDMI, the TV instead uses the full 0–100
+  range because there is no adjustable system-volume layer.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -75,12 +77,19 @@ settings. Reports for additional models are welcome.
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
 | Elevated privileges | Not required | Not required for the controller; the installer may use `winget` to install a missing user-scoped Python runtime |
 
-When volume control is enabled, the macOS controller uses an event tap only for
-the two hardware volume keys, so macOS Accessibility permission is required.
+When volume control is enabled, the macOS controller uses IOHID matching only
+for the standard Volume Up and Volume Down usages, so macOS Input Monitoring
+permission is required.
 Wake detection
 continues to use anonymous system event counters and does not read typed text.
 The Windows controller uses Raw Input for wake detection and a low-level hook
 limited to `Volume Up` and `Volume Down`.
+
+Only one macOS utility can take exclusive ownership of the native audio keys.
+If BetterDisplay is installed, open **BetterDisplay → Settings → Keyboard →
+Native (Apple) Keyboard Control** and turn off **Listen to native audio keys**
+before enabling this controller's volume routing. BetterDisplay can remain
+running for its other display features.
 
 ## Connection modes
 
@@ -135,11 +144,11 @@ directory together.
 
 If Gatekeeper blocks the downloaded script, Control-click `INSTALL.command`,
 choose **Open**, and confirm once more. Homebrew, Xcode Command Line Tools,
-`sudo` and Input Monitoring permission are not required. For volume-key
-routing, add the installed controller Python runtime to **System Settings →
-Privacy & Security → Accessibility** when macOS prompts. If permission is not
-granted, Picture Off control continues and only volume-key routing is disabled
-for that run.
+and `sudo` are not required. Input Monitoring is needed only for optional
+volume-key routing; add the installed controller Python runtime to **System
+Settings → Privacy & Security → Input Monitoring** when macOS prompts. If
+permission is not granted, Picture Off control continues and only volume-key
+routing is disabled for that run.
 
 See the [macOS guide](QN990F_macOS_Controller/README.txt) for detailed setup,
 configuration, file locations, and manual commands.
@@ -185,7 +194,8 @@ left blank.
 
 - `Volume Up` changes system volume until it is full, then sends TV volume-up.
 - In SmartThings mode, `Volume Down` lowers TV volume to the configured floor
-  (10 by default), then resumes normal system-volume reduction.
+  (10 by default), then resumes normal system-volume reduction. On macOS, a
+  fixed-volume output changes this floor to 0 automatically.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
 - Direct LAN can send TV volume keys but cannot query the TV's current volume,
@@ -260,8 +270,9 @@ checksum.
 - SmartThings cloud authentication remains dependent on Samsung's OAuth service
   and the official CLI. The proactive check detects failures earlier but cannot
   guarantee that SmartThings will continue accepting a saved refresh token.
-- Volume-key interception depends on the active user's desktop session. macOS
-  requires Accessibility approval for the installed Python runtime.
+- Volume-key interception depends on the active user's desktop session. If
+  macOS denies access, approve Input Monitoring for the installed Python
+  runtime.
 
 ## Troubleshooting
 

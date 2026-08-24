@@ -1406,14 +1406,6 @@ class SmartThingsTVClient:
     def get_volume(self):
         with self._lock:
             try:
-                self._ensure_command_budget(1)
-                self._command_times.append(time.monotonic())
-                self._run(
-                    "devices:commands",
-                    str(self.config["smartthings_device_id"]),
-                    "main:refresh:refresh()",
-                )
-                time.sleep(0.5)
                 output = self._run(
                     "devices:status", str(self.config["smartthings_device_id"]), "--json"
                 )

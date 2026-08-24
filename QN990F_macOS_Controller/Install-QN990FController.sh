@@ -153,7 +153,7 @@ case "$ENABLE_VOLUME_CHOICE" in
     ;;
 esac
 if [[ "$ENABLE_VOLUME" == "true" ]]; then
-  echo "Volume-key routing requires Accessibility permission for the installed Python runtime."
+  echo "macOS may require Input Monitoring permission for the installed Python runtime."
 fi
 
 if [[ "$CONTROL_METHOD" == "smartthings" ]]; then
@@ -379,7 +379,7 @@ step "Checking the global shortcut"
 if [[ "$ENABLE_VOLUME" == "true" ]]; then
   step "Checking volume-key access"
   if ! "$PYTHON" "$CONTROLLER" --check-volume-keys; then
-    echo "Open System Settings -> Privacy & Security -> Accessibility."
+    echo "Open System Settings -> Privacy & Security -> Input Monitoring."
     echo "Add and enable: $PYTHON"
     echo "Then rerun INSTALL.command."
     exit 2

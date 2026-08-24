@@ -201,6 +201,29 @@ class InputSourceTests(unittest.TestCase):
 
 
 class MacOSBackendTests(unittest.TestCase):
+    def test_volume_hid_matching_accepts_only_volume_usages(self):
+        backend = controller.MacOSBackend
+
+        self.assertEqual(
+            backend._volume_direction_for_hid_usage(
+                backend.K_HID_PAGE_CONSUMER,
+                backend.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT,
+            ),
+            "up",
+        )
+        self.assertEqual(
+            backend._volume_direction_for_hid_usage(
+                backend.K_HID_PAGE_KEYBOARD,
+                backend.K_HID_USAGE_KEYBOARD_VOLUME_DOWN,
+            ),
+            "down",
+        )
+        self.assertIsNone(
+            backend._volume_direction_for_hid_usage(
+                backend.K_HID_PAGE_KEYBOARD, 0x04
+            )
+        )
+
     def test_manual_carbon_pump_dispatches_and_releases_event(self):
         calls = []
         backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
@@ -289,6 +312,7 @@ class MacOSBackendTests(unittest.TestCase):
             raise RuntimeError("no writable volume scalar")
 
         backend._audio_property = read_property
+        self.assertEqual(backend.system_volume_state(), (False, True))
         self.assertTrue(backend.system_volume_is_max())
 
 
@@ -343,20 +367,11 @@ class SmartThingsTVClientTests(unittest.TestCase):
             }
         }
         with mock.patch.object(
-            self.client, "_run", side_effect=["", json.dumps(status)]
-        ) as run, mock.patch.object(controller.time, "sleep") as sleep:
+            self.client, "_run", return_value=json.dumps(status)
+        ) as run:
             self.assertEqual(self.client.get_volume(), 17)
 
-        self.assertEqual(
-            run.call_args_list,
-            [
-                mock.call(
-                    "devices:commands", DEVICE_ID, "main:refresh:refresh()"
-                ),
-                mock.call("devices:status", DEVICE_ID, "--json"),
-            ],
-        )
-        sleep.assert_called_once_with(0.5)
+        run.assert_called_once_with("devices:status", DEVICE_ID, "--json")
 
     def test_set_volume_uses_explicit_audio_volume_target(self):
         with mock.patch.object(self.client, "_run") as run:
@@ -641,6 +656,29 @@ class VolumeCoordinatorTests(unittest.TestCase):
         self.assertFalse(self.volume.handle_key("down"))
         self.assertTrue(self.tv.volume_set.wait(1.0))
         self.assertEqual(self.tv.set_volumes, [10])
+
+    def test_fixed_system_output_uses_full_tv_volume_range(self):
+        with self.volume._lock:
+            self.volume._tv_volume = 1
+
+        self.assertTrue(
+            self.volume.handle_key("down", system_is_adjustable=False)
+        )
+        self.assertFalse(
+            self.volume.handle_key("down", system_is_adjustable=False)
+        )
+        self.assertTrue(self.tv.volume_set.wait(1.0))
+        self.assertEqual(self.tv.set_volumes, [0])
+
+    def test_fixed_system_output_routes_down_when_tv_state_is_unknown(self):
+        self.assertTrue(
+            self.volume.handle_key("down", system_is_adjustable=False)
+        )
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and self.tv.sent != ["KEY_VOLDOWN"]:
+            time.sleep(0.01)
+        self.assertEqual(self.tv.sent, ["KEY_VOLDOWN"])
 
     def test_consecutive_volume_up_steps_are_sent_as_one_target(self):
         with self.volume._lock:

@@ -22,7 +22,8 @@ Makes a compatible Samsung TV behave more like a conventional computer display o
 
 5. Optionally integrates the keyboard volume buttons with TV volume. Volume Up controls
    macOS until it reaches maximum, then controls the TV. In SmartThings mode,
-   Volume Down lowers TV volume to 10 before continuing with macOS volume.
+   Volume Down lowers TV volume to 10 before continuing with macOS volume. For
+   fixed-volume outputs such as HDMI, the TV instead uses its full 0-100 range.
 
 
 Compatibility
@@ -123,17 +124,20 @@ Not Required
 - System pip
 - Xcode / Command Line Tools
 - sudo / root
-- Input Monitoring permission
+
+macOS may require Input Monitoring permission only when optional integrated
+volume control is enabled.
 
 
 macOS Privacy Permission
 ------------------------
-When enabled, integrated volume routing uses a CGEvent tap limited to the hardware Volume Up
-and Volume Down controls. Add the installed venv Python runtime to System
-Settings -> Privacy & Security -> Accessibility when macOS prompts. The
-controller does not inspect ordinary typed keys through this tap. If permission
-is unavailable, Picture Off control continues and only volume routing is disabled
-for that run.
+When enabled, integrated volume routing uses IOHIDManager matching limited to
+the standard keyboard and consumer Volume Up and Volume Down usages. If macOS
+denies access, add the installed venv Python runtime to System Settings ->
+Privacy & Security -> Input
+Monitoring when macOS prompts. The controller does not subscribe to ordinary
+typed-key usages. If permission is unavailable, Picture Off control continues
+and only volume routing is disabled for that run.
 
 Why Wake Detection Does Not Need Input Monitoring
 --------------------------------------------------
@@ -178,9 +182,15 @@ Volume keys:
     Integrated volume control is optional during installation. Rerun
     INSTALL.command to enable or disable it; press Return to keep the current choice.
     Volume Up -> macOS volume until maximum, then TV volume.
-    Volume Down in SmartThings mode -> TV volume down to 10, then macOS.
+    Volume Down in SmartThings mode -> TV volume down to 10, then macOS. If the
+    current macOS output has no adjustable volume, the TV floor is 0 instead.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
+
+    Native audio keys can have only one exclusive owner. If BetterDisplay is
+    installed, open BetterDisplay -> Settings -> Keyboard -> Native (Apple)
+    Keyboard Control and turn off "Listen to native audio keys". BetterDisplay
+    may remain running for brightness and its other display features.
 
 Direct LAN can send TV volume keys but cannot read current TV volume, so the
 TV-first Volume Down rule is intentionally limited to SmartThings mode.

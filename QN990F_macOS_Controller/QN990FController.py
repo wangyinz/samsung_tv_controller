@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import c_double, c_int32, c_uint8, c_uint32, c_ulong, c_void_p, POINTER, Structure
+from ctypes import (
+    c_bool, c_double, c_int32, c_long, c_uint8, c_uint32, c_ulong,
+    c_void_p, POINTER, Structure,
+)
 import fcntl
 import json
 import logging
@@ -104,6 +107,37 @@ class AudioObjectPropertyAddress(Structure):
     ]
 
 
+class CFDictionaryKeyCallBacks(Structure):
+    _fields_ = [
+        ("version", c_long),
+        ("retain", c_void_p),
+        ("release", c_void_p),
+        ("copy_description", c_void_p),
+        ("equal", c_void_p),
+        ("hash", c_void_p),
+    ]
+
+
+class CFDictionaryValueCallBacks(Structure):
+    _fields_ = [
+        ("version", c_long),
+        ("retain", c_void_p),
+        ("release", c_void_p),
+        ("copy_description", c_void_p),
+        ("equal", c_void_p),
+    ]
+
+
+class CFArrayCallBacks(Structure):
+    _fields_ = [
+        ("version", c_long),
+        ("retain", c_void_p),
+        ("release", c_void_p),
+        ("copy_description", c_void_p),
+        ("equal", c_void_p),
+    ]
+
+
 class MacOSBackend:
     K_EVENT_CLASS_KEYBOARD = fourcc("keyb")
     K_EVENT_HOTKEY_PRESSED = 5
@@ -120,15 +154,17 @@ class MacOSBackend:
     K_CG_EVENT_KEY_DOWN = 10
     K_CG_EVENT_SCROLL_WHEEL = 22
     K_CG_EVENT_OTHER_MOUSE_DOWN = 25
-    K_CG_EVENT_SYSTEM_DEFINED = 14
-    K_CG_EVENT_DATA1 = 55
-    K_CG_SESSION_EVENT_TAP = 1
-    K_CG_HEAD_INSERT_EVENT_TAP = 0
-    K_CG_EVENT_TAP_OPTION_DEFAULT = 0
-    NX_KEYTYPE_SOUND_UP = 0
-    NX_KEYTYPE_SOUND_DOWN = 1
-    NX_KEY_STATE_DOWN = 0x0A
-    NX_KEY_STATE_UP = 0x0B
+    K_IOHID_REQUEST_TYPE_LISTEN_EVENT = 1
+    K_IOHID_ACCESS_TYPE_GRANTED = 0
+    K_IO_RETURN_EXCLUSIVE_ACCESS = ctypes.c_int32(0xE00002C5).value
+    K_HID_PAGE_KEYBOARD = 0x07
+    K_HID_PAGE_CONSUMER = 0x0C
+    K_HID_USAGE_KEYBOARD_VOLUME_UP = 0x80
+    K_HID_USAGE_KEYBOARD_VOLUME_DOWN = 0x81
+    K_HID_USAGE_CONSUMER_VOLUME_INCREMENT = 0xE9
+    K_HID_USAGE_CONSUMER_VOLUME_DECREMENT = 0xEA
+    K_CF_NUMBER_SINT32_TYPE = 3
+    K_CF_STRING_ENCODING_UTF8 = 0x08000100
     K_AUDIO_OBJECT_SYSTEM_OBJECT = 1
     K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN = 0
     K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE = fourcc("dOut")
@@ -147,8 +183,8 @@ class MacOSBackend:
     }
 
     CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p)
-    EVENT_TAP_CALLBACK = ctypes.CFUNCTYPE(
-        c_void_p, c_void_p, c_int32, c_void_p, c_void_p
+    HID_VALUE_CALLBACK = ctypes.CFUNCTYPE(
+        None, c_void_p, c_int32, c_void_p, c_void_p
     )
 
     def __init__(self):
@@ -156,10 +192,12 @@ class MacOSBackend:
         cg = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
         cf = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
         ca = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+        io = "/System/Library/Frameworks/IOKit.framework/IOKit"
         self.hitoolbox = ctypes.CDLL(ht)
         self.coregraphics = ctypes.CDLL(cg)
         self.corefoundation = ctypes.CDLL(cf)
         self.coreaudio = ctypes.CDLL(ca)
+        self.iokit = ctypes.CDLL(io)
 
         self.hitoolbox.GetApplicationEventTarget.argtypes = []
         self.hitoolbox.GetApplicationEventTarget.restype = c_void_p
@@ -195,25 +233,27 @@ class MacOSBackend:
         self.coregraphics.CGEventCreate.restype = c_void_p
         self.coregraphics.CGEventGetLocation.argtypes = [c_void_p]
         self.coregraphics.CGEventGetLocation.restype = CGPoint
-        self.coregraphics.CGEventGetIntegerValueField.argtypes = [c_void_p, c_int32]
-        self.coregraphics.CGEventGetIntegerValueField.restype = ctypes.c_int64
-        self.coregraphics.CGEventTapCreate.argtypes = [
-            c_uint32, c_uint32, c_uint32, ctypes.c_uint64,
-            self.EVENT_TAP_CALLBACK, c_void_p,
-        ]
-        self.coregraphics.CGEventTapCreate.restype = c_void_p
-        self.coregraphics.CGEventTapEnable.argtypes = [c_void_p, c_uint8]
-        self.coregraphics.CGEventTapEnable.restype = None
         self.corefoundation.CFRelease.argtypes = [c_void_p]
         self.corefoundation.CFRelease.restype = None
-        self.corefoundation.CFMachPortCreateRunLoopSource.argtypes = [
-            c_void_p, c_void_p, c_int32,
+        self.corefoundation.CFStringCreateWithCString.argtypes = [
+            c_void_p, ctypes.c_char_p, c_uint32,
         ]
-        self.corefoundation.CFMachPortCreateRunLoopSource.restype = c_void_p
+        self.corefoundation.CFStringCreateWithCString.restype = c_void_p
+        self.corefoundation.CFNumberCreate.argtypes = [
+            c_void_p, c_int32, c_void_p,
+        ]
+        self.corefoundation.CFNumberCreate.restype = c_void_p
+        self.corefoundation.CFDictionaryCreate.argtypes = [
+            c_void_p, POINTER(c_void_p), POINTER(c_void_p), c_long,
+            POINTER(CFDictionaryKeyCallBacks), POINTER(CFDictionaryValueCallBacks),
+        ]
+        self.corefoundation.CFDictionaryCreate.restype = c_void_p
+        self.corefoundation.CFArrayCreate.argtypes = [
+            c_void_p, POINTER(c_void_p), c_long, POINTER(CFArrayCallBacks),
+        ]
+        self.corefoundation.CFArrayCreate.restype = c_void_p
         self.corefoundation.CFRunLoopGetCurrent.argtypes = []
         self.corefoundation.CFRunLoopGetCurrent.restype = c_void_p
-        self.corefoundation.CFRunLoopAddSource.argtypes = [c_void_p, c_void_p, c_void_p]
-        self.corefoundation.CFRunLoopAddSource.restype = None
         self.corefoundation.CFRunLoopRun.argtypes = []
         self.corefoundation.CFRunLoopRun.restype = None
         self.corefoundation.CFRunLoopStop.argtypes = [c_void_p]
@@ -221,6 +261,51 @@ class MacOSBackend:
         self._run_loop_default_mode = c_void_p.in_dll(
             self.corefoundation, "kCFRunLoopDefaultMode"
         )
+        self._cf_dictionary_key_callbacks = CFDictionaryKeyCallBacks.in_dll(
+            self.corefoundation, "kCFTypeDictionaryKeyCallBacks"
+        )
+        self._cf_dictionary_value_callbacks = CFDictionaryValueCallBacks.in_dll(
+            self.corefoundation, "kCFTypeDictionaryValueCallBacks"
+        )
+        self._cf_array_callbacks = CFArrayCallBacks.in_dll(
+            self.corefoundation, "kCFTypeArrayCallBacks"
+        )
+        self.iokit.IOHIDCheckAccess.argtypes = [c_int32]
+        self.iokit.IOHIDCheckAccess.restype = c_int32
+        self.iokit.IOHIDRequestAccess.argtypes = [c_int32]
+        self.iokit.IOHIDRequestAccess.restype = c_bool
+        self.iokit.IOHIDManagerCreate.argtypes = [c_void_p, c_uint32]
+        self.iokit.IOHIDManagerCreate.restype = c_void_p
+        self.iokit.IOHIDManagerOpen.argtypes = [c_void_p, c_uint32]
+        self.iokit.IOHIDManagerOpen.restype = c_int32
+        self.iokit.IOHIDManagerClose.argtypes = [c_void_p, c_uint32]
+        self.iokit.IOHIDManagerClose.restype = c_int32
+        self.iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
+        self.iokit.IOHIDManagerSetDeviceMatching.restype = None
+        self.iokit.IOHIDManagerSetInputValueMatchingMultiple.argtypes = [
+            c_void_p, c_void_p,
+        ]
+        self.iokit.IOHIDManagerSetInputValueMatchingMultiple.restype = None
+        self.iokit.IOHIDManagerRegisterInputValueCallback.argtypes = [
+            c_void_p, self.HID_VALUE_CALLBACK, c_void_p,
+        ]
+        self.iokit.IOHIDManagerRegisterInputValueCallback.restype = None
+        self.iokit.IOHIDManagerScheduleWithRunLoop.argtypes = [
+            c_void_p, c_void_p, c_void_p,
+        ]
+        self.iokit.IOHIDManagerScheduleWithRunLoop.restype = None
+        self.iokit.IOHIDManagerUnscheduleFromRunLoop.argtypes = [
+            c_void_p, c_void_p, c_void_p,
+        ]
+        self.iokit.IOHIDManagerUnscheduleFromRunLoop.restype = None
+        self.iokit.IOHIDValueGetElement.argtypes = [c_void_p]
+        self.iokit.IOHIDValueGetElement.restype = c_void_p
+        self.iokit.IOHIDValueGetIntegerValue.argtypes = [c_void_p]
+        self.iokit.IOHIDValueGetIntegerValue.restype = c_long
+        self.iokit.IOHIDElementGetUsagePage.argtypes = [c_void_p]
+        self.iokit.IOHIDElementGetUsagePage.restype = c_uint32
+        self.iokit.IOHIDElementGetUsage.argtypes = [c_void_p]
+        self.iokit.IOHIDElementGetUsage.restype = c_uint32
         self.coreaudio.AudioObjectGetPropertyData.argtypes = [
             c_uint32, POINTER(AudioObjectPropertyAddress), c_uint32,
             c_void_p, POINTER(c_uint32), c_void_p,
@@ -235,11 +320,11 @@ class MacOSBackend:
         self._dispatcher_target = c_void_p()
         self._input_poll_lock = threading.Lock()
         self._last_input_snapshot = None
-        self._volume_tap = c_void_p()
-        self._volume_tap_callback = None
+        self._volume_hid_manager = c_void_p()
+        self._volume_hid_callback = None
+        self._volume_cf_refs = []
         self._volume_run_loop = c_void_p()
         self._volume_thread = None
-        self._consumed_volume_keys = set()
 
     def idle_seconds(self) -> float:
         return max(0.0, float(self.coregraphics.CGEventSourceSecondsSinceLastEventType(
@@ -260,7 +345,7 @@ class MacOSBackend:
             raise RuntimeError(f"AudioObjectGetPropertyData failed: OSStatus {status}")
         return value.value
 
-    def system_volume_is_max(self) -> bool:
+    def system_volume_state(self):
         device_id = c_uint32()
         self._audio_property(
             self.K_AUDIO_OBJECT_SYSTEM_OBJECT,
@@ -284,80 +369,177 @@ class MacOSBackend:
             volumes.append(float(volume.value))
         # Fixed-volume HDMI devices expose no writable scalar; in that case
         # local volume is effectively already at its ceiling.
-        return not volumes or all(value >= 0.999 for value in volumes)
+        adjustable = bool(volumes)
+        return adjustable, not adjustable or all(value >= 0.999 for value in volumes)
 
-    def register_volume_keys(self, handler):
+    def system_volume_is_max(self) -> bool:
+        return self.system_volume_state()[1]
+
+    @classmethod
+    def _volume_direction_for_hid_usage(cls, usage_page, usage):
+        if (usage_page, usage) in {
+            (cls.K_HID_PAGE_KEYBOARD, cls.K_HID_USAGE_KEYBOARD_VOLUME_UP),
+            (cls.K_HID_PAGE_CONSUMER, cls.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT),
+        }:
+            return "up"
+        if (usage_page, usage) in {
+            (cls.K_HID_PAGE_KEYBOARD, cls.K_HID_USAGE_KEYBOARD_VOLUME_DOWN),
+            (cls.K_HID_PAGE_CONSUMER, cls.K_HID_USAGE_CONSUMER_VOLUME_DECREMENT),
+        }:
+            return "down"
+        return None
+
+    def _create_volume_hid_matching(self):
+        refs = []
+
+        def cf_string(value):
+            ref = self.corefoundation.CFStringCreateWithCString(
+                None, value.encode("utf-8"), self.K_CF_STRING_ENCODING_UTF8
+            )
+            if not ref:
+                raise RuntimeError(f"CFStringCreateWithCString failed for {value}.")
+            refs.append(c_void_p(ref))
+            return ref
+
+        def cf_number(value):
+            raw = c_int32(value)
+            ref = self.corefoundation.CFNumberCreate(
+                None, self.K_CF_NUMBER_SINT32_TYPE, ctypes.byref(raw)
+            )
+            if not ref:
+                raise RuntimeError(f"CFNumberCreate failed for {value}.")
+            refs.append(c_void_p(ref))
+            return ref
+
+        page_key = cf_string("UsagePage")
+        usage_key = cf_string("Usage")
+        dictionaries = []
+        for usage_page, usage in (
+            (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_UP),
+            (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_DOWN),
+            (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT),
+            (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_DECREMENT),
+        ):
+            keys = (c_void_p * 2)(page_key, usage_key)
+            values = (c_void_p * 2)(cf_number(usage_page), cf_number(usage))
+            dictionary = self.corefoundation.CFDictionaryCreate(
+                None, keys, values, 2,
+                ctypes.byref(self._cf_dictionary_key_callbacks),
+                ctypes.byref(self._cf_dictionary_value_callbacks),
+            )
+            if not dictionary:
+                raise RuntimeError("CFDictionaryCreate failed for HID matching.")
+            dictionaries.append(dictionary)
+            refs.append(c_void_p(dictionary))
+        values = (c_void_p * len(dictionaries))(*dictionaries)
+        array = self.corefoundation.CFArrayCreate(
+            None, values, len(dictionaries), ctypes.byref(self._cf_array_callbacks)
+        )
+        if not array:
+            raise RuntimeError("CFArrayCreate failed for HID matching.")
+        refs.append(c_void_p(array))
+        return array, refs
+
+    def register_volume_keys(self, handler, request_access=False):
+        access = self.iokit.IOHIDCheckAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
+        if access != self.K_IOHID_ACCESS_TYPE_GRANTED and request_access:
+            self.iokit.IOHIDRequestAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
+            access = self.iokit.IOHIDCheckAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
+        if access != self.K_IOHID_ACCESS_TYPE_GRANTED:
+            raise RuntimeError(
+                "macOS denied direct volume-key input; grant Input Monitoring "
+                "permission to the controller's Python runtime."
+            )
+
         ready = threading.Event()
         failure = []
 
-        def callback(_proxy, event_type, event, _user):
-            if event_type in (-2, -1):
-                if self._volume_tap:
-                    self.coregraphics.CGEventTapEnable(self._volume_tap, True)
-                return event
-            if event_type != self.K_CG_EVENT_SYSTEM_DEFINED:
-                return event
-            data = int(self.coregraphics.CGEventGetIntegerValueField(
-                event, self.K_CG_EVENT_DATA1
-            ))
-            key_code = (data >> 16) & 0xFFFF
-            key_state = (data >> 8) & 0xFF
-            if key_code not in (self.NX_KEYTYPE_SOUND_UP, self.NX_KEYTYPE_SOUND_DOWN):
-                return event
-            direction = "up" if key_code == self.NX_KEYTYPE_SOUND_UP else "down"
-            if key_state == self.NX_KEY_STATE_DOWN:
-                try:
-                    if handler(direction):
-                        self._consumed_volume_keys.add(key_code)
-                        return None
-                except Exception as exc:
-                    logger.warning("Volume-key routing failed: %r", exc)
-            elif key_state == self.NX_KEY_STATE_UP and key_code in self._consumed_volume_keys:
-                self._consumed_volume_keys.discard(key_code)
-                return None
-            return event
-
-        self._volume_tap_callback = self.EVENT_TAP_CALLBACK(callback)
-
-        def run_tap():
-            mask = 1 << self.K_CG_EVENT_SYSTEM_DEFINED
-            tap = self.coregraphics.CGEventTapCreate(
-                self.K_CG_SESSION_EVENT_TAP,
-                self.K_CG_HEAD_INSERT_EVENT_TAP,
-                self.K_CG_EVENT_TAP_OPTION_DEFAULT,
-                mask,
-                self._volume_tap_callback,
-                None,
-            )
-            if not tap:
-                failure.append(
-                    "macOS denied the volume-key event tap; grant Accessibility "
-                    "permission to the controller's Python runtime."
+        def callback(_context, result, _sender, value):
+            if result != 0 or not value:
+                return
+            element = self.iokit.IOHIDValueGetElement(value)
+            if not element or self.iokit.IOHIDValueGetIntegerValue(value) <= 0:
+                return
+            usage_page = self.iokit.IOHIDElementGetUsagePage(element)
+            usage = self.iokit.IOHIDElementGetUsage(element)
+            direction = self._volume_direction_for_hid_usage(usage_page, usage)
+            if direction is None:
+                return
+            logger.info("Volume HID input received: direction=%s", direction)
+            try:
+                routed = handler(direction)
+                logger.info(
+                    "Volume HID input handled: direction=%s routed=%s",
+                    direction, routed,
                 )
+            except Exception as exc:
+                logger.warning("Volume-key routing failed: %r", exc)
+
+        self._volume_hid_callback = self.HID_VALUE_CALLBACK(callback)
+
+        def run_hid_manager():
+            refs = []
+            manager = c_void_p()
+            run_loop = c_void_p()
+            scheduled = False
+            opened = False
+            startup_error = None
+            try:
+                manager = c_void_p(self.iokit.IOHIDManagerCreate(None, 0))
+                if not manager:
+                    raise RuntimeError("IOHIDManagerCreate returned NULL.")
+                matching, refs = self._create_volume_hid_matching()
+                self._volume_cf_refs = refs
+                self.iokit.IOHIDManagerSetDeviceMatching(manager, None)
+                self.iokit.IOHIDManagerSetInputValueMatchingMultiple(
+                    manager, matching
+                )
+                self.iokit.IOHIDManagerRegisterInputValueCallback(
+                    manager, self._volume_hid_callback, None
+                )
+                run_loop = c_void_p(self.corefoundation.CFRunLoopGetCurrent())
+                self.iokit.IOHIDManagerScheduleWithRunLoop(
+                    manager, run_loop, self._run_loop_default_mode
+                )
+                scheduled = True
+                status = self.iokit.IOHIDManagerOpen(manager, 0)
+                if status == 0:
+                    opened = True
+                elif status == self.K_IO_RETURN_EXCLUSIVE_ACCESS:
+                    opened = True
+                    logger.info(
+                        "Some HID devices are exclusively owned; using available devices."
+                    )
+                else:
+                    raise RuntimeError(f"IOHIDManagerOpen failed: IOReturn {status}.")
+                self._volume_run_loop = run_loop
+                self._volume_hid_manager = manager
+                logger.info("Direct volume-key HID manager started: access=%d", access)
                 ready.set()
-                return
-            self._volume_tap = c_void_p(tap)
-            source = self.corefoundation.CFMachPortCreateRunLoopSource(None, tap, 0)
-            if not source:
-                failure.append("CFMachPortCreateRunLoopSource returned NULL.")
-                ready.set()
-                return
-            self._volume_run_loop = c_void_p(self.corefoundation.CFRunLoopGetCurrent())
-            self.corefoundation.CFRunLoopAddSource(
-                self._volume_run_loop, source, self._run_loop_default_mode
-            )
-            self.coregraphics.CGEventTapEnable(tap, True)
-            ready.set()
-            self.corefoundation.CFRunLoopRun()
-            self.corefoundation.CFRelease(source)
-            self.corefoundation.CFRelease(tap)
+                self.corefoundation.CFRunLoopRun()
+            except Exception as exc:
+                startup_error = str(exc)
+            finally:
+                if scheduled:
+                    self.iokit.IOHIDManagerUnscheduleFromRunLoop(
+                        manager, run_loop, self._run_loop_default_mode
+                    )
+                if opened:
+                    self.iokit.IOHIDManagerClose(manager, 0)
+                if manager:
+                    self.corefoundation.CFRelease(manager)
+                for ref in reversed(refs):
+                    self.corefoundation.CFRelease(ref)
+                if startup_error is not None:
+                    failure.append(startup_error)
+                    ready.set()
 
         self._volume_thread = threading.Thread(
-            target=run_tap, daemon=True, name="QN990F-VolumeKeys"
+            target=run_hid_manager, daemon=True, name="QN990F-VolumeKeys"
         )
         self._volume_thread.start()
         if not ready.wait(2.0):
-            raise RuntimeError("Timed out while starting the volume-key event tap.")
+            raise RuntimeError("Timed out while starting direct volume-key input.")
         if failure:
             raise RuntimeError(failure[0])
 
@@ -366,11 +548,11 @@ class MacOSBackend:
             self.corefoundation.CFRunLoopStop(self._volume_run_loop)
         if self._volume_thread:
             self._volume_thread.join(timeout=1.0)
-        self._volume_tap = c_void_p()
+        self._volume_hid_manager = c_void_p()
         self._volume_run_loop = c_void_p()
         self._volume_thread = None
-        self._volume_tap_callback = None
-        self._consumed_volume_keys.clear()
+        self._volume_hid_callback = None
+        self._volume_cf_refs = []
 
     def _input_snapshot(self):
         counter = self.coregraphics.CGEventSourceCounterForEventType
@@ -947,14 +1129,6 @@ class SmartThingsTVClient:
     def get_volume(self):
         with self._lock:
             try:
-                self._ensure_command_budget(1)
-                self._command_times.append(time.monotonic())
-                self._run(
-                    "devices:commands",
-                    str(self.cfg["smartthings_device_id"]),
-                    "main:refresh:refresh()",
-                )
-                time.sleep(0.5)
                 output = self._run(
                     "devices:status", str(self.cfg["smartthings_device_id"]), "--json"
                 )
@@ -1029,7 +1203,9 @@ class VolumeCoordinator:
         )
         self._worker.start()
 
-    def handle_key(self, direction, system_is_max=False):
+    def handle_key(
+        self, direction, system_is_max=False, system_is_adjustable=True
+    ):
         if direction == "up":
             if not system_is_max:
                 return False
@@ -1052,9 +1228,14 @@ class VolumeCoordinator:
                 self._commands.put("flush_volume")
             return True
 
-        floor = int(self.cfg["tv_volume_floor"])
+        floor = int(self.cfg["tv_volume_floor"]) if system_is_adjustable else 0
         with self._lock:
-            if self._tv_volume is None or self._tv_volume <= floor:
+            if self._tv_volume is None:
+                if not system_is_adjustable:
+                    self._commands.put("KEY_VOLDOWN")
+                    return True
+                return False
+            if self._tv_volume <= floor:
                 return False
             notify = self._buffer_deadline == 0.0
             if notify:
@@ -1201,8 +1382,18 @@ class Controller:
     def handle_volume_key(self, direction):
         if self.volume is None:
             return False
-        system_is_max = direction == "up" and self.backend.system_volume_is_max()
-        return self.volume.handle_key(direction, system_is_max)
+        system_is_adjustable, system_is_max = self.backend.system_volume_state()
+        routed = self.volume.handle_key(
+            direction,
+            system_is_max=system_is_max,
+            system_is_adjustable=system_is_adjustable,
+        )
+        logger.info(
+            "Volume routing decision: direction=%s system_volume_adjustable=%s "
+            "system_volume_is_max=%s routed=%s",
+            direction, system_is_adjustable, system_is_max, routed,
+        )
+        return routed
 
     def is_off(self):
         with self._state_lock: return self.picture_off
@@ -1449,8 +1640,8 @@ def check_hotkey(cfg):
 def check_volume_keys():
     backend = MacOSBackend()
     try:
-        backend.register_volume_keys(lambda _direction: False)
-        print("Volume-key event tap registration succeeded.")
+        backend.register_volume_keys(lambda _direction: False, request_access=True)
+        print("Direct volume-key input registration succeeded.")
         return 0
     except Exception as exc:
         print(exc, file=sys.stderr)
