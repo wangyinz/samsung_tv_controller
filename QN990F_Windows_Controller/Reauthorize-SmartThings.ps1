@@ -17,6 +17,21 @@ $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 if ([string]$Config.control_method -ne "smartthings") {
     throw "This installation is not using SmartThings cloud control."
 }
+$SmartThingsCli = [string]$Config.smartthings_cli
+$SmartThingsCliScript = if (
+    $Config.PSObject.Properties.Name -contains "smartthings_cli_script"
+) { [string]$Config.smartthings_cli_script } else { "" }
+if ([string]::IsNullOrWhiteSpace($SmartThingsCliScript)) {
+    Write-Warning "This installation still uses the unsigned standalone SmartThings executable, which Windows Application Control can block. Rerun INSTALL-ME.cmd to install the signed Node.js runtime before reauthorizing."
+    Read-Host "Press Enter to close"
+    exit 3
+}
+if ((-not (Test-Path $SmartThingsCli)) -or
+    (-not (Test-Path $SmartThingsCliScript))) {
+    Write-Warning "The SmartThings runtime is incomplete. Rerun INSTALL-ME.cmd to repair it before reauthorizing."
+    Read-Host "Press Enter to close"
+    exit 3
+}
 
 Write-Host "Samsung TV Picture Controller - SmartThings reauthorization" -ForegroundColor Green
 Write-Host "The background controller will stop while browser sign-in completes."

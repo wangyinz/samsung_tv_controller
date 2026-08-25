@@ -73,6 +73,7 @@ DEFAULT_CONFIG = {
     "mouse_motion_window_ms": 500,
     "ignored_input_device_substrings": [],
     "smartthings_cli": str(APP_DIR / "smartthings.exe"),
+    "smartthings_cli_script": "",
     "smartthings_profile": "local.qn990f.picture-controller",
     "smartthings_device_id": "",
     "smartthings_command_timeout_seconds": 20.0,
@@ -810,6 +811,9 @@ def load_config() -> dict:
 
     if config["control_method"] == "smartthings":
         config["smartthings_cli"] = str(config.get("smartthings_cli", "")).strip()
+        config["smartthings_cli_script"] = str(
+            config.get("smartthings_cli_script", "")
+        ).strip()
         config["smartthings_profile"] = str(
             config.get("smartthings_profile", "local.qn990f.picture-controller")
         ).strip()
@@ -1331,12 +1335,19 @@ class SmartThingsTVClient:
         cli = Path(str(self.config["smartthings_cli"])).expanduser()
         if not cli.is_file():
             raise RuntimeError(f"SmartThings CLI is missing: {cli}")
-        command = [
-            str(cli), *args,
+        command = [str(cli)]
+        script_text = str(self.config.get("smartthings_cli_script", "")).strip()
+        if script_text:
+            script = Path(script_text).expanduser()
+            if not script.is_file():
+                raise RuntimeError(f"SmartThings CLI script is missing: {script}")
+            command.append(str(script))
+        command.extend([
+            *args,
             "--profile", str(self.config["smartthings_profile"]),
             "--token", "",
             "--language", "NONE",
-        ]
+        ])
         environment = os.environ.copy()
         environment.pop("SMARTTHINGS_TOKEN", None)
         if not allow_login:
@@ -1366,6 +1377,13 @@ class SmartThingsTVClient:
                 raise RuntimeError(
                     "SmartThings command timed out. Check the network connection."
                 ) from exc
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 4551:
+                    raise RuntimeError(
+                        "Windows Application Control blocked the SmartThings runtime. "
+                        "Rerun INSTALL-ME.cmd to install the signed Node.js runtime."
+                    ) from exc
+                raise
         finally:
             kernel32.ReleaseMutex(process_lock)
             kernel32.CloseHandle(process_lock)

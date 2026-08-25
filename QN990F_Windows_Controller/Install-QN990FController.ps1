@@ -25,9 +25,15 @@ $StartMenuDir = Join-Path $ProgramsDir "Samsung TV Picture Controller"
 $LegacyStartMenuDir = Join-Path $ProgramsDir "QN990F Controller"
 $SmartThingsProfile = "local.qn990f.picture-controller"
 $SmartThingsCliVersion = "2.1.1"
-$SmartThingsCliAsset = "smartthings-windows-x64.zip"
-$SmartThingsCliSha256 = "3f634dd76e77fded35a4f71485b5810f29f39351fc604733551a1e01ea773563"
-$SmartThingsCliPath = Join-Path $AppDir "smartthings.exe"
+$NodeVersion = "24.8.0"
+$NodeAsset = "node-v${NodeVersion}-win-x64.zip"
+$NodeSha256 = "970ecc121a16f546174b6a870215ca4cc0de33f8a616b42c16c8c02e66b07d05"
+$NodeDir = Join-Path $AppDir "node"
+$NodeExePath = Join-Path $NodeDir "node.exe"
+$NpmCliPath = Join-Path $NodeDir "node_modules\npm\bin\npm-cli.js"
+$SmartThingsCliDir = Join-Path $AppDir "smartthings-cli"
+$SmartThingsCliScriptPath = Join-Path $SmartThingsCliDir "node_modules\@smartthings\cli\dist\src\run.js"
+$LegacySmartThingsCliPath = Join-Path $AppDir "smartthings.exe"
 
 function Write-Step([string]$Text) {
     Write-Host ""
@@ -285,9 +291,10 @@ function Invoke-SmartThingsCliProcess {
     }
 }
 
-function Get-SmartThingsCliVersion([string]$Path) {
+function Get-SmartThingsCliVersion([string]$Path, [string]$ScriptPath) {
     try {
-        $Result = Invoke-SmartThingsCliProcess -Path $Path -Arguments "--version" `
+        $Arguments = "`"$ScriptPath`" --version"
+        $Result = Invoke-SmartThingsCliProcess -Path $Path -Arguments $Arguments `
             -TimeoutMilliseconds 15000
         if ($Result.ExitCode -eq 0) {
             return ($Result.StdOut + $Result.StdErr).Trim()
@@ -298,45 +305,71 @@ function Get-SmartThingsCliVersion([string]$Path) {
 
 function Install-PrivateSmartThingsCli {
     $ExpectedVersionPattern = "(^|[/\s])$([regex]::Escape($SmartThingsCliVersion))($|\s)"
-    if (Test-Path $SmartThingsCliPath) {
-        $InstalledVersion = Get-SmartThingsCliVersion $SmartThingsCliPath
-        if ($InstalledVersion -match $ExpectedVersionPattern) {
-            Write-Host "Using SmartThings CLI ${SmartThingsCliVersion}: $SmartThingsCliPath"
+    if ((Test-Path $NodeExePath) -and (Test-Path $SmartThingsCliScriptPath)) {
+        $ExistingNodeSignature = Get-AuthenticodeSignature -FilePath $NodeExePath
+        $InstalledVersion = Get-SmartThingsCliVersion $NodeExePath $SmartThingsCliScriptPath
+        if ($ExistingNodeSignature.Status -eq [System.Management.Automation.SignatureStatus]::Valid -and
+            $ExistingNodeSignature.SignerCertificate -and
+            $ExistingNodeSignature.SignerCertificate.Subject -match "OpenJS Foundation" -and
+            $InstalledVersion -match $ExpectedVersionPattern) {
+            Write-Host "Using SmartThings CLI ${SmartThingsCliVersion} with signed Node.js ${NodeVersion}."
             return
         }
-        Write-Warning "Replacing an unusable or unsupported private SmartThings CLI in $AppDir."
+        Write-Warning "Replacing an unusable or unsupported private SmartThings runtime in $AppDir."
     }
 
-    $ReleaseTag = [Uri]::EscapeDataString("@smartthings/cli@$SmartThingsCliVersion")
-    $DownloadUrl = "https://github.com/SmartThingsCommunity/smartthings-cli/releases/download/$ReleaseTag/$SmartThingsCliAsset"
+    $DownloadUrl = "https://nodejs.org/dist/v${NodeVersion}/$NodeAsset"
     $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("qn990f-smartthings-" + [Guid]::NewGuid().ToString("N"))
-    $ArchivePath = Join-Path $TempDir $SmartThingsCliAsset
+    $ArchivePath = Join-Path $TempDir $NodeAsset
     $ExtractDir = Join-Path $TempDir "extracted"
-    $ExtractedCli = Join-Path $ExtractDir "smartthings.exe"
+    $ExtractedNodeDir = Join-Path $ExtractDir "node-v${NodeVersion}-win-x64"
+    $ExtractedNode = Join-Path $ExtractedNodeDir "node.exe"
 
     try {
         New-Item -ItemType Directory -Path $TempDir | Out-Null
-        Write-Host "Downloading SmartThings CLI $SmartThingsCliVersion from the official GitHub release..."
+        Write-Host "Downloading signed Node.js $NodeVersion from nodejs.org..."
         Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $ArchivePath
 
         $ActualSha256 = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($ActualSha256 -ne $SmartThingsCliSha256) {
-            throw "SmartThings CLI download failed SHA-256 verification. Expected $SmartThingsCliSha256 but received $ActualSha256."
+        if ($ActualSha256 -ne $NodeSha256) {
+            throw "Node.js download failed SHA-256 verification. Expected $NodeSha256 but received $ActualSha256."
         }
 
         Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractDir
-        if (-not (Test-Path $ExtractedCli)) {
-            throw "The verified SmartThings CLI archive did not contain smartthings.exe."
+        if (-not (Test-Path $ExtractedNode)) {
+            throw "The verified Node.js archive did not contain node.exe."
         }
-        $DownloadedVersion = Get-SmartThingsCliVersion $ExtractedCli
-        if ($DownloadedVersion -notmatch $ExpectedVersionPattern) {
-            throw "The downloaded SmartThings CLI could not start or reported an unexpected version: $DownloadedVersion"
+        $NodeSignature = Get-AuthenticodeSignature -FilePath $ExtractedNode
+        if ($NodeSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+            (-not $NodeSignature.SignerCertificate) -or
+            $NodeSignature.SignerCertificate.Subject -notmatch "OpenJS Foundation") {
+            throw "The verified Node.js archive did not contain a valid OpenJS Foundation-signed node.exe."
         }
 
-        Copy-Item -LiteralPath $ExtractedCli -Destination $SmartThingsCliPath -Force
-        Write-Host "Installed private SmartThings CLI ${SmartThingsCliVersion}: $SmartThingsCliPath"
+        Remove-Item -LiteralPath $NodeDir -Recurse -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $ExtractedNodeDir -Destination $NodeDir
+
+        Remove-Item -LiteralPath $SmartThingsCliDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Installing official SmartThings CLI $SmartThingsCliVersion from npmjs.org..."
+        $NpmArguments = "`"$NpmCliPath`" install --prefix `"$SmartThingsCliDir`" --omit=dev --ignore-scripts --no-audit --no-fund `"@smartthings/cli@$SmartThingsCliVersion`""
+        $NpmResult = Invoke-SmartThingsCliProcess -Path $NodeExePath `
+            -Arguments $NpmArguments -TimeoutMilliseconds 300000
+        if ($NpmResult.ExitCode -ne 0) {
+            $NpmDetail = ($NpmResult.StdOut + $NpmResult.StdErr).Trim()
+            throw "npm could not install SmartThings CLI. $NpmDetail"
+        }
+
+        if (-not (Test-Path $SmartThingsCliScriptPath)) {
+            throw "The SmartThings CLI npm package did not contain its run.js entry point."
+        }
+        $DownloadedVersion = Get-SmartThingsCliVersion $NodeExePath $SmartThingsCliScriptPath
+        if ($DownloadedVersion -notmatch $ExpectedVersionPattern) {
+            throw "The installed SmartThings CLI could not start or reported an unexpected version: $DownloadedVersion"
+        }
+
+        Write-Host "Installed SmartThings CLI ${SmartThingsCliVersion}: $SmartThingsCliScriptPath"
     } catch {
-        throw "Could not install the official SmartThings CLI $SmartThingsCliVersion. Check internet access and try again. $($_.Exception.Message)"
+        throw "Could not install the official SmartThings CLI $SmartThingsCliVersion with signed Node.js. Check internet access and Windows Application Control, then try again. $($_.Exception.Message)"
     } finally {
         Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -499,11 +532,14 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to update pip inside the virtual enviro
 if ($LASTEXITCODE -ne 0) { throw "Failed to install samsungtvws." }
 
 $SmartThingsCli = ""
+$SmartThingsCliScript = ""
 $SmartThingsDeviceId = ""
 if ($ControlMethod -eq "smartthings") {
     Write-Step "Installing the official SmartThings CLI"
+    Stop-ExistingController
     Install-PrivateSmartThingsCli
-    $SmartThingsCli = $SmartThingsCliPath
+    $SmartThingsCli = $NodeExePath
+    $SmartThingsCliScript = $SmartThingsCliScriptPath
 
     if ($ExistingConfig -and -not $ControlMethodChanged -and
         ($ExistingConfig.PSObject.Properties.Name -contains "smartthings_device_id")) {
@@ -513,7 +549,7 @@ if ($ControlMethod -eq "smartthings") {
         Write-Step "Signing in to SmartThings and selecting a TV"
         Write-Host "Your browser may open for Samsung account sign-in and device authorization."
         $env:SMARTTHINGS_TOKEN = $null
-        $DeviceArguments = "devices --json --profile `"$SmartThingsProfile`" --token `"`" --language NONE"
+        $DeviceArguments = "`"$SmartThingsCliScript`" devices --json --profile `"$SmartThingsProfile`" --token `"`" --language NONE"
         $DevicesResult = Invoke-SmartThingsCliProcess -Path $SmartThingsCli `
             -Arguments $DeviceArguments -TimeoutMilliseconds 300000
         if ($DevicesResult.ExitCode -ne 0) {
@@ -639,6 +675,7 @@ try {
             mouse_motion_window_ms = 500
             ignored_input_device_substrings = @()
             smartthings_cli = $SmartThingsCli
+            smartthings_cli_script = $SmartThingsCliScript
             smartthings_profile = $SmartThingsProfile
             smartthings_device_id = $SmartThingsDeviceId
             smartthings_command_timeout_seconds = 20.0
@@ -659,6 +696,7 @@ try {
         $Config["control_method"] = $ControlMethod
         if ($ControlMethod -eq "smartthings") {
             $Config["smartthings_cli"] = $SmartThingsCli
+            $Config["smartthings_cli_script"] = $SmartThingsCliScript
             $Config["smartthings_profile"] = $SmartThingsProfile
             $Config["smartthings_device_id"] = $SmartThingsDeviceId
         }
@@ -778,6 +816,7 @@ try {
             throw "The background process did not report a running state. Check $AppDir\controller.log."
         }
         "complete" | Set-Content -Path $InstallStatePath -Encoding ASCII
+        Remove-Item $LegacySmartThingsCliPath -Force -ErrorAction SilentlyContinue
         Remove-Item $LegacyStartupShortcut -Force -ErrorAction SilentlyContinue
         Remove-Item (Join-Path $LegacyStartMenuDir "Configure QN990F Controller.lnk") -Force -ErrorAction SilentlyContinue
         Remove-Item (Join-Path $LegacyStartMenuDir "Uninstall QN990F Controller.lnk") -Force -ErrorAction SilentlyContinue

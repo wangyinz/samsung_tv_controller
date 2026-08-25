@@ -112,8 +112,10 @@ SmartThings cloud mode is available on macOS 13.5 or later and on Windows. It
 uses the public SmartThings HTTPS service through the official SmartThings CLI,
 so it can work when a VPN or network policy blocks direct access to the TV's
 private LAN address. The macOS installer supplies a pinned CLI; Windows users
-also receive a private pinned CLI automatically. Both installers verify the
-official release archive before using it; no separate Windows MSI is required.
+receive the pinned official npm CLI and a private signed Node.js runtime
+automatically. The Windows installer verifies the Node.js archive checksum and
+OpenJS Foundation signature; no separate Windows MSI or system Node.js is
+required.
 
 Requirements:
 
@@ -167,7 +169,7 @@ configuration, file locations, and manual commands.
 1. Open [`QN990F_Windows_Controller`](QN990F_Windows_Controller/).
 2. Double-click [`INSTALL-ME.cmd`](QN990F_Windows_Controller/INSTALL-ME.cmd).
 3. Choose Direct LAN or SmartThings cloud. In cloud mode, the installer
-   downloads and verifies its private copy of the official SmartThings CLI.
+   installs the pinned official npm CLI with a verified signed Node.js runtime.
 4. Choose whether to install integrated volume-key control.
 5. Approve the two-second `Picture Off` and restore test, then confirm what you
    observed.
@@ -254,8 +256,9 @@ Reconfiguration tools are installed with each platform version:
   per installation.
 
 Installers download runtime components and dependencies from their documented
-upstream sources. Both installers verify the pinned SmartThings CLI archive
-checksum.
+upstream sources. macOS verifies the pinned SmartThings CLI archive. Windows
+verifies the pinned Node.js archive and Authenticode signature, then installs
+the pinned official SmartThings CLI npm package with lifecycle scripts disabled.
 
 ## Limitations
 
@@ -307,6 +310,15 @@ checksum.
 - If authorization has expired, choose **Reauthorize** in the alert, run
   `Reauthorize.command` on macOS, or choose **Reauthorize SmartThings** from the
   Windows Start menu. This validation is read-only and sends no TV command.
+
+### Windows Application Control blocks SmartThings
+
+- Rerun `INSTALL-ME.cmd`. Current Windows installations use the official npm
+  CLI through a signed Node.js runtime instead of the unsigned standalone
+  `smartthings.exe` found in the SmartThings release ZIP.
+- Do not disable Windows Defender, Smart App Control, or enterprise Application
+  Control policy. The installer removes the obsolete standalone executable only
+  after the replacement runtime has passed validation and the controller starts.
 
 ### The hotkey does nothing
 

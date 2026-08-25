@@ -74,9 +74,11 @@ INSTALL
 For a new installation, the installer will:
 - Ask whether to use Direct LAN or SmartThings cloud.
 - In LAN mode, ask for the Samsung TV's LAN IP.
-- In cloud mode, download a pinned official SmartThings CLI into the private
-  application directory, verify its SHA-256 checksum, open the Samsung sign-in
-  flow, and ask which compatible TV to control. No separate MSI is required.
+- In cloud mode, download a pinned official Node.js runtime into the private
+  application directory, verify its SHA-256 checksum and OpenJS Foundation
+  signature, install the pinned official SmartThings CLI npm package, open the
+  Samsung sign-in flow, and ask which compatible TV to control. No separate MSI
+  or system Node.js installation is required.
 - Ask for the idle timeout (default 10 minutes; 0 disables it).
 - Use an existing Python 3.9+ if available.
 - If Python is absent, install Python 3.12 with winget.
@@ -156,7 +158,9 @@ For SmartThings sign-in only, use:
     Samsung TV Picture Controller -> Reauthorize SmartThings
 
 The reauthorization helper stops the background controller, completes browser
-sign-in, and restarts it without sending a TV command.
+sign-in, and restarts it without sending a TV command. If an older installation
+still uses the unsigned standalone smartthings.exe, rerun INSTALL-ME.cmd first;
+the helper will not stop the controller and attempt a runtime Windows blocks.
 
 You can change:
 - TV IP in Direct LAN mode
@@ -198,6 +202,12 @@ for in-place upgrades. It does not restrict which compatible TV can be used.
     Stops the controller, renews SmartThings OAuth interactively, and restarts it.
     It validates access with a read-only request and sends no TV command.
 
+%LOCALAPPDATA%\QN990FController\node
+    Pinned private Node.js runtime. node.exe is signed by the OpenJS Foundation.
+
+%LOCALAPPDATA%\QN990FController\smartthings-cli
+    Pinned official SmartThings CLI npm package and its dependencies.
+
 
 IMPORTANT BEHAVIOR / LIMITATIONS
 --------------------------------
@@ -236,6 +246,11 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 - SmartThings mode requires a Samsung OCF Television exposing execute and
   samsungvd.remoteControl. Optional volume control also requires audioVolume. Background commands use the
   official CLI's saved OAuth profile; config.json does not store its token.
+
+- Windows Application Control can reject the unsigned standalone executable
+  from SmartThings' release ZIP. Cloud installations instead run the official
+  npm CLI through a pinned, SHA-256-verified, OpenJS Foundation-signed node.exe.
+  Do not disable Defender or Application Control for this controller.
 
 - SmartThings authorization is checked with a read-only device request at startup
   and every 30 minutes. SmartThings sets the access-token lifetime (normally
