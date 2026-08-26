@@ -256,11 +256,18 @@ IMPORTANT BEHAVIOR / LIMITATIONS
   and every 30 minutes. SmartThings sets the access-token lifetime (normally
   about 24 hours). On Windows the controller proactively rotates both tokens
   when six hours remain, instead of waiting for the official CLI's final-hour
-  refresh. Token updates are atomic, and controller, installer, and
+  refresh. If the API rejects an access token before its saved expiry, the
+  controller forces one refresh and retries that request once. Token updates
+  are atomic, and controller, installer, and
   reauthorization operations share one cross-process lock. A transient refresh
   failure is held for five minutes rather than retried by every volume request.
   An actual rejected refresh token shows one Reauthorize alert; that helper
   clears the rejected local authorization and opens one interactive browser flow.
+
+- If cloud mode also runs on another computer, authorize that computer with a
+  different Samsung account and share the same SmartThings Location with both
+  accounts. In testing, token rotation under one Samsung account invalidated the
+  other computer's otherwise separate CLI authorization.
 
 
 MANUAL TEST COMMANDS

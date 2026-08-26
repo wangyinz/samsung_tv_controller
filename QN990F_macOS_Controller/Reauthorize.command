@@ -40,7 +40,7 @@ launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
 pkill -f "$CONTROLLER" >/dev/null 2>&1 || true
 sleep 0.3
 
-if ! "$PYTHON" "$CONTROLLER" --pair; then
+if ! "$PYTHON" "$CONTROLLER" --reauthorize; then
   echo
   echo "Reauthorization failed. The controller remains stopped to avoid a token race."
   echo "Run Reauthorize.command again when sign-in and network access are available."

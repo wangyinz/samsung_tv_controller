@@ -219,15 +219,22 @@ usually slower than LAN mode. Avoid triggering it repeatedly in quick succession
 normal use.
 Background control never opens a sign-in page by itself. If OAuth refresh fails, commands
 stop and one authorization alert is shown. The controller performs a read-only TV lookup
-at startup and every 30 minutes so the official CLI can refresh credentials before a
-hotkey is needed. SmartThings sets the access-token lifetime (normally about 24 hours),
-and the official CLI automatically replaces both the access token and the single-use
-refresh token. Controller, installer, and reauthorization CLI calls share one process
-lock so two refreshes cannot corrupt that rotation. Network timeouts are retried later;
-only an actual OAuth/refresh failure requires another sign-in. Choose Reauthorize in the
-alert, or double-click Reauthorize.command;
+at startup and every 30 minutes so the controller can refresh credentials before a
+hotkey is needed. SmartThings sets the access-token lifetime (normally about 24 hours).
+The controller proactively replaces both the access token and the single-use refresh
+token when six hours remain. If the API rejects an access token before that saved expiry,
+the controller forces one refresh under the same process lock and retries the request
+once. Controller, installer, and reauthorization operations share that lock so two
+refreshes cannot corrupt the rotation. Network timeouts are retried later; only a
+rejected refresh token or revoked authorization requires another sign-in. Choose
+Reauthorize in the alert, or double-click Reauthorize.command;
 the helper stops the controller, completes browser sign-in, and restarts it without
 sending a TV command.
+
+If cloud mode also runs on another computer, authorize that computer with a different
+Samsung account and share the same SmartThings Location with both accounts. In testing,
+token rotation under one Samsung account invalidated the other computer's otherwise
+separate CLI authorization.
 
 
 Video and Presentation Protection

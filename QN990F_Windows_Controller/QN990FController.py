@@ -1317,15 +1317,15 @@ class SmartThingsTVClient:
         if credentials.pop(self._credential_key(), None) is not None:
             self._write_credentials(credentials)
 
-    def _refresh_saved_authorization(self, timeout):
+    def _refresh_saved_authorization(self, timeout, force=False):
         if not SMARTTHINGS_CREDENTIALS_FILE.is_file():
-            return
+            return False
         credentials = json.loads(
             SMARTTHINGS_CREDENTIALS_FILE.read_text(encoding="utf-8")
         )
         credential = credentials.get(self._credential_key())
         if not isinstance(credential, dict):
-            return
+            return False
         try:
             expires = datetime.fromisoformat(
                 str(credential["expires"]).replace("Z", "+00:00")
@@ -1334,8 +1334,11 @@ class SmartThingsTVClient:
             raise SmartThingsAuthRequired(
                 "The saved SmartThings authorization is invalid."
             ) from exc
-        if expires > datetime.now(timezone.utc) + SMARTTHINGS_REFRESH_WINDOW:
-            return
+        if (
+            not force
+            and expires > datetime.now(timezone.utc) + SMARTTHINGS_REFRESH_WINDOW
+        ):
+            return False
         refresh_token = str(credential.get("refreshToken", "")).strip()
         if not refresh_token:
             raise SmartThingsAuthRequired(
@@ -1353,7 +1356,7 @@ class SmartThingsTVClient:
             data=body,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "Samsung-TV-Picture-Controller",
+                "User-Agent": "@smartthings/cli",
             },
             method="POST",
         )
@@ -1398,6 +1401,14 @@ class SmartThingsTVClient:
         self._write_credentials(credentials)
         self._authorization_refresh_retry_at = 0.0
         logger.info("SmartThings authorization refreshed")
+        return True
+
+    @staticmethod
+    def _result_detail(result):
+        detail = "\n".join(
+            part for part in (result.stdout, result.stderr) if part
+        ).strip()
+        return detail[-1200:] if len(detail) > 1200 else detail
 
     @staticmethod
     def _run_noninteractive(command, environment, timeout):
@@ -1488,25 +1499,43 @@ class SmartThingsTVClient:
                 else:
                     try:
                         self._refresh_saved_authorization(command_timeout)
-                    except SmartThingsAuthRequired:
-                        self._authorization_required = True
+                    except SmartThingsAuthRequired as exc:
                         if not allow_login:
-                            raise
+                            self._authorization_required = True
+                            raise SmartThingsAuthRequired(auth_message) from exc
                         self._remove_saved_authorization()
-                if allow_login:
-                    result = subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        env=environment,
-                        timeout=command_timeout,
-                        check=False,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                else:
-                    result = self._run_noninteractive(
+
+                def invoke():
+                    if allow_login:
+                        return subprocess.run(
+                            command,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                            timeout=command_timeout,
+                            check=False,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    return self._run_noninteractive(
                         command, environment, command_timeout
                     )
+
+                result = invoke()
+                detail = self._result_detail(result)
+                if result.returncode != 0 and self._is_auth_error(detail):
+                    try:
+                        refreshed = self._refresh_saved_authorization(
+                            command_timeout, force=True
+                        )
+                    except SmartThingsAuthRequired as exc:
+                        if not allow_login:
+                            self._authorization_required = True
+                            raise SmartThingsAuthRequired(auth_message) from exc
+                        self._remove_saved_authorization()
+                        result = invoke()
+                    else:
+                        if refreshed:
+                            result = invoke()
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
                     "SmartThings command timed out. Check the network connection."
@@ -1522,11 +1551,7 @@ class SmartThingsTVClient:
             kernel32.ReleaseMutex(process_lock)
             kernel32.CloseHandle(process_lock)
         if result.returncode != 0:
-            detail = "\n".join(
-                part for part in (result.stdout, result.stderr) if part
-            ).strip()
-            if len(detail) > 1200:
-                detail = detail[-1200:]
+            detail = self._result_detail(result)
             if self._is_auth_error(detail):
                 self._authorization_required = True
                 raise SmartThingsAuthRequired(auth_message)

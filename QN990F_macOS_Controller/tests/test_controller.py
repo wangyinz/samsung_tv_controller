@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -361,9 +362,28 @@ class SmartThingsTVClientTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.cfg = cloud_config(self.temp_dir.name)
         self.client = controller.SmartThingsTVClient(self.cfg)
+        controller.SMARTTHINGS_CREDENTIALS_FILE.unlink(missing_ok=True)
 
     def tearDown(self):
+        controller.SMARTTHINGS_CREDENTIALS_FILE.unlink(missing_ok=True)
         self.temp_dir.cleanup()
+
+    def write_credentials(self, lifetime=controller.timedelta(days=1)):
+        expires = (
+            controller.datetime.now(controller.timezone.utc)
+            + lifetime
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        credentials = {
+            self.client._credential_key(): {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expires": expires,
+                "scope": ["r:devices:*", "x:devices:*"],
+                "installedAppId": "installed-app",
+                "deviceId": "oauth-device",
+            }
+        }
+        self.client._write_credentials(credentials)
 
     def test_picture_off_uses_phone_accessibility_ocf_payload(self):
         with mock.patch.object(self.client, "_run") as run:
@@ -470,6 +490,104 @@ class SmartThingsTVClientTests(unittest.TestCase):
 
         self.assertTrue(self.client.authorization_required())
 
+    def test_early_api_401_forces_refresh_and_retries_once(self):
+        self.write_credentials()
+        failed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="Request failed with status code 401"
+        )
+        succeeded = subprocess.CompletedProcess(
+            [], 0, stdout="device", stderr=""
+        )
+        token_response = io.BytesIO(json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 86400,
+        }).encode("utf-8"))
+
+        with mock.patch.object(
+            controller.subprocess, "run", side_effect=[failed, succeeded]
+        ) as run, mock.patch.object(
+            controller.urllib_request, "urlopen", return_value=token_response
+        ) as urlopen:
+            output = self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertEqual(output, "device")
+        self.assertEqual(run.call_count, 2)
+        urlopen.assert_called_once()
+        refresh_request = urlopen.call_args.args[0]
+        self.assertEqual(refresh_request.get_header("User-agent"), "@smartthings/cli")
+        saved = json.loads(
+            controller.SMARTTHINGS_CREDENTIALS_FILE.read_text(encoding="utf-8")
+        )[self.client._credential_key()]
+        self.assertEqual(saved["accessToken"], "new-access")
+        self.assertEqual(saved["refreshToken"], "new-refresh")
+        self.assertFalse(self.client.authorization_required())
+
+    def test_authorization_is_refreshed_proactively_within_six_hours(self):
+        self.write_credentials(controller.timedelta(hours=1))
+        succeeded = subprocess.CompletedProcess(
+            [], 0, stdout="device", stderr=""
+        )
+        token_response = io.BytesIO(json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 86400,
+        }).encode("utf-8"))
+
+        with mock.patch.object(
+            controller.subprocess, "run", return_value=succeeded
+        ) as run, mock.patch.object(
+            controller.urllib_request, "urlopen", return_value=token_response
+        ) as urlopen:
+            output = self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertEqual(output, "device")
+        self.assertEqual(run.call_count, 1)
+        urlopen.assert_called_once()
+
+    def test_rejected_reactive_refresh_requires_authorization(self):
+        self.write_credentials()
+        failed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="Request failed with status code 401"
+        )
+        rejection = controller.urllib_error.HTTPError(
+            controller.SMARTTHINGS_OAUTH_TOKEN_URL,
+            401,
+            "Unauthorized",
+            None,
+            io.BytesIO(),
+        )
+        self.addCleanup(rejection.close)
+
+        with mock.patch.object(
+            controller.subprocess, "run", return_value=failed
+        ) as run, mock.patch.object(
+            controller.urllib_request, "urlopen", side_effect=rejection
+        ):
+            with self.assertRaises(controller.SmartThingsAuthRequired):
+                self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(self.client.authorization_required())
+
+    def test_transient_reactive_refresh_failure_does_not_latch_authorization(self):
+        self.write_credentials()
+        failed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="Request failed with status code 401"
+        )
+
+        with mock.patch.object(
+            controller.subprocess, "run", return_value=failed
+        ), mock.patch.object(
+            controller.urllib_request,
+            "urlopen",
+            side_effect=controller.urllib_error.URLError("offline"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "authorization service"):
+                self.client._run("devices", DEVICE_ID, "--json")
+
+        self.assertFalse(self.client.authorization_required())
+
     def test_background_timeout_is_transient_and_can_retry(self):
         timeout = subprocess.TimeoutExpired(["smartthings"], 20)
         with mock.patch.object(
@@ -481,7 +599,11 @@ class SmartThingsTVClientTests(unittest.TestCase):
                 self.client._run("devices", DEVICE_ID, "--json")
 
         self.assertFalse(self.client.authorization_required())
-        self.assertEqual(run.call_count, 2)
+        smartthings_calls = [
+            call for call in run.call_args_list
+            if call.args and call.args[0][0] == "/usr/bin/true"
+        ]
+        self.assertEqual(len(smartthings_calls), 2)
 
     def test_blocked_background_browser_fallback_latches_authorization(self):
         completed = subprocess.CompletedProcess(

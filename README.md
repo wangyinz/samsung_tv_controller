@@ -127,20 +127,27 @@ Requirements:
 Cloud mode does not silently fall back to LAN mode. It depends on an internet
 service, is usually slower than local control, and may be affected by API or
 firmware changes. The controller makes a read-only SmartThings device request
-at startup and every 30 minutes. This lets the official CLI refresh credentials
-before a hotkey is needed and detects failed refreshes early.
+at startup and every 30 minutes. This gives the controller an opportunity to
+refresh credentials before a hotkey is needed and detects failed refreshes
+early.
 
 SmartThings sets the access-token lifetime (normally about 24 hours); this
-project cannot extend it to a week or month. On Windows the controller follows
-SmartThings' proactive-refresh guidance and rotates the access token and
-single-use refresh token when six hours remain; macOS continues to use the
-official CLI's working refresh flow. Token writes are atomic and every CLI
-operation is serialized across processes so that two refreshes cannot consume
-the same refresh token or overwrite the newly rotated token. In normal
-operation, one browser authorization is therefore sufficient. Another
-authorization is needed only if access is revoked, the saved CLI credentials
-are removed or damaged, or SmartThings rejects the current refresh token. See SmartThings'
+project cannot extend it to a week or month. On both platforms the controller
+rotates the access token and single-use refresh token when six hours remain. If
+the API rejects an access token before its saved expiry time, the controller
+forces one refresh under the same lock and retries the failed request once.
+Token writes are atomic and every CLI operation is serialized across processes
+so that two refreshes cannot consume the same refresh token or overwrite the
+newly rotated token. In normal operation, one browser authorization is
+therefore sufficient. Another authorization is needed only if access is
+revoked, the saved CLI credentials are removed or damaged, or SmartThings
+rejects the current refresh token. See SmartThings'
 [token-management documentation](https://developer.smartthings.com/docs/service-integrations/token-management#token-expiry).
+
+When cloud mode runs on more than one computer, authorize each computer with a
+different Samsung account and share the same SmartThings Location with those
+accounts. In testing, token rotation under the same Samsung account invalidated
+the other computer's otherwise separate CLI authorization.
 
 ## Installation
 
