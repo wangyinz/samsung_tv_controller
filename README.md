@@ -131,14 +131,15 @@ at startup and every 30 minutes. This lets the official CLI refresh credentials
 before a hotkey is needed and detects failed refreshes early.
 
 SmartThings sets the access-token lifetime (normally about 24 hours); this
-project cannot extend it to a week or month. The official CLI automatically
-exchanges an expired access token and the current single-use refresh token for
-new access and refresh tokens. The controller and both installers serialize
-every CLI operation across processes so that two refreshes cannot consume the
-same refresh token or overwrite the newly rotated token. In normal operation,
-one browser authorization is therefore sufficient. Another authorization is
-needed only if access is revoked, the saved CLI credentials are removed or
-damaged, or SmartThings rejects the current refresh token. See SmartThings'
+project cannot extend it to a week or month. On Windows the controller follows
+SmartThings' proactive-refresh guidance and rotates the access token and
+single-use refresh token when six hours remain; macOS continues to use the
+official CLI's working refresh flow. Token writes are atomic and every CLI
+operation is serialized across processes so that two refreshes cannot consume
+the same refresh token or overwrite the newly rotated token. In normal
+operation, one browser authorization is therefore sufficient. Another
+authorization is needed only if access is revoked, the saved CLI credentials
+are removed or damaged, or SmartThings rejects the current refresh token. See SmartThings'
 [token-management documentation](https://developer.smartthings.com/docs/service-integrations/token-management#token-expiry).
 
 ## Installation

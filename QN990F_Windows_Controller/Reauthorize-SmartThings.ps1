@@ -33,6 +33,23 @@ if ((-not (Test-Path $SmartThingsCli)) -or
     exit 3
 }
 
+$ReauthorizationMutex = New-Object System.Threading.Mutex(
+    $false,
+    "Local\SamsungTVPictureControllerReauthorization"
+)
+$HasReauthorizationMutex = $false
+try {
+    try {
+        $HasReauthorizationMutex = $ReauthorizationMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $HasReauthorizationMutex = $true
+    }
+    if (-not $HasReauthorizationMutex) {
+        Write-Warning "SmartThings reauthorization is already running. Use the existing window."
+        Read-Host "Press Enter to close"
+        exit 4
+    }
+
 Write-Host "Samsung TV Picture Controller - SmartThings reauthorization" -ForegroundColor Green
 Write-Host "The background controller will stop while browser sign-in completes."
 Write-Host "No Picture Off or wake command will be sent."
@@ -70,13 +87,43 @@ $ControllerPids = @($ControllerPids | Sort-Object -Unique)
 foreach ($ControllerPid in $ControllerPids) {
     Stop-Process -Id $ControllerPid -Force -ErrorAction SilentlyContinue
 }
+$SmartThingsNodePids = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -eq "node.exe" -and $_.CommandLine -and
+        ([string]$_.CommandLine).IndexOf(
+            $SmartThingsCliScript,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -ge 0
+    } |
+    ForEach-Object { [int]$_.ProcessId })
+foreach ($SmartThingsNodePid in $SmartThingsNodePids) {
+    Stop-Process -Id $SmartThingsNodePid -Force -ErrorAction SilentlyContinue
+}
 if ($ControllerPids.Count -gt 0) {
     Start-Sleep -Milliseconds 300
 }
 Remove-Item $PidPath -Force -ErrorAction SilentlyContinue
 
-& $VenvPython $ControllerPath --pair
-if ($LASTEXITCODE -ne 0) {
+$env:BROWSER = $null
+$env:SMARTTHINGS_TOKEN = $null
+$PairProcess = Start-Process -FilePath $VenvPython `
+    -ArgumentList "`"$ControllerPath`" --reauthorize" `
+    -WorkingDirectory $AppDir -NoNewWindow -PassThru
+$BrowserOpened = $false
+while (-not $PairProcess.HasExited) {
+    if (-not $BrowserOpened) {
+        $LoginListener = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPort -in @(61973, 61974, 61975) } |
+            Select-Object -First 1
+        if ($LoginListener) {
+            Start-Process "http://localhost:$($LoginListener.LocalPort)/start"
+            $BrowserOpened = $true
+        }
+    }
+    Start-Sleep -Milliseconds 200
+}
+$PairProcess.WaitForExit()
+if ($PairProcess.ExitCode -ne 0) {
     Write-Warning "Reauthorization failed. The controller remains stopped to avoid a token race."
     Read-Host "Press Enter to close"
     exit 2
@@ -86,3 +133,9 @@ Start-Process -FilePath $VenvPythonW -ArgumentList "`"$ControllerPath`"" -Workin
 Write-Host ""
 Write-Host "SmartThings authorization was renewed and the controller restarted." -ForegroundColor Green
 Read-Host "Press Enter to close"
+} finally {
+    if ($HasReauthorizationMutex) {
+        $ReauthorizationMutex.ReleaseMutex()
+    }
+    $ReauthorizationMutex.Dispose()
+}

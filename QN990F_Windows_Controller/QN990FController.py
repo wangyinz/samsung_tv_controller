@@ -21,6 +21,7 @@ import argparse
 import atexit
 import ctypes
 from ctypes import wintypes
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -32,6 +33,9 @@ import subprocess
 import sys
 import threading
 import time
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 try:
     from samsungtvws import SamsungTVWS
@@ -48,6 +52,15 @@ TOKEN_FILE = APP_DIR / "samsung-token.txt"
 LOG_FILE = APP_DIR / "controller.log"
 PID_FILE = APP_DIR / "controller.pid"
 STATUS_FILE = APP_DIR / "status.json"
+SMARTTHINGS_CREDENTIALS_FILE = (
+    Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+    / "@smartthings" / "cli" / "Data" / "credentials.json"
+)
+SMARTTHINGS_OAUTH_CLIENT_ID = "d18cf96e-c626-4433-bf51-ddbb10c5d1ed"
+SMARTTHINGS_OAUTH_TOKEN_URL = (
+    "https://auth-global.api.smartthings.com/oauth/token"
+)
+SMARTTHINGS_REFRESH_WINDOW = timedelta(hours=6)
 
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1246,6 +1259,7 @@ class SmartThingsTVClient:
         self._lock = threading.Lock()
         self._command_times = []
         self._authorization_required = False
+        self._authorization_refresh_retry_at = 0.0
 
     @staticmethod
     def _acquire_process_lock(timeout):
@@ -1276,6 +1290,114 @@ class SmartThingsTVClient:
 
     def authorization_required(self):
         return self._authorization_required
+
+    def _credential_key(self):
+        return f'{self.config["smartthings_profile"]}:api.smartthings.com'
+
+    @staticmethod
+    def _write_credentials(credentials):
+        temporary = SMARTTHINGS_CREDENTIALS_FILE.with_name(
+            f"{SMARTTHINGS_CREDENTIALS_FILE.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(credentials, indent=4) + "\n", encoding="utf-8"
+            )
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, SMARTTHINGS_CREDENTIALS_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _remove_saved_authorization(self):
+        if not SMARTTHINGS_CREDENTIALS_FILE.is_file():
+            return
+        credentials = json.loads(
+            SMARTTHINGS_CREDENTIALS_FILE.read_text(encoding="utf-8")
+        )
+        if credentials.pop(self._credential_key(), None) is not None:
+            self._write_credentials(credentials)
+
+    def _refresh_saved_authorization(self, timeout):
+        if not SMARTTHINGS_CREDENTIALS_FILE.is_file():
+            return
+        credentials = json.loads(
+            SMARTTHINGS_CREDENTIALS_FILE.read_text(encoding="utf-8")
+        )
+        credential = credentials.get(self._credential_key())
+        if not isinstance(credential, dict):
+            return
+        try:
+            expires = datetime.fromisoformat(
+                str(credential["expires"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SmartThingsAuthRequired(
+                "The saved SmartThings authorization is invalid."
+            ) from exc
+        if expires > datetime.now(timezone.utc) + SMARTTHINGS_REFRESH_WINDOW:
+            return
+        refresh_token = str(credential.get("refreshToken", "")).strip()
+        if not refresh_token:
+            raise SmartThingsAuthRequired(
+                "The saved SmartThings authorization has no refresh token."
+            )
+        if time.monotonic() < self._authorization_refresh_retry_at:
+            raise RuntimeError("SmartThings token refresh retry is pending.")
+        body = urllib_parse.urlencode({
+            "grant_type": "refresh_token",
+            "client_id": SMARTTHINGS_OAUTH_CLIENT_ID,
+            "refresh_token": refresh_token,
+        }).encode("ascii")
+        request = urllib_request.Request(
+            SMARTTHINGS_OAUTH_TOKEN_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Samsung-TV-Picture-Controller",
+            },
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=timeout) as response:
+                token_data = json.load(response)
+        except urllib_error.HTTPError as exc:
+            if exc.code in {400, 401}:
+                raise SmartThingsAuthRequired(
+                    "The SmartThings refresh token was rejected."
+                ) from exc
+            self._authorization_refresh_retry_at = time.monotonic() + 300.0
+            raise RuntimeError(
+                f"SmartThings token refresh failed with HTTP {exc.code}."
+            ) from exc
+        except (urllib_error.URLError, TimeoutError) as exc:
+            self._authorization_refresh_retry_at = time.monotonic() + 300.0
+            raise RuntimeError(
+                "SmartThings token refresh could not reach the authorization service."
+            ) from exc
+        try:
+            lifetime = float(token_data["expires_in"])
+            updated = {
+                "accessToken": str(token_data["access_token"]),
+                "refreshToken": str(token_data["refresh_token"]),
+                "expires": (
+                    datetime.now(timezone.utc) + timedelta(seconds=lifetime)
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "scope": token_data.get("scope", credential.get("scope")),
+                "installedAppId": token_data.get(
+                    "installed_app_id", credential.get("installedAppId")
+                ),
+                "deviceId": token_data.get(
+                    "device_id", credential.get("deviceId")
+                ),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "SmartThings token refresh returned incomplete credentials."
+            ) from exc
+        credentials[self._credential_key()] = updated
+        self._write_credentials(credentials)
+        self._authorization_refresh_retry_at = 0.0
+        logger.info("SmartThings authorization refreshed")
 
     @staticmethod
     def _run_noninteractive(command, environment, timeout):
@@ -1325,7 +1447,7 @@ class SmartThingsTVClient:
         finally:
             kernel32.CloseHandle(job)
 
-    def _run(self, *args, timeout=None, allow_login=False):
+    def _run(self, *args, timeout=None, allow_login=False, force_login=False):
         auth_message = (
             "SmartThings authorization requires user interaction; "
             "run Reauthorize SmartThings from the Start menu."
@@ -1350,7 +1472,9 @@ class SmartThingsTVClient:
         ])
         environment = os.environ.copy()
         environment.pop("SMARTTHINGS_TOKEN", None)
-        if not allow_login:
+        if allow_login:
+            environment.pop("BROWSER", None)
+        else:
             environment["BROWSER"] = "none"
         command_timeout = (
             float(self.config["smartthings_command_timeout_seconds"])
@@ -1359,6 +1483,16 @@ class SmartThingsTVClient:
         process_lock = self._acquire_process_lock(command_timeout)
         try:
             try:
+                if force_login:
+                    self._remove_saved_authorization()
+                else:
+                    try:
+                        self._refresh_saved_authorization(command_timeout)
+                    except SmartThingsAuthRequired:
+                        self._authorization_required = True
+                        if not allow_login:
+                            raise
+                        self._remove_saved_authorization()
                 if allow_login:
                     result = subprocess.run(
                         command,
@@ -1418,11 +1552,12 @@ class SmartThingsTVClient:
                 logger.warning("SmartThings authorization check unavailable: %r", exc)
                 return None
 
-    def pair(self):
+    def pair(self, force_login=False):
         output = self._run(
             "devices", str(self.config["smartthings_device_id"]), "--json",
             timeout=650,
             allow_login=True,
+            force_login=force_login,
         )
         try:
             device = json.loads(output)
@@ -2249,6 +2384,7 @@ def main() -> int:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--pair", action="store_true")
+    mode.add_argument("--reauthorize", action="store_true")
     mode.add_argument("--test", action="store_true")
     mode.add_argument("--off", action="store_true")
     mode.add_argument("--wake", action="store_true")
@@ -2273,7 +2409,10 @@ def main() -> int:
 
     client = make_tv_client(config)
 
-    if args.pair:
+    if args.pair or args.reauthorize:
+        if args.reauthorize and config["control_method"] != "smartthings":
+            print("Reauthorization is only available in SmartThings mode.", file=sys.stderr)
+            return 2
         if config["control_method"] == "smartthings":
             print("Validating SmartThings cloud access...")
             print("A browser will open if SmartThings sign-in is required.")
@@ -2286,7 +2425,10 @@ def main() -> int:
                 "If the TV asks whether to allow remote control, choose Allow."
             )
         try:
-            label = client.pair()
+            if args.reauthorize:
+                label = client.pair(force_login=True)
+            else:
+                label = client.pair()
             if config["control_method"] == "smartthings":
                 print(f"SmartThings cloud access succeeded: {label}")
             else:

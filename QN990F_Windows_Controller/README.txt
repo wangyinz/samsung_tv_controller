@@ -254,12 +254,13 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 
 - SmartThings authorization is checked with a read-only device request at startup
   and every 30 minutes. SmartThings sets the access-token lifetime (normally
-  about 24 hours); the official CLI automatically rotates both the access token
-  and the single-use refresh token. CLI operations from the controller,
-  installer, and reauthorization flow share one cross-process lock, and
-  background jobs cannot create browser child processes. Network timeouts are
-  retried later. An actual failed refresh shows one alert with a Reauthorize
-  option; server-side revocation still requires another sign-in.
+  about 24 hours). On Windows the controller proactively rotates both tokens
+  when six hours remain, instead of waiting for the official CLI's final-hour
+  refresh. Token updates are atomic, and controller, installer, and
+  reauthorization operations share one cross-process lock. A transient refresh
+  failure is held for five minutes rather than retried by every volume request.
+  An actual rejected refresh token shows one Reauthorize alert; that helper
+  clears the rejected local authorization and opens one interactive browser flow.
 
 
 MANUAL TEST COMMANDS
