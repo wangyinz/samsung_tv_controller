@@ -28,11 +28,10 @@ monitor.
 - Per-user background startup with no separate server or always-on device.
 - Bounded diagnostic logs: one active 1 MB log and three 1 MB backups.
 - Isolated Python environment installed without modifying system Python packages.
-- Optional keyboard volume integration: local volume is used first when increasing;
-  after it reaches maximum, further presses increase TV volume. In SmartThings
-  mode, decreasing lowers TV volume to 10 before lowering system volume. On
-  macOS fixed-volume outputs such as HDMI, the TV instead uses the full 0–100
-  range because there is no adjustable system-volume layer.
+- Optional keyboard volume integration. Windows can extend its system-volume range
+  with TV volume. On macOS, TV volume routing is bound during installation to one
+  exact fixed-volume Core Audio endpoint; all other HDMI devices, Mac speakers,
+  headphones, and adjustable outputs remain entirely under macOS control.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -205,16 +204,17 @@ Press the configured hotkey to blank the picture:
 Afterward, press a non-modifier key, click a mouse button, or use the wheel to
 restore the picture. Modifier keys alone do not wake it.
 
-The hardware volume keys form one control range across the computer and TV:
-
 Integrated volume control is optional during installation. Rerun the installer
 to enable or disable it; an upgrade keeps the current choice when the prompt is
 left blank.
 
-- `Volume Up` changes system volume until it is full, then sends TV volume-up.
-- In SmartThings mode, `Volume Down` lowers TV volume to the configured floor
-  (10 by default), then resumes normal system-volume reduction. On macOS, a
-  fixed-volume output changes this floor to 0 automatically.
+- On Windows, `Volume Up` changes system volume until it is full, then sends TV
+  volume-up. In SmartThings mode, `Volume Down` lowers TV volume to the configured
+  floor before resuming normal system-volume reduction.
+- On macOS, the TV receives volume keys only when the current output has no
+  adjustable system volume and its Core Audio UID exactly matches the TV output
+  confirmed during installation. Other HDMI devices, Mac speakers, and headphones
+  never alter TV volume. The bound TV output uses its full range from 0 to 100.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
 - Cloud volume state is refreshed no more than once every 30 seconds.

@@ -20,10 +20,9 @@ Makes a compatible Samsung TV behave more like a conventional computer display o
    The picture will not be turned off automatically while a video or presentation app
    explicitly requests that the display remain on.
 
-5. Optionally integrates the keyboard volume buttons with TV volume. Volume Up controls
-   macOS until it reaches maximum, then controls the TV. In SmartThings mode,
-   Volume Down lowers TV volume to 10 before continuing with macOS volume. For
-   fixed-volume outputs such as HDMI, the TV instead uses its full 0-100 range.
+5. Optionally routes the keyboard volume buttons to TV volume while the current macOS
+   output is the exact fixed-volume Core Audio endpoint bound during installation.
+   Other HDMI devices, Mac speakers, and headphones remain entirely under macOS control.
 
 
 Compatibility
@@ -135,8 +134,10 @@ The controller uses IOHIDManager matching limited to the standard scroll-wheel,
 Volume Up, and Volume Down usages. If macOS denies access, add the installed
 venv Python runtime to System Settings -> Privacy & Security -> Input Monitoring
 when macOS prompts. The controller does not subscribe to ordinary typed-key
-usages. If permission is unavailable, Picture Off and keyboard/button wake
-continue, but wheel wake and volume routing are disabled for that run.
+usages. If registration is unavailable while login is still starting, the controller
+retries three times without delaying the global hotkey. If all attempts fail, Picture Off
+and keyboard/button wake continue, but wheel wake and volume routing are disabled for
+that run.
 
 Wake Input and Privacy
 ----------------------
@@ -181,10 +182,11 @@ After Picture Off:
 
 Volume keys:
     Integrated volume control is optional during installation. Rerun
-    INSTALL.command to enable or disable it; press Return to keep the current choice.
-    Volume Up -> macOS volume until maximum, then TV volume.
-    Volume Down in SmartThings mode -> TV volume down to 10, then macOS. If the
-    current macOS output has no adjustable volume, the TV floor is 0 instead.
+    INSTALL.command to enable, disable, or bind it to a different TV output. The
+    installer requires the configured TV to be selected as the current macOS sound output
+    and stores that endpoint's Core Audio UID. Only that exact fixed-volume output routes
+    Volume Up and Volume Down to the TV across its full 0-100 range. Every other output
+    remains under macOS control and does not modify TV volume.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
     Cloud volume state is refreshed no more than once every 30 seconds.
@@ -194,8 +196,8 @@ Volume keys:
     Keyboard Control and turn off "Listen to native audio keys". BetterDisplay
     may remain running for brightness and its other display features.
 
-Direct LAN can send TV volume keys but cannot read current TV volume, so the
-TV-first Volume Down rule is intentionally limited to SmartThings mode.
+Direct LAN can send TV volume keys but cannot read current TV volume. SmartThings mode
+can read and combine the target TV volume before sending an update.
 
 Wake rules:
 - Pressing modifier keys such as Control, Command, Option, or Shift alone does not wake.
@@ -282,7 +284,8 @@ SmartThings profile are legacy internal identifiers retained to avoid breaking
 existing installations. They do not restrict TV model compatibility.
 
 ~/Library/Application Support/QN990FController/config.json
-    Controller configuration; does not contain a SmartThings access token.
+    Controller configuration, including the exact Core Audio output UID bound for
+    optional TV-volume routing; does not contain a SmartThings access token.
 
 ~/Library/Application Support/QN990FController/samsung-token.txt
     TV pairing token used only in LAN mode.

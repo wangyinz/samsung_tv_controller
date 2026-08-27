@@ -343,6 +343,90 @@ class MacOSBackendTests(unittest.TestCase):
         self.assertEqual(backend.system_volume_state(), (False, True))
         self.assertTrue(backend.system_volume_is_max())
 
+    def test_default_audio_output_info_includes_stable_device_identity(self):
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+
+        def read_property(_object_id, selector, _scope, value, element=0):
+            del element
+            if selector == backend.K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE:
+                value.value = 42
+            elif selector == backend.K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE:
+                value.value = controller.fourcc("hdmi")
+            else:
+                self.fail(f"Unexpected selector: {selector}")
+            return value.value
+
+        values = {
+            backend.K_AUDIO_OBJECT_PROPERTY_NAME: "QN990F",
+            backend.K_AUDIO_OBJECT_PROPERTY_MANUFACTURER: "Samsung",
+            backend.K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: "coreaudio-tv-uid",
+        }
+        backend._audio_property = read_property
+        backend._audio_string_property = lambda _device, selector: values[selector]
+
+        self.assertEqual(
+            backend.default_audio_output_info(),
+            {
+                "name": "QN990F",
+                "manufacturer": "Samsung",
+                "uid": "coreaudio-tv-uid",
+                "transport": "hdmi",
+            },
+        )
+
+
+class DirectHIDStartupTests(unittest.TestCase):
+    class Backend:
+        def __init__(self, failures):
+            self.failures = failures
+            self.register_calls = 0
+            self.unregister_calls = 0
+
+        def register_volume_keys(self, _handler, wheel_handler):
+            self.register_calls += 1
+            self.wheel_handler = wheel_handler
+            if self.register_calls <= self.failures:
+                raise RuntimeError("not ready")
+
+        def unregister_volume_keys(self):
+            self.unregister_calls += 1
+
+    def make_controller(self):
+        volume = mock.Mock()
+        ctrl = types.SimpleNamespace(
+            cfg={"enable_volume_control": True},
+            handle_volume_key=mock.Mock(),
+            handle_input=mock.Mock(),
+            volume=volume,
+        )
+        return ctrl, volume
+
+    def test_direct_hid_retries_until_registration_succeeds(self):
+        backend = self.Backend(failures=2)
+        ctrl, volume = self.make_controller()
+
+        controller.register_direct_hid_input(
+            backend, ctrl, threading.Event(), retry_delays=(0.0, 0.0)
+        )
+
+        self.assertEqual(backend.register_calls, 3)
+        self.assertEqual(backend.unregister_calls, 2)
+        self.assertIs(ctrl.volume, volume)
+        volume.stop.assert_not_called()
+
+    def test_direct_hid_disables_volume_after_retry_budget_is_exhausted(self):
+        backend = self.Backend(failures=3)
+        ctrl, volume = self.make_controller()
+
+        controller.register_direct_hid_input(
+            backend, ctrl, threading.Event(), retry_delays=(0.0, 0.0)
+        )
+
+        self.assertEqual(backend.register_calls, 3)
+        self.assertEqual(backend.unregister_calls, 3)
+        volume.stop.assert_called_once_with()
+        self.assertIsNone(ctrl.volume)
+
 
 class LANClientTests(unittest.TestCase):
     def test_new_config_uses_generic_remote_name(self):
@@ -944,6 +1028,44 @@ class ControllerInputTests(unittest.TestCase):
             instance._authorization_monitor()
 
         report.assert_called_once_with()
+
+    def test_adjustable_system_output_never_routes_volume_to_tv(self):
+        instance, backend = self.make_controller()
+        instance.volume = mock.Mock()
+        backend.system_volume_state = mock.Mock(return_value=(True, True))
+
+        self.assertFalse(instance.handle_volume_key("up"))
+
+        instance.volume.handle_key.assert_not_called()
+
+    def test_fixed_system_output_routes_volume_to_tv(self):
+        instance, backend = self.make_controller()
+        instance.volume = mock.Mock()
+        instance.volume.handle_key.return_value = True
+        instance.cfg["tv_audio_output_uid"] = "tv-output"
+        backend.system_volume_state = mock.Mock(return_value=(False, True))
+        backend.default_audio_output_info = mock.Mock(
+            return_value={"uid": "tv-output"}
+        )
+
+        self.assertTrue(instance.handle_volume_key("down"))
+
+        instance.volume.handle_key.assert_called_once_with(
+            "down", system_is_max=True, system_is_adjustable=False
+        )
+
+    def test_unbound_fixed_output_never_routes_volume_to_tv(self):
+        instance, backend = self.make_controller()
+        instance.volume = mock.Mock()
+        instance.cfg["tv_audio_output_uid"] = "tv-output"
+        backend.system_volume_state = mock.Mock(return_value=(False, True))
+        backend.default_audio_output_info = mock.Mock(
+            return_value={"uid": "other-output"}
+        )
+
+        self.assertFalse(instance.handle_volume_key("down"))
+
+        instance.volume.handle_key.assert_not_called()
 
     def test_authorization_monitor_reports_a_latched_background_failure(self):
         instance, _backend = self.make_controller("smartthings")

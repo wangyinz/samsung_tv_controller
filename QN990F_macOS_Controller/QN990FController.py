@@ -48,6 +48,7 @@ SMARTTHINGS_OAUTH_TOKEN_URL = (
 SMARTTHINGS_REFRESH_WINDOW = timedelta(hours=6)
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 3
+HID_START_RETRY_SECONDS = (5.0, 15.0, 30.0)
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
@@ -76,6 +77,7 @@ DEFAULT_CONFIG = {
     "smartthings_command_timeout_seconds": 20.0,
     "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": True,
+    "tv_audio_output_uid": "",
     "tv_volume_floor": 10,
     "tv_volume_refresh_seconds": 30.0,
 }
@@ -184,6 +186,10 @@ class MacOSBackend:
     K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN = 0
     K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE = fourcc("dOut")
     K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL = fourcc("glob")
+    K_AUDIO_OBJECT_PROPERTY_NAME = fourcc("lnam")
+    K_AUDIO_OBJECT_PROPERTY_MANUFACTURER = fourcc("lmak")
+    K_AUDIO_DEVICE_PROPERTY_DEVICE_UID = fourcc("uid ")
+    K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE = fourcc("tran")
     K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR = fourcc("volm")
     K_AUDIO_DEVICE_PROPERTY_SCOPE_OUTPUT = fourcc("outp")
 
@@ -250,6 +256,10 @@ class MacOSBackend:
         self.coregraphics.CGEventGetLocation.restype = CGPoint
         self.corefoundation.CFRelease.argtypes = [c_void_p]
         self.corefoundation.CFRelease.restype = None
+        self.corefoundation.CFStringGetCString.argtypes = [
+            c_void_p, ctypes.c_char_p, c_long, c_uint32,
+        ]
+        self.corefoundation.CFStringGetCString.restype = c_bool
         self.corefoundation.CFStringCreateWithCString.argtypes = [
             c_void_p, ctypes.c_char_p, c_uint32,
         ]
@@ -359,6 +369,61 @@ class MacOSBackend:
         if status != 0:
             raise RuntimeError(f"AudioObjectGetPropertyData failed: OSStatus {status}")
         return value.value
+
+    def _audio_string_property(self, object_id, selector):
+        value = c_void_p()
+        self._audio_property(
+            object_id,
+            selector,
+            self.K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            value,
+        )
+        if not value:
+            return ""
+        try:
+            buffer = ctypes.create_string_buffer(1024)
+            if not self.corefoundation.CFStringGetCString(
+                value,
+                buffer,
+                len(buffer),
+                self.K_CF_STRING_ENCODING_UTF8,
+            ):
+                raise RuntimeError("CFStringGetCString failed for audio device property.")
+            return buffer.value.decode("utf-8")
+        finally:
+            self.corefoundation.CFRelease(value)
+
+    def default_audio_output_info(self):
+        device_id = c_uint32()
+        self._audio_property(
+            self.K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            self.K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            self.K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            device_id,
+        )
+        if not device_id.value:
+            raise RuntimeError("Core Audio has no default output device.")
+        transport = c_uint32()
+        self._audio_property(
+            device_id.value,
+            self.K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE,
+            self.K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            transport,
+        )
+        return {
+            "name": self._audio_string_property(
+                device_id.value, self.K_AUDIO_OBJECT_PROPERTY_NAME
+            ),
+            "manufacturer": self._audio_string_property(
+                device_id.value, self.K_AUDIO_OBJECT_PROPERTY_MANUFACTURER
+            ),
+            "uid": self._audio_string_property(
+                device_id.value, self.K_AUDIO_DEVICE_PROPERTY_DEVICE_UID
+            ),
+            "transport": transport.value.to_bytes(4, "big").decode(
+                "ascii", errors="replace"
+            ),
+        }
 
     def system_volume_state(self):
         device_id = c_uint32()
@@ -765,6 +830,7 @@ def load_config():
     cfg["socket_timeout_seconds"] = max(1.0, float(cfg.get("socket_timeout_seconds",5)))
     cfg["key_press_delay_seconds"] = max(0.0, float(cfg.get("key_press_delay_seconds",0.05)))
     cfg["enable_volume_control"] = bool(cfg.get("enable_volume_control", True))
+    cfg["tv_audio_output_uid"] = str(cfg.get("tv_audio_output_uid", "")).strip()
     cfg["tv_volume_floor"] = min(100, max(0, int(cfg.get("tv_volume_floor", 10))))
     cfg["tv_volume_refresh_seconds"] = max(
         30.0, float(cfg.get("tv_volume_refresh_seconds", 30.0))
@@ -1589,15 +1655,30 @@ class Controller:
         if self.volume is None:
             return False
         system_is_adjustable, system_is_max = self.backend.system_volume_state()
-        routed = self.volume.handle_key(
-            direction,
-            system_is_max=system_is_max,
-            system_is_adjustable=system_is_adjustable,
-        )
+        routed = False
+        if not system_is_adjustable:
+            try:
+                output = self.backend.default_audio_output_info()
+                output_matches = bool(self.cfg["tv_audio_output_uid"]) and (
+                    output["uid"] == self.cfg["tv_audio_output_uid"]
+                )
+            except RuntimeError as exc:
+                output_matches = False
+                logger.warning("Could not identify the current audio output: %s", exc)
+            if output_matches:
+                routed = self.volume.handle_key(
+                    direction,
+                    system_is_max=system_is_max,
+                    system_is_adjustable=False,
+                )
         logger.info(
             "Volume routing decision: direction=%s system_volume_adjustable=%s "
-            "system_volume_is_max=%s routed=%s",
-            direction, system_is_adjustable, system_is_max, routed,
+            "system_volume_is_max=%s tv_output_matched=%s routed=%s",
+            direction,
+            system_is_adjustable,
+            system_is_max,
+            output_matches if not system_is_adjustable else False,
+            routed,
         )
         return routed
 
@@ -1856,10 +1937,42 @@ def check_volume_keys():
         backend.unregister_volume_keys()
 
 
+def register_direct_hid_input(
+    backend, ctrl, stop, retry_delays=HID_START_RETRY_SECONDS
+):
+    attempts = len(retry_delays) + 1
+    for attempt in range(attempts):
+        if attempt and stop.wait(retry_delays[attempt - 1]):
+            return
+        try:
+            backend.register_volume_keys(
+                ctrl.handle_volume_key if ctrl.cfg["enable_volume_control"] else None,
+                wheel_handler=lambda: ctrl.handle_input({"kind": "mouse_wheel"}),
+            )
+            if attempt:
+                logger.info("Direct HID input recovered on attempt %d", attempt + 1)
+            return
+        except RuntimeError as exc:
+            backend.unregister_volume_keys()
+            if attempt + 1 < attempts:
+                logger.warning(
+                    "Direct HID input unavailable: %s Retrying in %.0f seconds.",
+                    exc, retry_delays[attempt],
+                )
+            else:
+                logger.warning(
+                    "Direct HID input disabled after %d attempts: %s", attempts, exc
+                )
+    if ctrl.volume:
+        ctrl.volume.stop()
+        ctrl.volume = None
+
+
 def run_daemon(cfg):
     backend = MacOSBackend()
     ctrl = None
     lock = None
+    hid_thread = None
     stop = threading.Event()
     def stop_handler(_sig,_frame): stop.set()
     signal.signal(signal.SIGTERM, stop_handler)
@@ -1867,19 +1980,24 @@ def run_daemon(cfg):
     try:
         lock = acquire_lock()
         backend.register_hotkey(str(cfg["hotkey"]))
-        ctrl = Controller(cfg, backend)
-        ctrl.start_authorization_monitor()
         try:
-            backend.register_volume_keys(
-                ctrl.handle_volume_key if cfg["enable_volume_control"] else None,
-                wheel_handler=lambda: ctrl.handle_input({"kind": "mouse_wheel"}),
+            output = backend.default_audio_output_info()
+            logger.info(
+                "Default audio output: name=%r manufacturer=%r uid=%r transport=%r",
+                output["name"], output["manufacturer"], output["uid"],
+                output["transport"],
             )
         except RuntimeError as exc:
-            logger.warning("Direct HID input disabled for this run: %s", exc)
-            backend.unregister_volume_keys()
-            if ctrl.volume:
-                ctrl.volume.stop()
-                ctrl.volume = None
+            logger.warning("Could not identify the default audio output: %s", exc)
+        ctrl = Controller(cfg, backend)
+        ctrl.start_authorization_monitor()
+        hid_thread = threading.Thread(
+            target=register_direct_hid_input,
+            args=(backend, ctrl, stop),
+            daemon=True,
+            name="QN990F-HIDStartup",
+        )
+        hid_thread.start()
         threading.Thread(target=ctrl.monitor, daemon=True, name="QN990F-IdleMonitor").start()
         write_status(
             running=True, state="awake", hotkey=cfg["hotkey"],
@@ -1895,6 +2013,9 @@ def run_daemon(cfg):
         write_status(running=False,state="error",error=str(exc))
         return 1
     finally:
+        stop.set()
+        if hid_thread:
+            hid_thread.join(timeout=3.0)
         backend.unregister_volume_keys()
         if ctrl: ctrl.stop()
         backend.unregister_hotkey()
@@ -1915,8 +2036,20 @@ def main():
     g.add_argument("--wake",action="store_true")
     g.add_argument("--check-hotkey",action="store_true")
     g.add_argument("--check-volume-keys",action="store_true")
+    g.add_argument("--audio-output",action="store_true")
     g.add_argument("--idle",action="store_true")
     a = ap.parse_args()
+    if a.audio_output:
+        try:
+            backend = MacOSBackend()
+            output = backend.default_audio_output_info()
+            adjustable, _is_max = backend.system_volume_state()
+            output["adjustable"] = adjustable
+            print(json.dumps(output))
+            return 0
+        except Exception as exc:
+            print(f"Could not identify the default audio output: {exc}", file=sys.stderr)
+            return 2
     try:
         cfg = load_config()
     except Exception as exc:
