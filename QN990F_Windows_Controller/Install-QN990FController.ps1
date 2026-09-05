@@ -17,6 +17,7 @@ $TokenPath = Join-Path $AppDir "samsung-token.txt"
 $InstallStatePath = Join-Path $AppDir "install-complete"
 $PidPath = Join-Path $AppDir "controller.pid"
 $StatusPath = Join-Path $AppDir "status.json"
+$TrayPidPath = Join-Path $AppDir "status-tray.pid"
 $StartupDir = [Environment]::GetFolderPath("Startup")
 $StartupShortcut = Join-Path $StartupDir "Samsung TV Picture Controller.lnk"
 $LegacyStartupShortcut = Join-Path $StartupDir "QN990F Picture Controller.lnk"
@@ -84,6 +85,27 @@ function Stop-ExistingController {
         Start-Sleep -Milliseconds 300
     }
     Remove-Item $PidPath -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-ExistingStatusTray {
+    if (-not (Test-Path $TrayPidPath)) { return }
+    try {
+        $TrayPid = [int](Get-Content $TrayPidPath -ErrorAction Stop)
+        $TrayProcess = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $TrayPid" -ErrorAction SilentlyContinue
+        $ExpectedScript = Join-Path $AppDir "StatusTray.ps1"
+        if ($TrayProcess -and $TrayProcess.CommandLine -and
+            ([string]$TrayProcess.CommandLine).IndexOf(
+                $ExpectedScript,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -ge 0) {
+            Stop-Process -Id $TrayPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 200
+        } elseif ($TrayProcess) {
+            Write-Warning "Ignoring stale status-tray PID $TrayPid because it belongs to another process."
+        }
+    } catch {}
+    Remove-Item $TrayPidPath -Force -ErrorAction SilentlyContinue
 }
 
 function Test-PythonInvocation {
@@ -189,6 +211,8 @@ Write-Host "Samsung TV Picture Controller installer for Windows" -ForegroundColo
 foreach ($RequiredFile in @(
     "QN990FController.py",
     "Configure-QN990FController.ps1",
+    "Reauthorize-SmartThings.ps1",
+    "StatusTray.ps1",
     "Uninstall-QN990FController.ps1",
     "README.txt"
 )) {
@@ -614,6 +638,7 @@ $InstalledFileNames = @(
     "QN990FController.py",
     "Configure-QN990FController.ps1",
     "Reauthorize-SmartThings.ps1",
+    "StatusTray.ps1",
     "Uninstall-QN990FController.ps1",
     "README.txt"
 )
@@ -645,6 +670,7 @@ try {
     }
 
     Stop-ExistingController
+    Stop-ExistingStatusTray
 
     try {
         if (-not $IsUpgrade) {
@@ -765,6 +791,7 @@ try {
         Copy-Item $SourceControllerPath $ControllerPath -Force
         Copy-Item (Join-Path $PSScriptRoot "Configure-QN990FController.ps1") (Join-Path $AppDir "Configure-QN990FController.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "Reauthorize-SmartThings.ps1") (Join-Path $AppDir "Reauthorize-SmartThings.ps1") -Force
+        Copy-Item (Join-Path $PSScriptRoot "StatusTray.ps1") (Join-Path $AppDir "StatusTray.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "Uninstall-QN990FController.ps1") (Join-Path $AppDir "Uninstall-QN990FController.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "README.txt") (Join-Path $AppDir "README.txt") -Force
 
@@ -807,13 +834,30 @@ try {
             if (Test-Path $StatusPath) {
                 try {
                     $Status = Get-Content $StatusPath -Raw | ConvertFrom-Json
-                    $Started = [bool]$Status.running
+                    $Started = [bool]$Status.running -and
+                        ([string]$Status.state -ne "starting")
                 } catch {}
                 if ($Started) { break }
             }
         }
         if (-not $Started) {
             throw "The background process did not report a running state. Check $AppDir\controller.log."
+        }
+        $TrayStarted = $false
+        for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
+            Start-Sleep -Milliseconds 100
+            if (Test-Path $TrayPidPath) {
+                try {
+                    $TrayPid = [int](Get-Content $TrayPidPath -ErrorAction Stop)
+                    $TrayStarted = $null -ne (
+                        Get-Process -Id $TrayPid -ErrorAction SilentlyContinue
+                    )
+                } catch {}
+                if ($TrayStarted) { break }
+            }
+        }
+        if (-not $TrayStarted) {
+            throw "The notification-area status process did not start."
         }
         "complete" | Set-Content -Path $InstallStatePath -Encoding ASCII
         Remove-Item $LegacySmartThingsCliPath -Force -ErrorAction SilentlyContinue
@@ -831,6 +875,7 @@ try {
                 }
             } catch {}
         }
+        Stop-ExistingStatusTray
         Restore-PreviousInstallation
         throw $InstallError
     }
@@ -853,6 +898,7 @@ if ([bool]($Config["enable_idle_off"])) {
 }
 Write-Host "  Wake:             key, mouse button, or wheel"
 Write-Host "  Pointer movement: ignored by default"
+Write-Host "  Status:           notification-area icon"
 if ($EnableVolumeControl) {
     Write-Host "  Volume control:   enabled; TV above 10 first"
 } else {

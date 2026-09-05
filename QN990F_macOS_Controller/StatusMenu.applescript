@@ -26,7 +26,7 @@ on run
     statusMenu's addItem:(my actionItem("Restart Controller", "restartController:"))
     statusMenu's addItem:(my actionItem("Open Controller Log", "openLog:"))
     statusMenu's addItem:(current application's NSMenuItem's separatorItem())
-    statusMenu's addItem:(my actionItem("Quit Status Menu", "quitStatusMenu:"))
+    statusMenu's addItem:(my actionItem("Quit Controller", "quitController:"))
     statusItem's setMenu:statusMenu
     my refreshStatus()
 end run
@@ -85,6 +85,10 @@ on openLog_(sender)
     do shell script "/usr/bin/open " & quoted form of (appDir & "controller.log")
 end openLog_
 
-on quitStatusMenu_(sender)
+on quitController_(sender)
+    set userID to do shell script "/usr/bin/id -u"
+    try
+        do shell script "/bin/launchctl bootout gui/" & userID & "/local.qn990f.picture-controller"
+    end try
     current application's NSApp's terminate:me
-end quitStatusMenu_
+end quitController_

@@ -21,6 +21,9 @@ Makes a compatible Samsung TV behave more like a PC monitor on Windows:
    Windows until it reaches maximum, then controls the TV. In SmartThings mode,
    Volume Down lowers TV volume to 10 before continuing with Windows volume.
 
+6) Provides a notification-area status icon with controller status, configuration,
+   SmartThings reauthorization, restart, log, and quit actions.
+
 This controller was developed and validated with a Samsung QN990F. Other
 Samsung TVs may work when they expose the encrypted Tizen WebSocket remote on
 TCP port 8002 and their firmware accepts KEY_PICTURE_OFF plus the configured
@@ -90,6 +93,8 @@ For a new installation, the installer will:
   to confirm what you observed.
 - Start the controller invisibly with pythonw.exe.
 - Add it to the current user's Startup folder.
+- Start a separate notification-area status process. It remains available if the
+  controller stops and does not send TV commands itself.
 
 
 UPGRADE OR REPAIR
@@ -148,6 +153,15 @@ Volume keys:
 Direct LAN can send a TV volume key but cannot read the current TV volume, so
 the TV-first Volume Down rule is intentionally limited to SmartThings mode.
 
+Notification-area icon:
+    Right-click the Samsung TV Picture Controller icon to see controller and
+    volume-integration status, configure or restart the controller, reauthorize
+    SmartThings, or open the log. The icon changes to the Windows error symbol and
+    shows one notification when the controller stops, reports an error, or requires
+    SmartThings authorization. Double-clicking the icon opens the controller log.
+    Quit Controller stops both the controller and notification icon; the Startup
+    shortcut remains installed for the next sign-in.
+
 
 CONFIGURATION
 -------------
@@ -197,6 +211,14 @@ for in-place upgrades. It does not restrict which compatible TV can be used.
 
 %LOCALAPPDATA%\QN990FController\status.json
     Current/last daemon status.
+
+%LOCALAPPDATA%\QN990FController\StatusTray.ps1
+    Notification-area status and recovery controls. It reads status/configuration
+    files and does not send TV commands.
+
+%LOCALAPPDATA%\QN990FController\status-tray.pid
+    Runtime PID used only to avoid duplicate status icons and to stop the icon safely
+    during upgrade or uninstall.
 
 %LOCALAPPDATA%\QN990FController\Reauthorize-SmartThings.ps1
     Stops the controller, renews SmartThings OAuth interactively, and restarts it.

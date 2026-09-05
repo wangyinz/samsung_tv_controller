@@ -287,6 +287,8 @@ The TV menu-bar item provides the common recovery actions:
 - TV: controller is running and no volume repair is required
 - TV!: Input Monitoring, output binding, or volume status needs attention
 - TV×: controller is stopped, in error, or needs SmartThings authorization
+- Quit Controller stops both the controller and menu for the current login session;
+  login startup remains installed for the next sign-in
 
 Use Repair Input Monitoring after privacy authorization is lost. Use Bind Current TV
 Audio Output only after selecting and confirming the intended TV in macOS Sound settings;

@@ -2,6 +2,8 @@ $ErrorActionPreference = "SilentlyContinue"
 
 $AppDir = Join-Path $env:LOCALAPPDATA "QN990FController"
 $PidPath = Join-Path $AppDir "controller.pid"
+$TrayPidPath = Join-Path $AppDir "status-tray.pid"
+$TrayScriptPath = Join-Path $AppDir "StatusTray.ps1"
 $StartupDir = [Environment]::GetFolderPath("Startup")
 $ProgramsDir = [Environment]::GetFolderPath("Programs")
 $StartupShortcuts = @(
@@ -14,6 +16,21 @@ $StartMenuDirs = @(
 )
 
 Write-Host "Uninstalling Samsung TV Picture Controller..."
+
+if (Test-Path $TrayPidPath) {
+    try {
+        $TrayPid = [int](Get-Content $TrayPidPath)
+        $TrayProcess = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $TrayPid" -ErrorAction SilentlyContinue
+        if ($TrayProcess -and $TrayProcess.CommandLine -and
+            ([string]$TrayProcess.CommandLine).IndexOf(
+                $TrayScriptPath,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -ge 0) {
+            Stop-Process -Id $TrayPid -Force
+        }
+    } catch {}
+}
 
 if (Test-Path $PidPath) {
     try {

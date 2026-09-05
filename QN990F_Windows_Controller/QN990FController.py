@@ -52,6 +52,7 @@ TOKEN_FILE = APP_DIR / "samsung-token.txt"
 LOG_FILE = APP_DIR / "controller.log"
 PID_FILE = APP_DIR / "controller.pid"
 STATUS_FILE = APP_DIR / "status.json"
+STATUS_TRAY_SCRIPT = APP_DIR / "StatusTray.ps1"
 SMARTTHINGS_CREDENTIALS_FILE = (
     Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
     / "@smartthings" / "cli" / "Data" / "credentials.json"
@@ -876,6 +877,28 @@ def write_status(**kwargs) -> None:
         STATUS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+def start_status_tray() -> None:
+    if not STATUS_TRAY_SCRIPT.is_file():
+        logger.warning("Status tray helper is missing: %s", STATUS_TRAY_SCRIPT)
+        return
+    try:
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Sta",
+                "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden",
+                "-File", str(STATUS_TRAY_SCRIPT),
+            ],
+            cwd=str(APP_DIR),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            close_fds=True,
+        )
+    except Exception as exc:
+        logger.warning("Could not start the status tray: %r", exc)
 
 
 def show_smartthings_auth_prompt() -> None:
@@ -2321,6 +2344,8 @@ def run_daemon(config: dict) -> int:
 
         PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         atexit.register(remove_pid_file)
+        write_status(running=True, state="starting", version="3.3")
+        start_status_tray()
 
         controller = Controller(config)
         controller.start_authorization_monitor()
@@ -2338,7 +2363,7 @@ def run_daemon(config: dict) -> int:
         monitor.start()
 
         logger.info(
-            "Controller v3.2 started. connection=%s TV=%s:%s hotkey=%s idle=%s min auto=%s "
+            "Controller v3.3 started. connection=%s TV=%s:%s hotkey=%s idle=%s min auto=%s "
             "mouse_move_wake=%s mouse_threshold=%s",
             config["control_method"],
             config["tv_ip"],
@@ -2352,7 +2377,7 @@ def run_daemon(config: dict) -> int:
         write_status(
             running=True,
             state="awake",
-            version="3.2",
+            version="3.3",
             hotkey=config["hotkey"],
         )
 
@@ -2384,7 +2409,7 @@ def run_daemon(config: dict) -> int:
         write_status(
             running=False,
             state="error",
-            version="3.2",
+            version="3.3",
             error=str(exc),
         )
         return 1
@@ -2398,7 +2423,7 @@ def run_daemon(config: dict) -> int:
         if mutex:
             kernel32.CloseHandle(mutex)
         remove_pid_file()
-        write_status(running=False, state="stopped", version="3.2")
+        write_status(running=False, state="stopped", version="3.3")
 
 
 # ---------------- CLI ----------------

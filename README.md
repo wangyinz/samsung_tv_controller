@@ -33,8 +33,8 @@ monitor.
   fixed-volume physical Core Audio device. The controller normalizes the endpoint
   suffix that macOS may add or remove during an OS update; different physical HDMI
   devices, Mac speakers, headphones, and adjustable outputs remain under macOS control.
-- A macOS menu-bar status item with permission repair, TV-output rebinding,
-  SmartThings reauthorization, restart, and log actions.
+- A macOS menu-bar item and Windows notification-area icon with live status and
+  platform-appropriate repair, reauthorization, restart, and log actions.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -77,6 +77,7 @@ settings. Reports for additional models are welcome.
 | Per-device input exclusion | No | Yes, by Raw Input device-path substring |
 | Media/presentation protection | macOS display power assertions | Windows `ES_DISPLAY_REQUIRED` |
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
+| Status UI | Menu-bar item (`TV`, `TV!`, `TV×`) | Notification-area icon with error notifications |
 | Elevated privileges | Not required | Not required for the controller; the installer may use `winget` to install a missing user-scoped Python runtime |
 
 The macOS controller uses IOHID matching only for the standard scroll-wheel,
@@ -250,6 +251,11 @@ Reconfiguration tools are installed with each platform version:
 On macOS, use the `TV` menu-bar item for current controller/volume status and
 the common recovery actions. `TV!` means volume integration needs attention;
 `TV×` means the controller is stopped, in error, or requires SmartThings sign-in.
+On Windows, right-click the notification-area icon for controller and volume
+status, configuration, SmartThings reauthorization, restart, and log actions.
+The status process is separate, so it remains available when the controller stops.
+On either platform, **Quit Controller** stops both the background controller and
+its status UI while leaving login startup installed for the next sign-in.
 
 ## Security and privacy
 
@@ -271,6 +277,8 @@ the common recovery actions. `TV!` means volume integration needs attention;
 - macOS writes a small local `health.json` file for the menu-bar status item. It
   contains state labels and the current audio-output name/normalized identity when
   rebinding is required; it contains no typed keys or SmartThings token.
+- The Windows notification-area process reads only the existing local
+  `status.json` and `config.json`; it does not send TV commands.
 - The project adds no application telemetry. It writes local status and
   diagnostic files only. Windows logs may include Raw Input device paths; macOS
   logs input categories but not typed text. Windows wake records may also
