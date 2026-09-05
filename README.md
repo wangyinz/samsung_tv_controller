@@ -30,8 +30,11 @@ monitor.
 - Isolated Python environment installed without modifying system Python packages.
 - Optional keyboard volume integration. Windows can extend its system-volume range
   with TV volume. On macOS, TV volume routing is bound during installation to one
-  exact fixed-volume Core Audio endpoint; all other HDMI devices, Mac speakers,
-  headphones, and adjustable outputs remain entirely under macOS control.
+  fixed-volume physical Core Audio device. The controller normalizes the endpoint
+  suffix that macOS may add or remove during an OS update; different physical HDMI
+  devices, Mac speakers, headphones, and adjustable outputs remain under macOS control.
+- A macOS menu-bar status item with permission repair, TV-output rebinding,
+  SmartThings reauthorization, restart, and log actions.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -167,6 +170,9 @@ and `sudo` are not required. Add the installed controller Python runtime to
 **System Settings → Privacy & Security → Input Monitoring** if macOS denies
 direct HID access. Without that access, Picture Off and keyboard/button wake
 continue, but wheel wake and volume-key routing are disabled for that run.
+The menu-bar item shows `TV!` and offers **Repair Input Monitoring** when this
+happens. The installation is under the current user's
+`~/Library/Application Support`, not the system-wide `/Library/Application Support`.
 
 See the [macOS guide](QN990F_macOS_Controller/README.txt) for detailed setup,
 configuration, file locations, and manual commands.
@@ -212,9 +218,11 @@ left blank.
   volume-up. In SmartThings mode, `Volume Down` lowers TV volume to the configured
   floor before resuming normal system-volume reduction.
 - On macOS, the TV receives volume keys only when the current output has no
-  adjustable system volume and its Core Audio UID exactly matches the TV output
-  confirmed during installation. Other HDMI devices, Mac speakers, and headphones
-  never alter TV volume. The bound TV output uses its full range from 0 to 100.
+  adjustable system volume and its normalized physical Core Audio identity matches
+  the TV output confirmed during installation. Known per-endpoint UID suffix changes
+  are tolerated across macOS updates, while another physical HDMI sink is rejected.
+  Other HDMI devices, Mac speakers, and headphones never alter TV volume. The bound
+  TV output uses its full range from 0 to 100.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
 - Cloud volume state is refreshed no more than once every 30 seconds.
@@ -239,6 +247,10 @@ Reconfiguration tools are installed with each platform version:
 - macOS: `~/Library/Application Support/QN990FController/Configure.command`
 - Windows: the controller's **Configure** shortcut in the Start menu
 
+On macOS, use the `TV` menu-bar item for current controller/volume status and
+the common recovery actions. `TV!` means volume integration needs attention;
+`TV×` means the controller is stopped, in error, or requires SmartThings sign-in.
+
 ## Security and privacy
 
 - Installation and background startup are per-user; the controller does not
@@ -256,6 +268,9 @@ Reconfiguration tools are installed with each platform version:
   activity and shows one authorization alert. Choosing **Reauthorize** opens a dedicated helper
   that stops the controller, completes browser sign-in, and restarts it without
   sending a TV command.
+- macOS writes a small local `health.json` file for the menu-bar status item. It
+  contains state labels and the current audio-output name/normalized identity when
+  rebinding is required; it contains no typed keys or SmartThings token.
 - The project adds no application telemetry. It writes local status and
   diagnostic files only. Windows logs may include Raw Input device paths; macOS
   logs input categories but not typed text. Windows wake records may also
@@ -335,6 +350,18 @@ the pinned official SmartThings CLI npm package with lifecycle scripts disabled.
 - Review `controller.log` and `status.json` in the platform application-data
   directory shown in its guide.
 - Run the configuration tool to validate a replacement hotkey.
+
+### Picture Off works but macOS volume keys do not
+
+- Open the `TV` menu-bar item and read the **Volume** status.
+- If it shows `TV!`, choose **Repair Input Monitoring** or
+  **Bind Current TV Audio Output** as directed.
+- Input Monitoring must contain the exact installed runtime at
+  `~/Library/Application Support/QN990FController/venv/bin/python`.
+- Privacy authorization can be removed during a macOS update. The controller
+  reports this explicitly and continues Picture Off without volume interception.
+- A changed endpoint suffix alone does not require rebinding. Select and confirm
+  the output again only when macOS reports a different physical device identity.
 
 ### The picture wakes unexpectedly
 

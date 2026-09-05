@@ -140,6 +140,49 @@ class LoggingConfigurationTests(unittest.TestCase):
         self.assertEqual(controller.LOG_BACKUP_COUNT, 3)
 
 
+class AudioIdentityTests(unittest.TestCase):
+    def test_endpoint_suffix_is_removed_from_physical_identity(self):
+        before_update = "4C2D2579-0000-0000-0123-0103808E5078_00000030"
+        after_update = "4C2D2579-0000-0000-0123-0103808E5078"
+
+        self.assertTrue(controller.audio_output_matches(before_update, after_update))
+
+    def test_different_physical_devices_do_not_match(self):
+        self.assertFalse(
+            controller.audio_output_matches(
+                "4C2D2579-0000-0000-0123-0103808E5078_00000030",
+                "4C2D2579-0000-0000-0123-0103808E5079_00000030",
+            )
+        )
+
+    def test_empty_identity_never_matches(self):
+        self.assertFalse(controller.audio_output_matches("", ""))
+        self.assertFalse(controller.audio_output_matches("bound", ""))
+
+    def test_load_config_migrates_a_legacy_endpoint_uid_in_memory(self):
+        config_path = Path(TEST_HOME.name) / "legacy-audio-config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "control_method": "lan",
+                    "tv_ip": "192.0.2.10",
+                    "tv_audio_output_uid": (
+                        "4C2D2579-0000-0000-0123-0103808E5078_00000030"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(controller, "CONFIG_FILE", config_path):
+            loaded = controller.load_config()
+
+        self.assertEqual(
+            loaded["tv_audio_output_uid"],
+            "4c2d2579-0000-0000-0123-0103808e5078",
+        )
+
+
 class InputSourceTests(unittest.TestCase):
     def test_windowserver_hardware_activity_is_recognized(self):
         output = (
@@ -370,6 +413,7 @@ class MacOSBackendTests(unittest.TestCase):
                 "name": "QN990F",
                 "manufacturer": "Samsung",
                 "uid": "coreaudio-tv-uid",
+                "physical_uid": "coreaudio-tv-uid",
                 "transport": "hdmi",
             },
         )
@@ -397,6 +441,7 @@ class DirectHIDStartupTests(unittest.TestCase):
             cfg={"enable_volume_control": True},
             handle_volume_key=mock.Mock(),
             handle_input=mock.Mock(),
+            set_hid_input_state=mock.Mock(),
             volume=volume,
         )
         return ctrl, volume
@@ -411,6 +456,7 @@ class DirectHIDStartupTests(unittest.TestCase):
 
         self.assertEqual(backend.register_calls, 3)
         self.assertEqual(backend.unregister_calls, 2)
+        ctrl.set_hid_input_state.assert_called_once_with(True)
         self.assertIs(ctrl.volume, volume)
         volume.stop.assert_not_called()
 
@@ -424,6 +470,25 @@ class DirectHIDStartupTests(unittest.TestCase):
 
         self.assertEqual(backend.register_calls, 3)
         self.assertEqual(backend.unregister_calls, 3)
+        ctrl.set_hid_input_state.assert_called_once_with(
+            False, "not ready", notify=True
+        )
+        volume.stop.assert_called_once_with()
+        self.assertIsNone(ctrl.volume)
+
+    def test_denied_input_monitoring_prompts_without_waiting_for_retries(self):
+        backend = self.Backend(failures=3)
+        backend.input_monitoring_access = mock.Mock(return_value="denied")
+        ctrl, volume = self.make_controller()
+
+        controller.register_direct_hid_input(
+            backend, ctrl, threading.Event(), retry_delays=(5.0, 15.0, 30.0)
+        )
+
+        self.assertEqual(backend.register_calls, 1)
+        ctrl.set_hid_input_state.assert_called_once_with(
+            False, "not ready", notify=True
+        )
         volume.stop.assert_called_once_with()
         self.assertIsNone(ctrl.volume)
 
@@ -1060,12 +1125,81 @@ class ControllerInputTests(unittest.TestCase):
         instance.cfg["tv_audio_output_uid"] = "tv-output"
         backend.system_volume_state = mock.Mock(return_value=(False, True))
         backend.default_audio_output_info = mock.Mock(
-            return_value={"uid": "other-output"}
+            return_value={
+                "name": "Other HDMI",
+                "uid": "other-output",
+                "physical_uid": "other-output",
+            }
         )
 
-        self.assertFalse(instance.handle_volume_key("down"))
+        with mock.patch.object(controller, "show_audio_binding_prompt"):
+            self.assertFalse(instance.handle_volume_key("down"))
 
         instance.volume.handle_key.assert_not_called()
+
+    def test_volume_health_reports_a_bound_physical_output_as_ready(self):
+        instance, backend = self.make_controller()
+        instance.cfg["enable_volume_control"] = True
+        instance.cfg["tv_audio_output_uid"] = "physical-tv"
+        backend.system_volume_state = mock.Mock(return_value=(False, True))
+        backend.default_audio_output_info = mock.Mock(
+            return_value={
+                "name": "Samsung TV",
+                "uid": "physical-tv_00000030",
+                "physical_uid": "physical-tv",
+            }
+        )
+
+        with mock.patch.object(controller, "write_volume_health") as write_health:
+            instance.set_hid_input_state(True)
+
+        self.assertEqual(write_health.call_args.args[:2], (
+            "ready", "TV volume is active for Samsung TV."
+        ))
+
+    def test_input_permission_failure_is_visible_when_volume_is_disabled(self):
+        instance, _backend = self.make_controller()
+
+        with mock.patch.object(controller, "write_volume_health") as write_health:
+            instance.set_hid_input_state(False, "permission denied")
+
+        self.assertEqual(
+            write_health.call_args.args[:2],
+            ("input_permission_required", "permission denied"),
+        )
+
+    def test_volume_health_reports_binding_required_for_another_fixed_output(self):
+        instance, backend = self.make_controller()
+        instance.cfg["enable_volume_control"] = True
+        instance.cfg["tv_audio_output_uid"] = "bound-tv"
+        backend.system_volume_state = mock.Mock(return_value=(False, True))
+        backend.default_audio_output_info = mock.Mock(
+            return_value={
+                "name": "Other HDMI",
+                "uid": "other-output",
+                "physical_uid": "other-output",
+            }
+        )
+
+        with mock.patch.object(controller, "write_volume_health") as write_health:
+            instance.set_hid_input_state(True)
+
+        self.assertEqual(write_health.call_args.args[0], "binding_required")
+        self.assertEqual(
+            write_health.call_args.kwargs["current_audio_physical_uid"],
+            "other-output",
+        )
+
+    def test_binding_alert_is_shown_once_per_unmatched_output(self):
+        instance, _backend = self.make_controller()
+        output = {"physical_uid": "other-output"}
+
+        with mock.patch.object(controller.threading, "Thread") as thread:
+            instance._report_binding_required(output)
+            instance._report_binding_required(output)
+
+        thread.assert_called_once()
+        self.assertIs(thread.call_args.kwargs["target"], controller.show_audio_binding_prompt)
 
     def test_authorization_monitor_reports_a_latched_background_failure(self):
         instance, _backend = self.make_controller("smartthings")

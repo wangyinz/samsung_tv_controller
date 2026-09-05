@@ -35,6 +35,7 @@ CONFIG_FILE = APP_DIR / "config.json"
 TOKEN_FILE = APP_DIR / "samsung-token.txt"
 LOG_FILE = APP_DIR / "controller.log"
 STATUS_FILE = APP_DIR / "status.json"
+HEALTH_FILE = APP_DIR / "health.json"
 LOCK_FILE = APP_DIR / "controller.lock"
 SMARTTHINGS_LOCK_FILE = APP_DIR / "smartthings.lock"
 SMARTTHINGS_CREDENTIALS_FILE = (
@@ -49,6 +50,7 @@ SMARTTHINGS_REFRESH_WINDOW = timedelta(hours=6)
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 3
 HID_START_RETRY_SECONDS = (5.0, 15.0, 30.0)
+_health_lock = threading.Lock()
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
@@ -100,6 +102,16 @@ def fourcc(text: str) -> int:
     for ch in text.encode("ascii"):
         v = (v << 8) | ch
     return v
+
+
+def physical_audio_output_uid(uid):
+    return re.sub(r"_[0-9A-Fa-f]{8}$", "", str(uid).strip()).casefold()
+
+
+def audio_output_matches(bound_uid, current_uid):
+    bound = physical_audio_output_uid(bound_uid)
+    current = physical_audio_output_uid(current_uid)
+    return bool(bound) and bound == current
 
 
 class EventTypeSpec(Structure):
@@ -357,6 +369,14 @@ class MacOSBackend:
             self.K_CG_ANY_INPUT_EVENT_TYPE
         )))
 
+    def input_monitoring_access(self):
+        value = int(self.iokit.IOHIDCheckAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT))
+        return {0: "granted", 1: "denied", 2: "unknown"}.get(value, f"unknown:{value}")
+
+    def request_input_monitoring_access(self):
+        self.iokit.IOHIDRequestAccess(self.K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
+        return self.input_monitoring_access()
+
     def _audio_property(self, object_id, selector, scope, value, element=0):
         address = AudioObjectPropertyAddress(
             selector, scope, element
@@ -410,6 +430,9 @@ class MacOSBackend:
             self.K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
             transport,
         )
+        uid = self._audio_string_property(
+            device_id.value, self.K_AUDIO_DEVICE_PROPERTY_DEVICE_UID
+        )
         return {
             "name": self._audio_string_property(
                 device_id.value, self.K_AUDIO_OBJECT_PROPERTY_NAME
@@ -417,9 +440,8 @@ class MacOSBackend:
             "manufacturer": self._audio_string_property(
                 device_id.value, self.K_AUDIO_OBJECT_PROPERTY_MANUFACTURER
             ),
-            "uid": self._audio_string_property(
-                device_id.value, self.K_AUDIO_DEVICE_PROPERTY_DEVICE_UID
-            ),
+            "uid": uid,
+            "physical_uid": physical_audio_output_uid(uid),
             "transport": transport.value.to_bytes(4, "big").decode(
                 "ascii", errors="replace"
             ),
@@ -830,7 +852,9 @@ def load_config():
     cfg["socket_timeout_seconds"] = max(1.0, float(cfg.get("socket_timeout_seconds",5)))
     cfg["key_press_delay_seconds"] = max(0.0, float(cfg.get("key_press_delay_seconds",0.05)))
     cfg["enable_volume_control"] = bool(cfg.get("enable_volume_control", True))
-    cfg["tv_audio_output_uid"] = str(cfg.get("tv_audio_output_uid", "")).strip()
+    cfg["tv_audio_output_uid"] = physical_audio_output_uid(
+        cfg.get("tv_audio_output_uid", "")
+    )
     cfg["tv_volume_floor"] = min(100, max(0, int(cfg.get("tv_volume_floor", 10))))
     cfg["tv_volume_refresh_seconds"] = max(
         30.0, float(cfg.get("tv_volume_refresh_seconds", 30.0))
@@ -883,29 +907,79 @@ def write_status(**kwargs):
         pass
 
 
-def show_smartthings_auth_prompt():
-    helper = APP_DIR / "Reauthorize.command"
+def write_volume_health(state, message, **details):
+    temporary = HEALTH_FILE.with_name(f"{HEALTH_FILE.name}.{os.getpid()}.tmp")
+    payload = {
+        "pid": os.getpid(),
+        "timestamp": time.time(),
+        "volume_control_state": state,
+        "volume_control_message": message,
+        **details,
+    }
+    with _health_lock:
+        try:
+            temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(temporary, HEALTH_FILE)
+        except OSError:
+            pass
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def show_action_prompt(message, action_label, helper):
     if not helper.is_file():
-        logger.error("SmartThings reauthorization helper is missing: %s", helper)
+        logger.error("Recovery helper is missing: %s", helper)
         return
     script = r'''
 on run argv
-    set reply to display dialog "SmartThings authorization needs renewal. Picture Off commands cannot run until you sign in again." with title "Samsung TV Picture Controller" buttons {"Later", "Reauthorize"} default button "Reauthorize" cancel button "Later" giving up after 60 with icon caution
-    if gave up of reply is false and button returned of reply is "Reauthorize" then
-        do shell script "/usr/bin/open " & quoted form of item 1 of argv
+    set actionLabel to item 2 of argv
+    set reply to display dialog (item 1 of argv) with title "Samsung TV Picture Controller" buttons {"Later", actionLabel} default button actionLabel cancel button "Later" giving up after 60 with icon caution
+    if gave up of reply is false and button returned of reply is actionLabel then
+        do shell script "/usr/bin/open " & quoted form of item 3 of argv
     end if
 end run
 '''
     try:
         subprocess.run(
-            ["/usr/bin/osascript", "-e", script, str(helper)],
+            [
+                "/usr/bin/osascript", "-e", script,
+                message, action_label, str(helper),
+            ],
             capture_output=True,
             text=True,
             timeout=70,
             check=False,
         )
     except Exception as exc:
-        logger.warning("Could not show SmartThings authorization prompt: %r", exc)
+        logger.warning("Could not show recovery prompt: %r", exc)
+
+
+def show_smartthings_auth_prompt():
+    show_action_prompt(
+        "SmartThings authorization needs renewal. Picture Off commands cannot run "
+        "until you sign in again.",
+        "Reauthorize",
+        APP_DIR / "Reauthorize.command",
+    )
+
+
+def show_input_monitoring_prompt():
+    show_action_prompt(
+        "Volume-key monitoring could not start. Restore Input Monitoring access, "
+        "then restart the controller.",
+        "Repair Permission",
+        APP_DIR / "RepairInputMonitoring.command",
+    )
+
+
+def show_audio_binding_prompt():
+    show_action_prompt(
+        "The current fixed-volume audio output does not match the TV saved by the "
+        "controller. Confirm and bind the current TV output before volume keys can "
+        "control it.",
+        "Bind TV Output",
+        APP_DIR / "BindAudioOutput.command",
+    )
 
 
 def display_is_explicitly_required() -> bool:
@@ -1582,6 +1656,12 @@ class Controller:
         self._stop = threading.Event()
         self._auth_notice_sent = False
         self._auth_thread = None
+        self._hid_input_ready = False
+        self._hid_input_error = ""
+        self._hid_notice_sent = False
+        self._binding_notice_uid = ""
+        self._volume_health_signature = None
+        self._volume_health_checked = 0.0
         self.picture_off = False
         self.wake_not_before = 0.0
         self.next_off_attempt = 0.0
@@ -1594,6 +1674,7 @@ class Controller:
         self._assert_cache = False
         self._assert_checked = 0.0
         self.backend.reset_input_baseline()
+        self.update_volume_health(force=True)
 
     def start_authorization_monitor(self):
         if self.cfg["control_method"] != "smartthings":
@@ -1651,26 +1732,106 @@ class Controller:
             return True
         return False
 
+    def set_hid_input_state(self, ready, error="", notify=False):
+        self._hid_input_ready = bool(ready)
+        self._hid_input_error = str(error)
+        if ready:
+            self._hid_notice_sent = False
+        self.update_volume_health(force=True)
+        if notify and not self._hid_notice_sent:
+            self._hid_notice_sent = True
+            threading.Thread(
+                target=show_input_monitoring_prompt,
+                daemon=True,
+                name="QN990F-InputMonitoringPrompt",
+            ).start()
+
+    def _volume_output_state(self):
+        adjustable, is_max = self.backend.system_volume_state()
+        if adjustable:
+            return adjustable, is_max, False, None
+        output = self.backend.default_audio_output_info()
+        return (
+            adjustable,
+            is_max,
+            audio_output_matches(self.cfg["tv_audio_output_uid"], output["uid"]),
+            output,
+        )
+
+    def update_volume_health(self, force=False):
+        details = {}
+        if not self._hid_input_ready:
+            state = "input_permission_required" if self._hid_input_error else "starting"
+            message = self._hid_input_error or "Starting volume-key monitoring."
+        elif not self.cfg["enable_volume_control"]:
+            state = "disabled"
+            message = "Integrated TV volume control is disabled; wheel wake is active."
+        else:
+            try:
+                adjustable, _is_max, matches, output = self._volume_output_state()
+            except RuntimeError as exc:
+                state = "error"
+                message = f"Could not identify the current audio output: {exc}"
+            else:
+                if adjustable:
+                    state = "inactive_output"
+                    message = "Current output is adjustable; only macOS volume is active."
+                    self._binding_notice_uid = ""
+                elif matches:
+                    state = "ready"
+                    message = f"TV volume is active for {output['name']}."
+                    self._binding_notice_uid = ""
+                else:
+                    state = "binding_required"
+                    message = (
+                        f"Fixed-volume output {output['name']} is not the bound TV."
+                    )
+                    details = {
+                        "current_audio_output": output["name"],
+                        "current_audio_physical_uid": output["physical_uid"],
+                    }
+        signature = (state, message, tuple(sorted(details.items())))
+        if force or signature != self._volume_health_signature:
+            self._volume_health_signature = signature
+            write_volume_health(state, message, **details)
+        return state
+
+    def _report_binding_required(self, output):
+        current = output["physical_uid"]
+        if current == self._binding_notice_uid:
+            return
+        self._binding_notice_uid = current
+        threading.Thread(
+            target=show_audio_binding_prompt,
+            daemon=True,
+            name="QN990F-AudioBindingPrompt",
+        ).start()
+
     def handle_volume_key(self, direction):
         if self.volume is None:
             return False
-        system_is_adjustable, system_is_max = self.backend.system_volume_state()
+        output = None
+        try:
+            (
+                system_is_adjustable,
+                system_is_max,
+                output_matches,
+                output,
+            ) = self._volume_output_state()
+        except RuntimeError as exc:
+            logger.warning("Could not identify the current audio output: %s", exc)
+            self.update_volume_health(force=True)
+            return False
         routed = False
-        if not system_is_adjustable:
-            try:
-                output = self.backend.default_audio_output_info()
-                output_matches = bool(self.cfg["tv_audio_output_uid"]) and (
-                    output["uid"] == self.cfg["tv_audio_output_uid"]
-                )
-            except RuntimeError as exc:
-                output_matches = False
-                logger.warning("Could not identify the current audio output: %s", exc)
-            if output_matches:
-                routed = self.volume.handle_key(
-                    direction,
-                    system_is_max=system_is_max,
-                    system_is_adjustable=False,
-                )
+        if not system_is_adjustable and output_matches:
+            routed = self.volume.handle_key(
+                direction,
+                system_is_max=system_is_max,
+                system_is_adjustable=False,
+            )
+        elif output is not None:
+            self._report_binding_required(output)
+        self.update_volume_health()
         logger.info(
             "Volume routing decision: direction=%s system_volume_adjustable=%s "
             "system_volume_is_max=%s tv_output_matched=%s routed=%s",
@@ -1875,6 +2036,9 @@ class Controller:
         while not self._stop.is_set():
             try:
                 now = time.monotonic()
+                if now - self._volume_health_checked >= 2.0:
+                    self._volume_health_checked = now
+                    self.update_volume_health()
                 for event in self.backend.poll_input_events():
                     self.handle_input(event)
                 if self.is_off():
@@ -1951,9 +2115,15 @@ def register_direct_hid_input(
             )
             if attempt:
                 logger.info("Direct HID input recovered on attempt %d", attempt + 1)
+            ctrl.set_hid_input_state(True)
             return
         except RuntimeError as exc:
             backend.unregister_volume_keys()
+            access = getattr(backend, "input_monitoring_access", lambda: "unknown")()
+            if access == "denied":
+                logger.warning("Direct HID input permission is denied: %s", exc)
+                ctrl.set_hid_input_state(False, str(exc), notify=True)
+                break
             if attempt + 1 < attempts:
                 logger.warning(
                     "Direct HID input unavailable: %s Retrying in %.0f seconds.",
@@ -1963,6 +2133,7 @@ def register_direct_hid_input(
                 logger.warning(
                     "Direct HID input disabled after %d attempts: %s", attempts, exc
                 )
+                ctrl.set_hid_input_state(False, str(exc), notify=True)
     if ctrl.volume:
         ctrl.volume.stop()
         ctrl.volume = None
@@ -2037,8 +2208,18 @@ def main():
     g.add_argument("--check-hotkey",action="store_true")
     g.add_argument("--check-volume-keys",action="store_true")
     g.add_argument("--audio-output",action="store_true")
+    g.add_argument("--input-access",action="store_true")
+    g.add_argument("--request-input-access",action="store_true")
     g.add_argument("--idle",action="store_true")
     a = ap.parse_args()
+    if a.input_access or a.request_input_access:
+        backend = MacOSBackend()
+        access = (
+            backend.request_input_monitoring_access()
+            if a.request_input_access else backend.input_monitoring_access()
+        )
+        print(access)
+        return 0 if access == "granted" else 1
     if a.audio_output:
         try:
             backend = MacOSBackend()

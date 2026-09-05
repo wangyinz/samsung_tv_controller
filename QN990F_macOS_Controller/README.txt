@@ -21,8 +21,13 @@ Makes a compatible Samsung TV behave more like a conventional computer display o
    explicitly requests that the display remain on.
 
 5. Optionally routes the keyboard volume buttons to TV volume while the current macOS
-   output is the exact fixed-volume Core Audio endpoint bound during installation.
-   Other HDMI devices, Mac speakers, and headphones remain entirely under macOS control.
+   output is the fixed-volume physical Core Audio device bound during installation.
+   A variable endpoint suffix is normalized so an OS update does not break an
+   otherwise unchanged physical-device binding. Other HDMI devices, Mac speakers,
+   and headphones remain entirely under macOS control.
+
+6. Provides a TV menu-bar status item with repair, rebinding, reauthorization,
+   restart, and log actions.
 
 
 Compatibility
@@ -114,6 +119,7 @@ What the Installer Does Automatically
 - Checks the global hotkey and the macOS idle-input API
 - Verifies the selected TV connection
 - Installs a user-level LaunchAgent
+- Installs a user-level menu-bar status app and LaunchAgent
 
 
 Not Required
@@ -137,7 +143,15 @@ when macOS prompts. The controller does not subscribe to ordinary typed-key
 usages. If registration is unavailable while login is still starting, the controller
 retries three times without delaying the global hotkey. If all attempts fail, Picture Off
 and keyboard/button wake continue, but wheel wake and volume routing are disabled for
-that run.
+that run. A definite permission denial shows a recovery alert immediately and changes
+the menu-bar title to TV!.
+
+The required runtime is installed under the current user's Library:
+    ~/Library/Application Support/QN990FController/venv/bin/python
+It is not installed under /Library/Application Support. A macOS update may remove a
+previous Input Monitoring entry. Use Repair Input Monitoring from the TV menu-bar item;
+the helper opens the correct settings pane, displays the exact runtime path, and restarts
+the controller after you confirm the change.
 
 Wake Input and Privacy
 ----------------------
@@ -184,9 +198,11 @@ Volume keys:
     Integrated volume control is optional during installation. Rerun
     INSTALL.command to enable, disable, or bind it to a different TV output. The
     installer requires the configured TV to be selected as the current macOS sound output
-    and stores that endpoint's Core Audio UID. Only that exact fixed-volume output routes
-    Volume Up and Volume Down to the TV across its full 0-100 range. Every other output
-    remains under macOS control and does not modify TV volume.
+    and stores a normalized physical identity derived from its Core Audio UID. macOS has
+    been observed adding or removing an eight-hex-digit endpoint suffix during an OS
+    update; that suffix is intentionally ignored. A different physical UID remains a
+    mismatch. Only the confirmed fixed-volume output routes Volume Up and Volume Down to
+    the TV across its full 0-100 range. Every other output remains under macOS control.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
     Cloud volume state is refreshed no more than once every 30 seconds.
@@ -267,6 +283,16 @@ To renew only the SmartThings sign-in, double-click:
 
 ~/Library/Application Support/QN990FController/Reauthorize.command
 
+The TV menu-bar item provides the common recovery actions:
+- TV: controller is running and no volume repair is required
+- TV!: Input Monitoring, output binding, or volume status needs attention
+- TV×: controller is stopped, in error, or needs SmartThings authorization
+
+Use Repair Input Monitoring after privacy authorization is lost. Use Bind Current TV
+Audio Output only after selecting and confirming the intended TV in macOS Sound settings;
+this explicit confirmation is how the controller relates a Core Audio device to the TV.
+It does not guess from a display name or a SmartThings label.
+
 Hotkey examples:
     Ctrl+Cmd+P
     Ctrl+Cmd+O
@@ -284,8 +310,8 @@ SmartThings profile are legacy internal identifiers retained to avoid breaking
 existing installations. They do not restrict TV model compatibility.
 
 ~/Library/Application Support/QN990FController/config.json
-    Controller configuration, including the exact Core Audio output UID bound for
-    optional TV-volume routing; does not contain a SmartThings access token.
+    Controller configuration, including the normalized physical Core Audio identity
+    bound for optional TV-volume routing; does not contain a SmartThings access token.
 
 ~/Library/Application Support/QN990FController/samsung-token.txt
     TV pairing token used only in LAN mode.
@@ -309,8 +335,18 @@ uninstaller does not modify or sign out any profile.
 ~/Library/Application Support/QN990FController/status.json
     Current or most recent runtime status.
 
+~/Library/Application Support/QN990FController/health.json
+    Current optional-volume health shown by the menu-bar status item. It contains no
+    SmartThings token or typed input.
+
+~/Library/Application Support/QN990FController/Samsung TV Picture Controller Status.app
+    Menu-bar status and recovery controls. It does not send TV commands by itself.
+
 ~/Library/LaunchAgents/local.qn990f.picture-controller.plist
     Login startup item.
+
+~/Library/LaunchAgents/local.samsung-tv.picture-controller.menu.plist
+    Login startup item for the menu-bar status app.
 
 
 Important Limitations

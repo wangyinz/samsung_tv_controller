@@ -8,6 +8,9 @@ CONTROLLER="$APP_DIR/QN990FController.py"
 CONFIG="$APP_DIR/config.json"
 PLIST="$HOME/Library/LaunchAgents/local.qn990f.picture-controller.plist"
 LABEL="local.qn990f.picture-controller"
+MENU_PLIST="$HOME/Library/LaunchAgents/local.samsung-tv.picture-controller.menu.plist"
+MENU_LABEL="local.samsung-tv.picture-controller.menu"
+STATUS_APP="$APP_DIR/Samsung TV Picture Controller Status.app"
 UV_DIR="$APP_DIR/bootstrap"
 UV="$UV_DIR/uv"
 UV_VERSION="0.12.5"
@@ -37,6 +40,7 @@ trap cleanup EXIT
 
 stop_agent() {
   launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)" "$MENU_PLIST" >/dev/null 2>&1 || true
   pkill -f "$CONTROLLER" >/dev/null 2>&1 || true
   sleep 0.2
 }
@@ -202,17 +206,31 @@ HOTKEY="Ctrl+Cmd+P"
 
 mkdir -p "$APP_DIR" "$HOME/Library/LaunchAgents"
 stop_agent
-rm -f "$PLIST"
+rm -f "$PLIST" "$MENU_PLIST"
 rm -f "$APP_DIR/launchd.out.log" "$APP_DIR/launchd.err.log"
 
 step "Copying controller files"
 cp "$SCRIPT_DIR/QN990FController.py" "$CONTROLLER"
 cp "$SCRIPT_DIR/Configure.command" "$APP_DIR/Configure.command"
 cp "$SCRIPT_DIR/Reauthorize.command" "$APP_DIR/Reauthorize.command"
+cp "$SCRIPT_DIR/RepairInputMonitoring.command" "$APP_DIR/RepairInputMonitoring.command"
+cp "$SCRIPT_DIR/BindAudioOutput.command" "$APP_DIR/BindAudioOutput.command"
 cp "$SCRIPT_DIR/Uninstall.command" "$APP_DIR/Uninstall.command"
 cp "$SCRIPT_DIR/README.txt" "$APP_DIR/README.txt"
 chmod 755 "$CONTROLLER" "$APP_DIR/Configure.command" \
-  "$APP_DIR/Reauthorize.command" "$APP_DIR/Uninstall.command"
+  "$APP_DIR/Reauthorize.command" "$APP_DIR/RepairInputMonitoring.command" \
+  "$APP_DIR/BindAudioOutput.command" "$APP_DIR/Uninstall.command"
+
+rm -rf -- "$STATUS_APP"
+/usr/bin/osacompile -s -o "$STATUS_APP" "$SCRIPT_DIR/StatusMenu.applescript"
+STATUS_INFO="$STATUS_APP/Contents/Info.plist"
+/usr/bin/plutil -replace CFBundleIdentifier \
+  -string "com.samsung-tv.picture-controller.status" "$STATUS_INFO" 2>/dev/null || \
+  /usr/bin/plutil -insert CFBundleIdentifier \
+    -string "com.samsung-tv.picture-controller.status" "$STATUS_INFO"
+/usr/bin/plutil -replace LSUIElement -bool true "$STATUS_INFO" 2>/dev/null || \
+  /usr/bin/plutil -insert LSUIElement -bool true "$STATUS_INFO"
+/usr/bin/codesign --force --sign - "$STATUS_APP" >/dev/null
 
 step "Installing an isolated Python runtime"
 mkdir -p "$UV_DIR"
@@ -353,7 +371,7 @@ if [[ "$ENABLE_VOLUME" == "true" ]]; then
     'import json,sys; print(str(json.loads(sys.argv[1])["adjustable"]).lower())' \
     "$AUDIO_OUTPUT_JSON")"
   TV_AUDIO_OUTPUT_UID="$("$PYTHON" -c \
-    'import json,sys; print(json.loads(sys.argv[1])["uid"])' \
+    'import json,sys; print(json.loads(sys.argv[1])["physical_uid"])' \
     "$AUDIO_OUTPUT_JSON")"
   echo "Current output: $AUDIO_OUTPUT_NAME ($AUDIO_OUTPUT_MANUFACTURER)"
   if [[ "$AUDIO_OUTPUT_ADJUSTABLE" == "true" || -z "$TV_AUDIO_OUTPUT_UID" ]]; then
@@ -508,9 +526,35 @@ cat > "$PLIST" <<PLIST
 </plist>
 PLIST
 
+cat > "$MENU_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$MENU_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$STATUS_APP/Contents/MacOS/applet</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+PLIST
+
 plutil -lint "$PLIST" >/dev/null
+plutil -lint "$MENU_PLIST" >/dev/null
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
+launchctl bootstrap "gui/$(id -u)" "$MENU_PLIST"
 launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+launchctl kickstart -k "gui/$(id -u)/$MENU_LABEL" >/dev/null 2>&1 || true
 sleep 1
 
 step "Verifying background startup"
@@ -519,6 +563,11 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
 else
   echo "Warning: LaunchAgent did not appear loaded."
   printf 'Check with: launchctl print "gui/%s/%s"\n' "$(id -u)" "$LABEL"
+fi
+if launchctl print "gui/$(id -u)/$MENU_LABEL" >/dev/null 2>&1; then
+  echo "Menu-bar status app is loaded."
+else
+  echo "Warning: menu-bar status app did not appear loaded."
 fi
 
 echo
@@ -531,7 +580,7 @@ else
 fi
 echo "  Wake:            key, mouse button, or wheel"
 if [[ "$ENABLE_VOLUME" == "true" ]]; then
-  echo "  Volume control:  enabled; TV above 10 first"
+  echo "  Volume control:  bound to $AUDIO_OUTPUT_NAME"
 else
   echo "  Volume control:  disabled"
 fi
