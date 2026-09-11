@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName WindowsFormsIntegration
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
@@ -139,6 +140,7 @@ try {
     $XamlReader = [System.Xml.XmlReader]::Create($XamlPath)
     try { $Flyout = [System.Windows.Markup.XamlReader]::Load($XamlReader) }
     finally { $XamlReader.Dispose() }
+    [System.Windows.Forms.Integration.ElementHost]::EnableModelessKeyboardInterop($Flyout)
     $ControllerItem = $Flyout.FindName("ControllerItem")
     $VolumeItem = $Flyout.FindName("VolumeItem")
     $TVVolumeLabel = $Flyout.FindName("TVVolumeLabel")
@@ -437,7 +439,7 @@ try {
         try {
             Stop-Controller
             $script:Exiting = $true
-            [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
+            [System.Windows.Forms.Application]::ExitThread()
         } catch { Show-TrayError $_.Exception.Message }
     })
     $Notify.Add_MouseClick({
@@ -521,14 +523,14 @@ try {
         $script:LastState = $State
     }
 
-    $Timer = New-Object System.Windows.Threading.DispatcherTimer
-    $Timer.Interval = [TimeSpan]::FromSeconds(1)
+    $Timer = New-Object System.Windows.Forms.Timer
+    $Timer.Interval = 1000
     $Timer.Add_Tick({ Update-TrayStatus })
     Update-TrayStatus
     $Timer.Start()
-    [System.Windows.Threading.Dispatcher]::Run()
+    [System.Windows.Forms.Application]::Run()
 } finally {
-    if ($Timer) { $Timer.Stop() }
+    if ($Timer) { $Timer.Stop(); $Timer.Dispose() }
     if ($Notify) { $Notify.Visible = $false; $Notify.Dispose() }
     $script:Exiting = $true
     if ($Flyout) { $Flyout.Close() }
