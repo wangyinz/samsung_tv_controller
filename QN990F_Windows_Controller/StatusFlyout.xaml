@@ -1,0 +1,180 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Samsung TV Picture Controller"
+        Width="360" SizeToContent="Height" WindowStyle="None" ResizeMode="NoResize"
+        ShowInTaskbar="False" Topmost="True" Background="{DynamicResource SurfaceBrush}"
+        Foreground="{DynamicResource TextBrush}" FontFamily="Segoe UI Variable, Segoe UI" FontSize="14"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
+        KeyboardNavigation.TabNavigation="Cycle">
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="0" GlassFrameThickness="1"
+                      UseAeroCaptionButtons="False"/>
+    </shell:WindowChrome.WindowChrome>
+    <Window.Resources>
+        <SolidColorBrush x:Key="SurfaceBrush" Color="#F3F3F3"/>
+        <SolidColorBrush x:Key="TextBrush" Color="#1B1B1B"/>
+        <SolidColorBrush x:Key="SecondaryBrush" Color="#606060"/>
+        <SolidColorBrush x:Key="BorderBrush" Color="#D5D5D5"/>
+        <SolidColorBrush x:Key="TrackBrush" Color="#8A8A8A"/>
+        <SolidColorBrush x:Key="AccentBrush" Color="#0067C0"/>
+        <SolidColorBrush x:Key="HoverBrush" Color="#10000000"/>
+        <SolidColorBrush x:Key="PressedBrush" Color="#18000000"/>
+        <SolidColorBrush x:Key="ThumbBrush" Color="#FFFFFF"/>
+
+        <Style x:Key="SliderFocus" TargetType="Control">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate>
+                        <Border CornerRadius="6" BorderThickness="2" Margin="-3"
+                                BorderBrush="{DynamicResource AccentBrush}"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="TrackButton" TargetType="RepeatButton">
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Height="4" CornerRadius="2" Background="{TemplateBinding Background}"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="VolumeThumb" TargetType="Thumb">
+            <Setter Property="Width" Value="22"/>
+            <Setter Property="Height" Value="22"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Grid>
+                            <Ellipse Fill="{DynamicResource ThumbBrush}" Stroke="{DynamicResource BorderBrush}"/>
+                            <Ellipse x:Name="Dot" Width="12" Height="12" Fill="{DynamicResource AccentBrush}"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Dot" Property="Width" Value="14"/>
+                                <Setter TargetName="Dot" Property="Height" Value="14"/>
+                            </Trigger>
+                            <Trigger Property="IsDragging" Value="True">
+                                <Setter TargetName="Dot" Property="Width" Value="10"/>
+                                <Setter TargetName="Dot" Property="Height" Value="10"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="Slider">
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="FocusVisualStyle" Value="{StaticResource SliderFocus}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid x:Name="SliderRoot" Background="Transparent">
+                            <Track x:Name="PART_Track" Minimum="{TemplateBinding Minimum}"
+                                   Maximum="{TemplateBinding Maximum}" Value="{TemplateBinding Value}"
+                                   Orientation="Horizontal">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource TrackButton}"
+                                                  Background="{DynamicResource AccentBrush}"
+                                                  Command="{x:Static Slider.DecreaseLarge}"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Style="{StaticResource VolumeThumb}"/>
+                                </Track.Thumb>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource TrackButton}"
+                                                  Background="{DynamicResource TrackBrush}"
+                                                  Command="{x:Static Slider.IncreaseLarge}"/>
+                                </Track.IncreaseRepeatButton>
+                            </Track>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="SliderRoot" Property="Opacity" Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Padding" Value="12,9"/>
+            <Setter Property="Margin" Value="0,1"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBody" CornerRadius="5" Background="Transparent"
+                                BorderThickness="1" BorderBrush="Transparent" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="Center" RecognizesAccessKey="True"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBody" Property="Background" Value="{DynamicResource HoverBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="ButtonBody" Property="Background" Value="{DynamicResource PressedBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="ButtonBody" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="8" Padding="18">
+        <StackPanel>
+            <StackPanel x:Name="StatusPanel" Margin="0,0,0,16">
+                <TextBlock Text="Samsung TV Picture Controller" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                <TextBlock x:Name="ControllerItem" Text="Controller: loading" Foreground="{DynamicResource SecondaryBrush}"
+                           TextWrapping="Wrap" FontSize="12"/>
+                <TextBlock x:Name="VolumeItem" Text="Keyboard volume: loading" Foreground="{DynamicResource SecondaryBrush}"
+                           TextWrapping="Wrap" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <DockPanel Margin="0,0,0,10">
+                <TextBlock x:Name="TVVolumeLabel" DockPanel.Dock="Right" Text="&#x2014;" FontWeight="SemiBold"
+                           HorizontalAlignment="Right" AutomationProperties.LiveSetting="Polite"/>
+                <TextBlock Text="TV volume" FontWeight="SemiBold"/>
+            </DockPanel>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="30"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="&#xE767;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="19"
+                           VerticalAlignment="Center" Focusable="False" AutomationProperties.Name="TV speaker"/>
+                <Slider x:Name="VolumeSlider" Grid.Column="1" Minimum="0" Maximum="100"
+                        SmallChange="1" LargeChange="10" TickFrequency="1" IsSnapToTickEnabled="True"
+                        IsMoveToPointEnabled="True" IsEnabled="False" AutomationProperties.Name="TV volume"/>
+            </Grid>
+            <TextBlock x:Name="VolumeNotice" Foreground="{DynamicResource SecondaryBrush}" FontSize="12"
+                       TextWrapping="Wrap" Margin="0,8,0,0" AutomationProperties.LiveSetting="Polite">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Style.Triggers>
+                            <Trigger Property="Text" Value="">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+            <StackPanel x:Name="ActionsPanel" Margin="-6,14,-6,-6">
+                <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="6,0,6,8"/>
+                <Button x:Name="ConfigureItem" Content="_Configure controller..."/>
+                <Button x:Name="ReauthorizeItem" Content="_Reauthorize SmartThings..."/>
+                <Button x:Name="RestartItem" Content="Re_start controller"/>
+                <Button x:Name="LogItem" Content="Open controller _log"/>
+                <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="6,8"/>
+                <Button x:Name="ExitItem" Content="_Quit controller"/>
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>

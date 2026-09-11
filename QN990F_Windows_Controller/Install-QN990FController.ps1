@@ -213,6 +213,7 @@ foreach ($RequiredFile in @(
     "Configure-QN990FController.ps1",
     "Reauthorize-SmartThings.ps1",
     "StatusTray.ps1",
+    "StatusFlyout.xaml",
     "Uninstall-QN990FController.ps1",
     "README.txt"
 )) {
@@ -639,6 +640,7 @@ $InstalledFileNames = @(
     "Configure-QN990FController.ps1",
     "Reauthorize-SmartThings.ps1",
     "StatusTray.ps1",
+    "StatusFlyout.xaml",
     "Uninstall-QN990FController.ps1",
     "README.txt"
 )
@@ -792,6 +794,7 @@ try {
         Copy-Item (Join-Path $PSScriptRoot "Configure-QN990FController.ps1") (Join-Path $AppDir "Configure-QN990FController.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "Reauthorize-SmartThings.ps1") (Join-Path $AppDir "Reauthorize-SmartThings.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "StatusTray.ps1") (Join-Path $AppDir "StatusTray.ps1") -Force
+        Copy-Item (Join-Path $PSScriptRoot "StatusFlyout.xaml") (Join-Path $AppDir "StatusFlyout.xaml") -Force
         Copy-Item (Join-Path $PSScriptRoot "Uninstall-QN990FController.ps1") (Join-Path $AppDir "Uninstall-QN990FController.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "README.txt") (Join-Path $AppDir "README.txt") -Force
 

@@ -154,17 +154,22 @@ Direct LAN can send a TV volume key but cannot read the current TV volume, so
 the TV-first Volume Down rule is intentionally limited to SmartThings mode.
 
 Notification-area icon:
-    Right-click the Samsung TV Picture Controller icon to see controller and
-    volume-integration status, configure or restart the controller, reauthorize
-    SmartThings, or open the log. A recognizable TV icon has a yellow ! badge when
-    attention is needed and a red x badge when the controller is stopped. It shows
-    one notification on these state changes. Double-clicking the icon opens the log.
+    Left-click the Samsung TV Picture Controller icon for a compact TV-volume
+    flyout only. Right-click for the full panel with controller and keyboard-volume
+    status, configuration, restart, SmartThings reauthorization, and log actions.
+    Both views use a Windows 11-inspired interface with a thin slider, rounded
+    corners on Windows 11, hover states, and the system light/dark or high-contrast
+    theme. This is the controller's own TV-volume UI, not the Windows audio mixer.
+    No additional UI runtime is installed; it uses Windows' built-in WPF libraries.
+    Press Esc or click outside to dismiss the panel without stopping the controller.
+    A recognizable TV icon has a yellow ! badge when attention is needed and a red x
+    badge when the controller is stopped. It notifies once on these state changes.
     Quit Controller stops both the controller and notification icon; the Startup
     shortcut remains installed for the next sign-in.
 
     The TV volume slider sets the configured TV to a value from 0 to 100. Drag to
     choose a value, then release to apply it; arrow keys allow precise adjustments.
-    The menu shows pending changes and failures. SmartThings and audioVolume support
+    The flyout shows pending changes and failures. SmartThings and audioVolume support
     on the TV are required; LAN mode shows the slider as unavailable.
     The slider controls the TV directly, even when keyboard integration is disabled.
     The keyboard's TV-volume floor does not limit manual slider targets.
@@ -220,6 +225,7 @@ for in-place upgrades. It does not restrict which compatible TV can be used.
     Current/last daemon status.
 
 %LOCALAPPDATA%\QN990FController\StatusTray.ps1
+%LOCALAPPDATA%\QN990FController\StatusFlyout.xaml
     Notification-area status, recovery controls, and a TV-volume slider. Slider
     requests are processed by the background controller's existing SmartThings client.
 

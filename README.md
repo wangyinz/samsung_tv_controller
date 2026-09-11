@@ -36,7 +36,8 @@ monitor.
 - A macOS menu-bar item and Windows notification-area icon with live status and
   platform-appropriate repair, reauthorization, restart, and log actions.
 - A TV-volume slider in both status menus. In SmartThings mode, choose an exact
-  value from 0 to 100 and release the slider to apply it.
+  value from 0 to 100 and release the slider to apply it. On Windows, left-click
+  the tray icon for a volume-only flyout; right-click for the full control panel.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -254,8 +255,13 @@ Reconfiguration tools are installed with each platform version:
 On macOS, use the `TV` menu-bar item for current controller/volume status and
 the common recovery actions. `TV!` means volume integration needs attention;
 `TV×` means the controller is stopped, in error, or requires SmartThings sign-in.
-On Windows, right-click the notification-area icon for controller and volume
-status, configuration, SmartThings reauthorization, restart, and log actions.
+On Windows, left-click the notification-area icon for a compact volume-only
+flyout. Right-click for the full panel with controller and keyboard-volume status,
+configuration, SmartThings reauthorization, restart, and log actions. Both views
+use a Windows 11-inspired design with light/dark and high-contrast themes, a thin
+volume track, and rounded corners on Windows 11. They use Windows' built-in WPF
+libraries, with no extra UI runtime to install. This controls the TV directly;
+it is not the Windows system-volume mixer. Press Esc or click outside to dismiss.
 The status process is separate, so it remains available when the controller stops.
 On either platform, **Quit Controller** stops both the background controller and
 its status UI while leaving login startup installed for the next sign-in.
@@ -443,6 +449,19 @@ with `samsungtvws` installed, it can also be invoked directly:
 ```powershell
 python .\QN990F_Windows_Controller\QN990FController.py --self-test
 ```
+
+Test the Windows flyout's XAML, slider state, request protocol, and monitor-bound
+placement without contacting a TV or modifying the installed controller:
+
+```powershell
+powershell.exe -NoProfile -Sta -ExecutionPolicy Bypass -File .\QN990F_Windows_Controller\tests\Test-StatusTray.ps1 -RequireWpf
+```
+
+PowerShell 7 on other platforms can run the same script without `-RequireWpf`
+for protocol and placement checks; WPF checks are explicitly skipped. On Windows,
+also check left/right tray clicks, drag-release and keyboard adjustment, outside
+click/Esc dismissal, and light/dark/high-contrast appearance at the display scales
+you use. These interactive checks require a Windows desktop.
 
 Do not use `--test`, `--off`, or `--wake` during automated testing: those modes
 send real commands to the configured TV.
