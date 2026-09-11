@@ -74,6 +74,13 @@ try {
         $WindowHelper = New-Object Windows.Interop.WindowInteropHelper($Flyout)
         $WindowHandle = $WindowHelper.EnsureHandle()
         Set-FlyoutTheme
+        foreach ($Name in @(
+            "SurfaceBrush", "TextBrush", "SecondaryBrush", "BorderBrush", "TrackBrush",
+            "AccentBrush", "HoverBrush", "PressedBrush", "ThumbBrush"
+        )) {
+            Assert-True ($Flyout.Resources[$Name] -is [Windows.Media.SolidColorBrush]) `
+                "Theme resource must remain a SolidColorBrush: $Name"
+        }
         [void]$VolumeSlider.ApplyTemplate()
         $Track = $VolumeSlider.Template.FindName("PART_Track", $VolumeSlider)
         Assert-True ($null -ne $Track.Thumb) "The slider must have a usable thumb"
