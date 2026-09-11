@@ -188,7 +188,7 @@ try {
         }
         foreach ($Name in $Colors.Keys) {
             $Color = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$Colors[$Name])
-            $Flyout.Resources[$Name] = New-Object System.Windows.Media.SolidColorBrush($Color)
+            $Flyout.Resources[$Name] = [System.Windows.Media.SolidColorBrush]::new($Color)
         }
         [TVFlyoutNative]::Style($WindowHandle, $Dark)
     }
