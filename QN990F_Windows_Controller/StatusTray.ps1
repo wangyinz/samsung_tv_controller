@@ -2,6 +2,42 @@ $ErrorActionPreference = "Stop"
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
+
+public static class TVStatusIcon {
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr icon);
+
+    public static Icon Create(string badge, Color badgeColor) {
+        using (var bitmap = new Bitmap(32, 32))
+        using (var graphics = Graphics.FromImage(bitmap))
+        using (var border = new Pen(Color.White, 2))
+        using (var font = new Font("Segoe UI", 17, FontStyle.Bold, GraphicsUnit.Pixel))
+        using (var badgeFont = new Font("Segoe UI", 12, FontStyle.Bold, GraphicsUnit.Pixel))
+        using (var badgeBrush = new SolidBrush(badgeColor))
+        using (var format = new StringFormat()) {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.FillRectangle(Brushes.Black, 1, 3, 29, 24);
+            graphics.DrawRectangle(border, 1, 3, 29, 24);
+            format.Alignment = StringAlignment.Center;
+            format.LineAlignment = StringAlignment.Center;
+            graphics.DrawString("TV", font, Brushes.White, new RectangleF(1, 3, 29, 24), format);
+            if (badge.Length > 0) {
+                graphics.FillEllipse(badgeBrush, 18, 18, 14, 14);
+                graphics.DrawString(badge, badgeFont, Brushes.Black, new RectangleF(18, 17, 14, 14), format);
+            }
+            var handle = bitmap.GetHicon();
+            try {
+                using (var icon = Icon.FromHandle(handle)) { return (Icon)icon.Clone(); }
+            } finally { DestroyIcon(handle); }
+        }
+    }
+}
+'@
 
 $AppDir = Join-Path $env:LOCALAPPDATA "QN990FController"
 $StatusPath = Join-Path $AppDir "status.json"
@@ -13,6 +49,8 @@ $TrayPidPath = Join-Path $AppDir "status-tray.pid"
 $ConfigurePath = Join-Path $AppDir "Configure-QN990FController.ps1"
 $ReauthorizePath = Join-Path $AppDir "Reauthorize-SmartThings.ps1"
 $LogPath = Join-Path $AppDir "controller.log"
+$VolumeStatusPath = Join-Path $AppDir "volume-status.json"
+$VolumeRequestPath = Join-Path $AppDir "volume-request.json"
 
 $TrayMutex = New-Object System.Threading.Mutex(
     $false,
@@ -31,7 +69,10 @@ try {
 
     $Notify = New-Object System.Windows.Forms.NotifyIcon
     $Notify.Text = "Samsung TV Picture Controller"
-    $Notify.Icon = [System.Drawing.SystemIcons]::Information
+    $ReadyIcon = [TVStatusIcon]::Create("", [System.Drawing.Color]::Transparent)
+    $AttentionIcon = [TVStatusIcon]::Create("!", [System.Drawing.Color]::Gold)
+    $StoppedIcon = [TVStatusIcon]::Create("x", [System.Drawing.Color]::Tomato)
+    $Notify.Icon = $ReadyIcon
     $Notify.Visible = $true
 
     $Menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -44,6 +85,25 @@ try {
     $VolumeItem.Text = "Volume integration: loading"
     $VolumeItem.Enabled = $false
     [void]$Menu.Items.Add($VolumeItem)
+
+    $TVVolumeLabel = $Menu.Items.Add("TV volume: loading")
+    $TVVolumeLabel.Enabled = $false
+    $VolumeSlider = New-Object System.Windows.Forms.TrackBar
+    $VolumeSlider.Minimum = 0
+    $VolumeSlider.Maximum = 100
+    $VolumeSlider.SmallChange = 1
+    $VolumeSlider.LargeChange = 10
+    $VolumeSlider.TickStyle = [System.Windows.Forms.TickStyle]::None
+    $VolumeSlider.AutoSize = $false
+    $VolumeSlider.Size = New-Object System.Drawing.Size(240, 32)
+    $VolumeSlider.AccessibleName = "TV volume"
+    $VolumeSlider.Enabled = $false
+    $SliderHost = New-Object System.Windows.Forms.ToolStripControlHost($VolumeSlider)
+    $SliderHost.AutoSize = $false
+    $SliderHost.Size = $VolumeSlider.Size
+    [void]$Menu.Items.Add($SliderHost)
+    $VolumeNotice = $Menu.Items.Add("")
+    $VolumeNotice.Enabled = $false
     [void]$Menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
     $ConfigureItem = $Menu.Items.Add("Configure Controller...")
@@ -61,6 +121,109 @@ try {
             $Message,
             [System.Windows.Forms.ToolTipIcon]::Error
         )
+    }
+
+    $script:VolumeSession = ""
+    $script:PendingVolumeId = ""
+    $script:PendingVolumeTime = [DateTime]::MinValue
+    $script:VolumeDragging = $false
+    $script:VolumeEditing = $false
+    $script:VolumeSyncing = $false
+    $script:VolumeDirty = $false
+    function Submit-Volume {
+        if (-not $VolumeSlider.Enabled -or -not $script:VolumeSession -or
+            -not $script:VolumeDirty) { return }
+        $RequestId = [Guid]::NewGuid().ToString("N")
+        $Payload = @{
+            session = $script:VolumeSession
+            id = $RequestId
+            value = [int]$VolumeSlider.Value
+            created_at = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0)
+        } | ConvertTo-Json -Compress
+        $TemporaryPath = "$VolumeRequestPath.tmp"
+        try {
+            [IO.File]::WriteAllText($TemporaryPath, $Payload)
+            if ([IO.File]::Exists($VolumeRequestPath)) {
+                [IO.File]::Replace($TemporaryPath, $VolumeRequestPath, [NullString]::Value)
+            } else {
+                [IO.File]::Move($TemporaryPath, $VolumeRequestPath)
+            }
+            $script:PendingVolumeId = $RequestId
+            $script:PendingVolumeTime = [DateTime]::UtcNow
+            $script:VolumeDirty = $false
+            $VolumeNotice.Text = "Setting TV volume to $($VolumeSlider.Value)..."
+        } catch { Show-TrayError $_.Exception.Message }
+    }
+    $VolumeSlider.Add_MouseDown({
+        param($Source, $EventArgs)
+        if ($EventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            $script:VolumeDragging = $true
+        }
+    })
+    $VolumeSlider.Add_MouseUp({
+        $script:VolumeDragging = $false
+        Submit-Volume
+    })
+    $VolumeSlider.Add_KeyDown({
+        param($Source, $EventArgs)
+        if ($EventArgs.KeyCode.ToString() -in @("Left", "Right", "Up", "Down", "Home", "End", "PageUp", "PageDown")) {
+            $script:VolumeEditing = $true
+        }
+    })
+    $VolumeSlider.Add_KeyUp({
+        $script:VolumeEditing = $false
+        Submit-Volume
+    })
+    $VolumeSlider.Add_Scroll({
+        if ($script:VolumeSyncing) { return }
+        $script:VolumeDirty = $true
+        $TVVolumeLabel.Text = "TV volume: $($VolumeSlider.Value) / 100"
+        if (-not $script:VolumeDragging -and -not $script:VolumeEditing) {
+            Submit-Volume
+        }
+    })
+
+    function Update-VolumeStatus([bool]$ControllerRunning, [int]$ControllerPid) {
+        if ($script:VolumeDragging -or $script:VolumeEditing) { return }
+        try {
+            $Info = Get-Content -LiteralPath $VolumeStatusPath -Raw | ConvertFrom-Json
+        } catch {
+            $VolumeSlider.Enabled = $false
+            $TVVolumeLabel.Text = "TV volume: unavailable"
+            $VolumeNotice.Text = "Start or update the controller to use the slider."
+            return
+        }
+        $Available = $ControllerRunning -and [bool]$Info.available -and
+            ([int]$Info.pid -eq $ControllerPid)
+        $VolumeSlider.Enabled = $Available
+        if ([string]$Info.session -ne $script:VolumeSession) {
+            $script:VolumeSession = [string]$Info.session
+            $script:PendingVolumeId = ""
+        }
+        if ($script:PendingVolumeId) {
+            if ([string]$Info.request_id -eq $script:PendingVolumeId) {
+                $script:PendingVolumeId = ""
+            } elseif ($Available -and
+                ([DateTime]::UtcNow - $script:PendingVolumeTime).TotalSeconds -lt 60) {
+                return
+            } else {
+                $script:PendingVolumeId = ""
+                $VolumeNotice.Text = "No response; restart the controller and try again."
+                return
+            }
+        }
+        if ($null -ne $Info.value) {
+            $script:VolumeSyncing = $true
+            try { $VolumeSlider.Value = [Math]::Min(100, [Math]::Max(0, [int]$Info.value)) }
+            finally { $script:VolumeSyncing = $false }
+            $TVVolumeLabel.Text = "TV volume: $($VolumeSlider.Value) / 100"
+        } else {
+            $TVVolumeLabel.Text = "TV volume: unknown"
+        }
+        $VolumeNotice.Text = [string]$Info.message
+        if (-not $Available -and -not $VolumeNotice.Text) {
+            $VolumeNotice.Text = "Controller is stopped."
+        }
     }
 
     function Start-ControllerHelper([string]$ScriptPath) {
@@ -142,6 +305,7 @@ try {
     function Update-TrayStatus {
         $State = "stopped"
         $Running = $false
+        $StatusPid = 0
         if (Test-Path -LiteralPath $StatusPath) {
             try {
                 $Status = Get-Content -LiteralPath $StatusPath -Raw | ConvertFrom-Json
@@ -179,12 +343,15 @@ try {
             "Volume integration: disabled"
         }
         $ReauthorizeItem.Visible = ($ControlMethod -eq "smartthings")
+        Update-VolumeStatus $Running $StatusPid
 
         $NeedsAttention = $State -in @("authorization_required", "error", "stopped")
-        $Notify.Icon = if ($NeedsAttention) {
-            [System.Drawing.SystemIcons]::Error
+        $Notify.Icon = if ($State -eq "stopped" -or -not $Running) {
+            $StoppedIcon
+        } elseif ($NeedsAttention) {
+            $AttentionIcon
         } else {
-            [System.Drawing.SystemIcons]::Information
+            $ReadyIcon
         }
         $Tooltip = "Samsung TV Controller: $State"
         if ($Tooltip.Length -gt 63) { $Tooltip = $Tooltip.Substring(0, 63) }
@@ -205,8 +372,9 @@ try {
     }
 
     $Timer = New-Object System.Windows.Forms.Timer
-    $Timer.Interval = 3000
+    $Timer.Interval = 1000
     $Timer.Add_Tick({ Update-TrayStatus })
+    $Menu.Add_Opening({ Update-TrayStatus })
     Update-TrayStatus
     $Timer.Start()
     [System.Windows.Forms.Application]::Run()
@@ -214,6 +382,9 @@ try {
     if ($Timer) { $Timer.Stop(); $Timer.Dispose() }
     if ($Notify) { $Notify.Visible = $false; $Notify.Dispose() }
     if ($Menu) { $Menu.Dispose() }
+    if ($ReadyIcon) { $ReadyIcon.Dispose() }
+    if ($AttentionIcon) { $AttentionIcon.Dispose() }
+    if ($StoppedIcon) { $StoppedIcon.Dispose() }
     try {
         if ((Test-Path -LiteralPath $TrayPidPath) -and
             ([int](Get-Content -LiteralPath $TrayPidPath)) -eq $PID) {

@@ -460,7 +460,7 @@ class DirectHIDStartupTests(unittest.TestCase):
         self.assertIs(ctrl.volume, volume)
         volume.stop.assert_not_called()
 
-    def test_direct_hid_disables_volume_after_retry_budget_is_exhausted(self):
+    def test_direct_hid_failure_keeps_the_menu_volume_worker_available(self):
         backend = self.Backend(failures=3)
         ctrl, volume = self.make_controller()
 
@@ -473,8 +473,8 @@ class DirectHIDStartupTests(unittest.TestCase):
         ctrl.set_hid_input_state.assert_called_once_with(
             False, "not ready", notify=True
         )
-        volume.stop.assert_called_once_with()
-        self.assertIsNone(ctrl.volume)
+        volume.stop.assert_not_called()
+        self.assertIs(ctrl.volume, volume)
 
     def test_denied_input_monitoring_prompts_without_waiting_for_retries(self):
         backend = self.Backend(failures=3)
@@ -489,8 +489,8 @@ class DirectHIDStartupTests(unittest.TestCase):
         ctrl.set_hid_input_state.assert_called_once_with(
             False, "not ready", notify=True
         )
-        volume.stop.assert_called_once_with()
-        self.assertIsNone(ctrl.volume)
+        volume.stop.assert_not_called()
+        self.assertIs(ctrl.volume, volume)
 
 
 class LANClientTests(unittest.TestCase):
@@ -1071,11 +1071,12 @@ class ControllerInputTests(unittest.TestCase):
 
     def make_controller(self, control_method="lan", tv=None):
         backend = FakeBackend()
-        instance = controller.Controller(
-            controller_config(control_method),
-            backend,
-        )
-        instance.tv = tv or RecordingTV()
+        with mock.patch.object(controller, "make_tv_client", return_value=tv or RecordingTV()):
+            instance = controller.Controller(
+                controller_config(control_method),
+                backend,
+            )
+        self.addCleanup(instance.stop)
         return instance, backend
 
     @staticmethod
@@ -1096,6 +1097,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_adjustable_system_output_never_routes_volume_to_tv(self):
         instance, backend = self.make_controller()
+        instance.cfg["enable_volume_control"] = True
         instance.volume = mock.Mock()
         backend.system_volume_state = mock.Mock(return_value=(True, True))
 
@@ -1105,6 +1107,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_fixed_system_output_routes_volume_to_tv(self):
         instance, backend = self.make_controller()
+        instance.cfg["enable_volume_control"] = True
         instance.volume = mock.Mock()
         instance.volume.handle_key.return_value = True
         instance.cfg["tv_audio_output_uid"] = "tv-output"
@@ -1121,6 +1124,7 @@ class ControllerInputTests(unittest.TestCase):
 
     def test_unbound_fixed_output_never_routes_volume_to_tv(self):
         instance, backend = self.make_controller()
+        instance.cfg["enable_volume_control"] = True
         instance.volume = mock.Mock()
         instance.cfg["tv_audio_output_uid"] = "tv-output"
         backend.system_volume_state = mock.Mock(return_value=(False, True))
@@ -1135,6 +1139,12 @@ class ControllerInputTests(unittest.TestCase):
         with mock.patch.object(controller, "show_audio_binding_prompt"):
             self.assertFalse(instance.handle_volume_key("down"))
 
+        instance.volume.handle_key.assert_not_called()
+
+    def test_menu_worker_does_not_enable_disabled_media_key_routing(self):
+        instance, _backend = self.make_controller()
+        instance.volume = mock.Mock()
+        self.assertFalse(instance.handle_volume_key("up"))
         instance.volume.handle_key.assert_not_called()
 
     def test_volume_health_reports_a_bound_physical_output_as_ready(self):

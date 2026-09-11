@@ -35,6 +35,8 @@ monitor.
   devices, Mac speakers, headphones, and adjustable outputs remain under macOS control.
 - A macOS menu-bar item and Windows notification-area icon with live status and
   platform-appropriate repair, reauthorization, restart, and log actions.
+- A TV-volume slider in both status menus. In SmartThings mode, choose an exact
+  value from 0 to 100 and release the slider to apply it.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -77,7 +79,8 @@ settings. Reports for additional models are welcome.
 | Per-device input exclusion | No | Yes, by Raw Input device-path substring |
 | Media/presentation protection | macOS display power assertions | Windows `ES_DISPLAY_REQUIRED` |
 | Background startup | Per-user LaunchAgent | Per-user Startup shortcut |
-| Status UI | Menu-bar item (`TV`, `TV!`, `TV×`) | Notification-area icon with error notifications |
+| Status UI | Menu-bar item (`TV`, `TV!`, `TV×`) | TV icon with `!` attention / `×` stopped badges |
+| Exact TV-volume slider | SmartThings | SmartThings |
 | Elevated privileges | Not required | Not required for the controller; the installer may use `winget` to install a missing user-scoped Python runtime |
 
 The macOS controller uses IOHID matching only for the standard scroll-wheel,
@@ -222,7 +225,7 @@ left blank.
   adjustable system volume and its normalized physical Core Audio identity matches
   the TV output confirmed during installation. Known per-endpoint UID suffix changes
   are tolerated across macOS updates, while another physical HDMI sink is rejected.
-  Other HDMI devices, Mac speakers, and headphones never alter TV volume. The bound
+  Volume keys for other HDMI devices, Mac speakers, and headphones never alter TV volume. The bound
   TV output uses its full range from 0 to 100.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
@@ -257,6 +260,14 @@ The status process is separate, so it remains available when the controller stop
 On either platform, **Quit Controller** stops both the background controller and
 its status UI while leaving login startup installed for the next sign-in.
 
+The **TV volume** slider controls the configured TV directly, including values
+below the keyboard-volume floor. It works even when keyboard volume integration
+is disabled or the computer is using another audio output; on macOS it does not
+need Input Monitoring. Drag to choose a value, then release to apply it. The menu
+shows the pending change or an error, and periodically updates the displayed TV
+volume. Exact values require SmartThings and the TV's `audioVolume` capability;
+LAN mode displays an explanation in place of an active slider.
+
 ## Security and privacy
 
 - Installation and background startup are per-user; the controller does not
@@ -277,8 +288,11 @@ its status UI while leaving login startup installed for the next sign-in.
 - macOS writes a small local `health.json` file for the menu-bar status item. It
   contains state labels and the current audio-output name/normalized identity when
   rebinding is required; it contains no typed keys or SmartThings token.
-- The Windows notification-area process reads only the existing local
-  `status.json` and `config.json`; it does not send TV commands.
+- The status interfaces read local state and submit slider targets through
+  `volume-request.json`. The controller processes them using its existing
+  serialized SmartThings client; the interfaces do not handle OAuth credentials.
+  `volume-status.json` reports the value and result. These two small files are
+  overwritten in place, and requests from a previous controller session are ignored.
 - The project adds no application telemetry. It writes local status and
   diagnostic files only. Windows logs may include Raw Input device paths; macOS
   logs input categories but not typed text. Windows wake records may also

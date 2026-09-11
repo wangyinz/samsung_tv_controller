@@ -156,11 +156,18 @@ the TV-first Volume Down rule is intentionally limited to SmartThings mode.
 Notification-area icon:
     Right-click the Samsung TV Picture Controller icon to see controller and
     volume-integration status, configure or restart the controller, reauthorize
-    SmartThings, or open the log. The icon changes to the Windows error symbol and
-    shows one notification when the controller stops, reports an error, or requires
-    SmartThings authorization. Double-clicking the icon opens the controller log.
+    SmartThings, or open the log. A recognizable TV icon has a yellow ! badge when
+    attention is needed and a red x badge when the controller is stopped. It shows
+    one notification on these state changes. Double-clicking the icon opens the log.
     Quit Controller stops both the controller and notification icon; the Startup
     shortcut remains installed for the next sign-in.
+
+    The TV volume slider sets the configured TV to a value from 0 to 100. Drag to
+    choose a value, then release to apply it; arrow keys allow precise adjustments.
+    The menu shows pending changes and failures. SmartThings and audioVolume support
+    on the TV are required; LAN mode shows the slider as unavailable.
+    The slider controls the TV directly, even when keyboard integration is disabled.
+    The keyboard's TV-volume floor does not limit manual slider targets.
 
 
 CONFIGURATION
@@ -213,8 +220,13 @@ for in-place upgrades. It does not restrict which compatible TV can be used.
     Current/last daemon status.
 
 %LOCALAPPDATA%\QN990FController\StatusTray.ps1
-    Notification-area status and recovery controls. It reads status/configuration
-    files and does not send TV commands.
+    Notification-area status, recovery controls, and a TV-volume slider. Slider
+    requests are processed by the background controller's existing SmartThings client.
+
+%LOCALAPPDATA%\QN990FController\volume-status.json
+%LOCALAPPDATA%\QN990FController\volume-request.json
+    Current slider state and latest target. These small files are overwritten,
+    contain no OAuth credentials, and cannot replay targets after a controller restart.
 
 %LOCALAPPDATA%\QN990FController\status-tray.pid
     Runtime PID used only to avoid duplicate status icons and to stop the icon safely

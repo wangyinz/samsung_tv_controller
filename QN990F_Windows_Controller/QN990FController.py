@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -1734,7 +1735,7 @@ def make_tv_client(config: dict):
 class VolumeCoordinator:
     BUFFER_SECONDS = 0.2
 
-    def __init__(self, config: dict, tv):
+    def __init__(self, config: dict, tv, menu_dir=None):
         self.config = config
         self.tv = tv
         self._lock = threading.Lock()
@@ -1744,10 +1745,97 @@ class VolumeCoordinator:
         self._estimate_valid_until = 0.0
         self._buffer_start_volume = None
         self._buffer_deadline = 0.0
+        self._menu_dir = menu_dir
+        self._menu_session = uuid.uuid4().hex
+        self._menu_request_id = ""
+        self._menu_completed_id = ""
+        self._menu_error = ""
+        self._menu_last_status = None
         self._worker = threading.Thread(
             target=self._run, daemon=True, name="QN990F-VolumeControl"
         )
         self._worker.start()
+
+    def _publish_menu_status(self):
+        if self._menu_dir is None:
+            return
+        supported = callable(getattr(self.tv, "set_volume", None))
+        auth_required = getattr(self.tv, "authorization_required", lambda: False)()
+        with self._lock:
+            available = supported and not auth_required and not self._stop.is_set()
+            if self._stop.is_set():
+                state, message = "stopped", "Controller is stopped."
+            elif not supported:
+                state, message = "unavailable", "Exact TV volume requires SmartThings."
+            elif auth_required:
+                state, message = "authorization_required", "Reauthorize SmartThings to control TV volume."
+            elif self._menu_error:
+                state, message = "error", self._menu_error
+            elif self._menu_request_id != self._menu_completed_id:
+                state, message = "pending", "Setting TV volume..."
+            else:
+                state, message = "ready", ""
+            payload = {
+                "session": self._menu_session,
+                "pid": os.getpid(),
+                "available": available,
+                "state": state,
+                "message": message,
+                "value": self._tv_volume,
+                "request_id": self._menu_completed_id,
+            }
+            if payload == self._menu_last_status:
+                return
+            path = self._menu_dir / "volume-status.json"
+            temporary = path.with_suffix(".tmp")
+            try:
+                temporary.write_text(json.dumps(payload), encoding="utf-8")
+                os.replace(temporary, path)
+                self._menu_last_status = payload
+            except OSError as exc:
+                logger.warning("Could not publish menu volume status: %s", exc)
+
+    def _poll_menu_request(self):
+        if self._menu_dir is None:
+            return
+        try:
+            request = json.loads(
+                (self._menu_dir / "volume-request.json").read_text(encoding="utf-8-sig")
+            )
+        except (OSError, ValueError):
+            return
+        if not isinstance(request, dict) or request.get("session") != self._menu_session:
+            return
+        request_id = request.get("id")
+        if not isinstance(request_id, str) or not request_id or request_id == self._menu_request_id:
+            return
+        self._menu_request_id = request_id
+        target = request.get("value")
+        created = request.get("created_at")
+        error = ""
+        if type(target) is not int or not 0 <= target <= 100:
+            error = "TV volume must be an integer from 0 to 100."
+        elif not isinstance(created, (int, float)) or not 0 <= time.time() - created <= 60:
+            error = "Volume request expired; move the slider again."
+        elif not callable(getattr(self.tv, "set_volume", None)):
+            error = "Exact TV volume requires SmartThings."
+        elif getattr(self.tv, "authorization_required", lambda: False)():
+            error = "Reauthorize SmartThings to control TV volume."
+        with self._lock:
+            self._menu_error = error
+            if error:
+                self._menu_completed_id = request_id
+                return
+            # Absolute menu targets share the media-key buffer and its worker.
+            # A new target replaces earlier unsent steps, including targets below 10.
+            notify = self._buffer_deadline == 0.0
+            self._buffer_start_volume = None
+            self._tv_volume = target
+            now = time.monotonic()
+            self._buffer_deadline = now + self.BUFFER_SECONDS
+            self._estimate_valid_until = now + 2 * float(self.config["tv_volume_refresh_seconds"])
+        if notify:
+            self._commands.put("flush_volume")
 
     def handle_key(self, direction: str, system_is_max=False) -> bool:
         if getattr(self.tv, "authorization_required", lambda: False)():
@@ -1793,6 +1881,8 @@ class VolumeCoordinator:
 
     def _flush_volume_buffer(self) -> None:
         while not self._stop.is_set():
+            self._poll_menu_request()
+            self._publish_menu_status()
             with self._lock:
                 remaining = self._buffer_deadline - time.monotonic()
             if remaining > 0:
@@ -1804,17 +1894,25 @@ class VolumeCoordinator:
                 start = self._buffer_start_volume
                 self._buffer_deadline = 0.0
                 self._buffer_start_volume = None
+                request_id = self._menu_request_id
             if target is None or target == start:
+                self._menu_completed_id = request_id
                 return
-            if not self.tv.set_volume(target):
-                with self._lock:
+            success = self.tv.set_volume(target)
+            with self._lock:
+                self._menu_completed_id = request_id
+                self._menu_error = "" if success else "TV volume change failed; check the controller log."
+                if not success:
                     self._tv_volume = None
                     self._estimate_valid_until = 0.0
+            self._publish_menu_status()
             return
 
     def _run(self) -> None:
         refresh_at = 0.0
         while not self._stop.is_set():
+            self._poll_menu_request()
+            self._publish_menu_status()
             if getattr(self.tv, "authorization_required", lambda: False)():
                 return
             now = time.monotonic()
@@ -1825,14 +1923,17 @@ class VolumeCoordinator:
                     volume = self.tv.get_volume()
                     if volume is not None:
                         with self._lock:
-                            self._tv_volume = volume
+                            if time.monotonic() >= self._estimate_valid_until:
+                                self._tv_volume = volume
                     elif getattr(
                         self.tv, "authorization_required", lambda: False
                     )():
+                        self._publish_menu_status()
                         return
                 refresh_at = time.monotonic() + float(
                     self.config["tv_volume_refresh_seconds"]
                 )
+                self._publish_menu_status()
             if self._stop.is_set():
                 break
             try:
@@ -1853,17 +1954,18 @@ class VolumeCoordinator:
             self.config.get("smartthings_command_timeout_seconds", 0.0)
         ) + 1.0
         self._worker.join(timeout=max(1.0, timeout))
+        self._publish_menu_status()
 
 
 # ---------------- Controller state machine ----------------
 
 class Controller:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, volume_menu=False):
         self.config = config
         self.tv = make_tv_client(config)
         self.volume = (
-            VolumeCoordinator(config, self.tv)
-            if config["enable_volume_control"] else None
+            VolumeCoordinator(config, self.tv, APP_DIR if volume_menu else None)
+            if config["enable_volume_control"] or volume_menu else None
         )
         self._operation_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -1945,7 +2047,7 @@ class Controller:
         return False
 
     def handle_volume_key(self, direction: str, system_is_max=False) -> bool:
-        if self.volume is None:
+        if self.volume is None or not self.config["enable_volume_control"]:
             return False
         return self.volume.handle_key(direction, system_is_max)
 
@@ -2347,7 +2449,7 @@ def run_daemon(config: dict) -> int:
         write_status(running=True, state="starting", version="3.3")
         start_status_tray()
 
-        controller = Controller(config)
+        controller = Controller(config, volume_menu=True)
         controller.start_authorization_monitor()
         input_window = RawInputWindow(config)
         input_window.create()

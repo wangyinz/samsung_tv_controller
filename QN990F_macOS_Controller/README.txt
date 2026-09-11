@@ -290,6 +290,14 @@ The TV menu-bar item provides the common recovery actions:
 - Quit Controller stops both the controller and menu for the current login session;
   login startup remains installed for the next sign-in
 
+The TV volume slider sets the configured TV to an exact value from 0 to 100.
+Drag to choose a value, then release to apply it. Pending changes and failures
+are shown below the slider. SmartThings and the TV's audioVolume capability are
+required; LAN mode shows the slider as unavailable.
+This explicit TV control works even when keyboard volume integration is disabled,
+Input Monitoring is unavailable, or the current audio output is not the bound TV.
+The keyboard's volume-floor and audio-output binding rules do not limit the slider.
+
 Use Repair Input Monitoring after privacy authorization is lost. Use Bind Current TV
 Audio Output only after selecting and confirming the intended TV in macOS Sound settings;
 this explicit confirmation is how the controller relates a Core Audio device to the TV.
@@ -342,7 +350,13 @@ uninstaller does not modify or sign out any profile.
     SmartThings token or typed input.
 
 ~/Library/Application Support/QN990FController/Samsung TV Picture Controller Status.app
-    Menu-bar status and recovery controls. It does not send TV commands by itself.
+    Menu-bar status, recovery controls, and a TV-volume slider. Slider requests are
+    processed by the background controller's existing SmartThings client.
+
+~/Library/Application Support/QN990FController/volume-status.json
+~/Library/Application Support/QN990FController/volume-request.json
+    Current slider state and latest target. These small files are overwritten,
+    contain no OAuth credentials, and cannot replay targets after a controller restart.
 
 ~/Library/LaunchAgents/local.qn990f.picture-controller.plist
     Login startup item.
