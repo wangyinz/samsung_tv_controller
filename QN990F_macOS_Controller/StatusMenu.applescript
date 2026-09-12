@@ -3,6 +3,8 @@ use framework "AppKit"
 use scripting additions
 
 property statusItem : missing value
+property statusMenu : missing value
+property fullMenuItems : {}
 property controllerLine : missing value
 property volumeLine : missing value
 property volumeSlider : missing value
@@ -17,15 +19,24 @@ property appDir : ""
 on run
     set appDir to POSIX path of (path to application support from user domain) & "QN990FController/"
     set statusItem to current application's NSStatusBar's systemStatusBar's statusItemWithLength:(current application's NSVariableStatusItemLength)
+    my buildStatusMenu()
+    set volumeTimer to current application's NSTimer's timerWithTimeInterval:1 target:me selector:"refreshVolumeTimer:" userInfo:(missing value) repeats:true
+    current application's NSRunLoop's mainRunLoop()'s addTimer:volumeTimer forMode:(current application's NSRunLoopCommonModes)
+    my refreshStatus()
+end run
+
+on buildStatusMenu()
+    set fullMenuItems to {}
     statusItem's button's setTitle:"TV"
+    statusItem's button's setToolTip:"Left-click: TV volume. Right-click: controller menu."
 
     set statusMenu to current application's NSMenu's alloc()'s initWithTitle:"Samsung TV Picture Controller"
     set controllerLine to current application's NSMenuItem's alloc()'s initWithTitle:"Controller: loading" action:(missing value) keyEquivalent:""
     controllerLine's setEnabled:false
-    statusMenu's addItem:controllerLine
+    my addFullMenuItem(controllerLine)
     set volumeLine to current application's NSMenuItem's alloc()'s initWithTitle:"Volume: loading" action:(missing value) keyEquivalent:""
     volumeLine's setEnabled:false
-    statusMenu's addItem:volumeLine
+    my addFullMenuItem(volumeLine)
     set volumeView to current application's NSView's alloc()'s initWithFrame:{{0, 0}, {290, 65}}
     set volumeValueLabel to current application's NSTextField's labelWithString:"TV volume: loading"
     volumeValueLabel's setFrame:{{16, 39}, {260, 20}}
@@ -48,20 +59,52 @@ on run
     set volumeNotice to current application's NSMenuItem's alloc()'s initWithTitle:"" action:(missing value) keyEquivalent:""
     volumeNotice's setEnabled:false
     statusMenu's addItem:volumeNotice
-    statusMenu's addItem:(current application's NSMenuItem's separatorItem())
-    statusMenu's addItem:(my actionItem("Repair Input Monitoring…", "repairInputMonitoring:"))
-    statusMenu's addItem:(my actionItem("Bind Current TV Audio Output…", "bindAudioOutput:"))
-    statusMenu's addItem:(my actionItem("Reauthorize SmartThings…", "reauthorizeSmartThings:"))
-    statusMenu's addItem:(my actionItem("Restart Controller", "restartController:"))
-    statusMenu's addItem:(my actionItem("Open Controller Log", "openLog:"))
-    statusMenu's addItem:(current application's NSMenuItem's separatorItem())
-    statusMenu's addItem:(my actionItem("Quit Controller", "quitController:"))
-    statusItem's setMenu:statusMenu
+    my addFullMenuItem(current application's NSMenuItem's separatorItem())
+    my addFullMenuItem(my actionItem("Repair Input Monitoring…", "repairInputMonitoring:"))
+    my addFullMenuItem(my actionItem("Bind Current TV Audio Output…", "bindAudioOutput:"))
+    my addFullMenuItem(my actionItem("Reauthorize SmartThings…", "reauthorizeSmartThings:"))
+    my addFullMenuItem(my actionItem("Restart Controller", "restartController:"))
+    my addFullMenuItem(my actionItem("Open Controller Log", "openLog:"))
+    my addFullMenuItem(current application's NSMenuItem's separatorItem())
+    my addFullMenuItem(my actionItem("Quit Controller", "quitController:"))
     statusMenu's setDelegate:me
-    set volumeTimer to current application's NSTimer's timerWithTimeInterval:1 target:me selector:"refreshVolumeTimer:" userInfo:(missing value) repeats:true
-    current application's NSRunLoop's mainRunLoop()'s addTimer:volumeTimer forMode:(current application's NSRunLoopCommonModes)
-    my refreshStatus()
-end run
+    -- A permanently attached menu consumes clicks before the button action.
+    statusItem's setMenu:(missing value)
+    statusItem's button's setTarget:me
+    statusItem's button's setAction:"statusItemClicked:"
+    -- NSEventMaskLeftMouseUp (1 << 2) | NSEventMaskRightMouseUp (1 << 4).
+    statusItem's button's sendActionOn:20
+end buildStatusMenu
+
+on addFullMenuItem(menuItem)
+    statusMenu's addItem:menuItem
+    set end of fullMenuItems to menuItem
+end addFullMenuItem
+
+on wantsFullMenu(eventType, modifierFlags)
+    -- Right-click and Control-click open the full menu. Non-mouse activation
+    -- (including accessibility actions) also keeps recovery commands reachable.
+    if eventType is not 2 then return true
+    return ((modifierFlags div 262144) mod 2) is 1 -- NSEventModifierFlagControl
+end wantsFullMenu
+
+on prepareStatusMenu(showFullMenu)
+    repeat with menuItem in fullMenuItems
+        menuItem's setHidden:(not showFullMenu)
+    end repeat
+end prepareStatusMenu
+
+on statusItemClicked_(sender)
+    set clickEvent to current application's NSApp's currentEvent()
+    set showFullMenu to true
+    if clickEvent is not missing value then
+        set showFullMenu to my wantsFullMenu(clickEvent's type() as integer, clickEvent's modifierFlags() as integer)
+    end if
+    my prepareStatusMenu(showFullMenu)
+    -- Reuse the same menu and slider, including its pending request/session.
+    -- AppKit handles menu tracking, outside-click dismissal, and Esc.
+    statusMenu's popUpMenuPositioningItem:(missing value) atLocation:{0, 0} inView:(statusItem's button)
+end statusItemClicked_
 
 on readJSON(fileName)
     set jsonData to current application's NSData's dataWithContentsOfFile:(appDir & fileName)

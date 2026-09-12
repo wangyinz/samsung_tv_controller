@@ -224,8 +224,11 @@ for in-place upgrades. It does not restrict which compatible TV can be used.
 
 %LOCALAPPDATA%\QN990FController\controller.log
     Rotating diagnostic log, including qualifying input source/device details.
-    The active log and three backups are each limited to 1 MB, so retained logs
-    use at most approximately 4 MB in total.
+    The active log and three backups are each limited to 1,000,000 bytes (4 MB
+    total), accounting for UTF-8 and Windows line endings. Oldest entries are
+    discarded automatically. Formatted records over 8,192 characters are truncated
+    with a marker, retaining their beginning and end. The background controller
+    and status tray do not append separate console-output log files.
 
 %LOCALAPPDATA%\QN990FController\status.json
     Current/last daemon status.

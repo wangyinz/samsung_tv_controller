@@ -50,6 +50,7 @@ SMARTTHINGS_OAUTH_TOKEN_URL = (
 SMARTTHINGS_REFRESH_WINDOW = timedelta(hours=6)
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 3
+LOG_MAX_RECORD_CHARS = 8192
 HID_START_RETRY_SECONDS = (5.0, 15.0, 30.0)
 _health_lock = threading.Lock()
 APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,14 +86,42 @@ DEFAULT_CONFIG = {
     "tv_volume_refresh_seconds": 30.0,
 }
 
+
+class BoundedRotatingFileHandler(RotatingFileHandler):
+    """Bound individual records as well as the UTF-8 files that retain them."""
+
+    def format(self, record):
+        message = super().format(record)
+        if len(message) > LOG_MAX_RECORD_CHARS:
+            marker = "\n...[log record truncated]...\n"
+            tail = LOG_MAX_RECORD_CHARS // 4
+            head = LOG_MAX_RECORD_CHARS - tail - len(marker)
+            message = message[:head] + marker + message[-tail:]
+        return message
+
+    def shouldRollover(self, record):
+        if self.stream is None:
+            self.stream = self._open()
+        if self.maxBytes <= 0:
+            return False
+        self.stream.seek(0, os.SEEK_END)
+        # RotatingFileHandler counts characters, not encoded bytes. Also account
+        # for TextIO's LF -> CRLF translation on Windows.
+        message = (self.format(record) + self.terminator).replace("\n", os.linesep)
+        size = len(message.encode(self.encoding, errors=self.errors or "strict"))
+        return (self.stream.tell() + size >= self.maxBytes
+                and os.path.isfile(self.baseFilename))
+
+
 logger = logging.getLogger("QN990FController")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    h = RotatingFileHandler(
+    h = BoundedRotatingFileHandler(
         LOG_FILE,
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT,
         encoding="utf-8",
+        errors="backslashreplace",
     )
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(h)

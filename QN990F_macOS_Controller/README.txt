@@ -284,6 +284,9 @@ To renew only the SmartThings sign-in, double-click:
 ~/Library/Application Support/QN990FController/Reauthorize.command
 
 The TV menu-bar item provides the common recovery actions:
+- Left-click: the TV volume slider and its current status only
+- Right-click or Control-click: the full status and recovery menu
+- No distinct double-click action is assigned
 - TV: controller is running and no volume repair is required
 - TV!: Input Monitoring, output binding, or volume status needs attention
 - TV×: controller is stopped, in error, or needs SmartThings authorization
@@ -294,6 +297,9 @@ The TV volume slider sets the configured TV to an exact value from 0 to 100.
 Drag to choose a value, then release to apply it. Pending changes and failures
 are shown below the slider. SmartThings and the TV's audioVolume capability are
 required; LAN mode shows the slider as unavailable.
+Both menu views share the same slider and pending request. Switching views does
+not reset the selected value or send an extra command. Press Esc or click outside
+to dismiss the menu. These menu interactions require no Input Monitoring access.
 This explicit TV control works even when keyboard volume integration is disabled,
 Input Monitoring is unavailable, or the current audio output is not the bound TV.
 The keyboard's volume-floor and audio-output binding rules do not limit the slider.
@@ -340,7 +346,10 @@ uninstaller does not modify or sign out any profile.
 
 ~/Library/Application Support/QN990FController/controller.log
     Rotating controller log. It is limited to controller.log plus three backups of at
-    most 1 MB each (about 4 MB total). Oldest entries are discarded automatically.
+    most 1,000,000 bytes each (4 MB total). Oldest entries are discarded automatically.
+    Byte accounting includes UTF-8 encoding. Formatted records over 8,192 characters
+    are truncated with a marker, retaining their beginning and end. Both LaunchAgents
+    send stdout/stderr to /dev/null instead of accumulating extra output logs.
 
 ~/Library/Application Support/QN990FController/status.json
     Current or most recent runtime status.

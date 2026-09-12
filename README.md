@@ -36,8 +36,8 @@ monitor.
 - A macOS menu-bar item and Windows notification-area icon with live status and
   platform-appropriate repair, reauthorization, restart, and log actions.
 - A TV-volume slider in both status menus. In SmartThings mode, choose an exact
-  value from 0 to 100 and release the slider to apply it. On Windows, left-click
-  the tray icon for a volume-only flyout; right-click for the full control panel.
+  value from 0 to 100 and release the slider to apply it. On either platform,
+  left-click the status icon for volume only; right-click for the full menu.
 
 The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
 power toggle. Automatic input wake is active only after this controller believes
@@ -252,8 +252,11 @@ Reconfiguration tools are installed with each platform version:
 - macOS: `~/Library/Application Support/QN990FController/Configure.command`
 - Windows: the controller's **Configure** shortcut in the Start menu
 
-On macOS, use the `TV` menu-bar item for current controller/volume status and
-the common recovery actions. `TV!` means volume integration needs attention;
+On macOS, left-click the `TV` menu-bar item for the volume slider and its current
+status. Right-click (or Control-click) for the full menu with controller/volume
+status and the common recovery actions. Both views share the same slider and
+pending request; switching views does not send an extra command. No distinct
+double-click action is assigned. `TV!` means volume integration needs attention;
 `TV×` means the controller is stopped, in error, or requires SmartThings sign-in.
 On Windows, left-click the notification-area icon for a compact volume-only
 flyout. Right-click for the full panel with controller and keyboard-volume status,
@@ -308,8 +311,13 @@ LAN mode displays an explanation in place of an active slider.
   diagnostic files only. Windows logs may include Raw Input device paths; macOS
   logs input categories but not typed text. Windows wake records may also
   include the single virtual-key code that caused a wake.
-- The active log and three rotating backups retain at most approximately 4 MB
-  per installation.
+- On both platforms, `controller.log` rotates into `.1`, `.2`, and `.3`, with
+  the oldest backup discarded. Each file is capped at 1,000,000 bytes (4 MB
+  total), counting UTF-8 bytes and Windows line endings. Individual formatted
+  records over 8,192 characters retain their beginning and end with an explicit
+  truncation marker, so a huge exception cannot create a huge log file.
+  macOS LaunchAgents send stdout/stderr to `/dev/null`; the Windows background
+  controller and tray do not append separate console-output log files.
 
 Installers download runtime components and dependencies from their documented
 upstream sources. macOS verifies the pinned SmartThings CLI archive. Windows
@@ -437,6 +445,13 @@ Run the macOS unit suite on macOS:
 ```sh
 python3 -B -m unittest discover -s QN990F_macOS_Controller/tests -v
 ```
+
+The suite also stress-tests both platforms' real log handlers through multiple
+rotations, oversized exceptions, UTF-8 records, and Windows newline accounting.
+On macOS it compiles and exercises the actual AppKit status menu with an offscreen
+status button and temporary request files; it does not start the installed app,
+show a menu, or send TV commands. For manual UI verification, check left-click,
+right-click/Control-click, slider release, and outside-click/Esc dismissal.
 
 Validate the macOS shell entry points without sending TV commands:
 
