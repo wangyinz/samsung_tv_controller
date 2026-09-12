@@ -65,6 +65,41 @@ on run argv
     my assertThat(implementation's pendingVolumeID is "pending-test-request", "Switching views must not clear pending requests")
     my assertThat(implementation's volumeSession is "test-session", "Switching views must not change controller session")
 
+    -- Exercise the native status-item presentation handoff without opening UI.
+    -- Only the button's display action is replaced; the actual show/close/error
+    -- handlers must attach and detach the same menu for every click mode.
+    set nativeButton to fakeStatusItem's button
+    script presentationButton
+        property owner : missing value
+        property clicks : 0
+        property shouldFail : false
+        on performClick_(sender)
+            if owner's attachedMenu is missing value then error "Native presentation needs an attached status menu"
+            set clicks to clicks + 1
+            if shouldFail then error "Simulated presentation failure" number -2701
+        end performClick_
+    end script
+    set presentationButton's owner to fakeStatusItem
+    set fakeStatusItem's button to presentationButton
+    repeat with fullMode in {false, true, false}
+        implementation's prepareStatusMenu(contents of fullMode)
+        implementation's showStatusMenu()
+        my assertThat((fakeStatusItem's attachedMenu's isEqual:theMenu) as boolean, "Native status-item anchoring should own the shared menu")
+        implementation's menuDidClose_(theMenu)
+        my assertThat(fakeStatusItem's attachedMenu is missing value, "Menu close must restore left/right click routing")
+    end repeat
+    my assertThat(presentationButton's clicks is 3, "Each mode should open through the native status button")
+    set presentationButton's shouldFail to true
+    set expectedError to false
+    try
+        implementation's showStatusMenu()
+    on error number errorNumber
+        set expectedError to errorNumber is -2701
+    end try
+    my assertThat(expectedError, "Presentation failures should remain observable")
+    my assertThat(fakeStatusItem's attachedMenu is missing value, "A failed presentation must not leave click routing attached")
+    set fakeStatusItem's button to nativeButton
+
     -- Exercise the unchanged submission path, writing only inside the test directory.
     if (current application's NSEvent's pressedMouseButtons()) is not 0 then
         return "PASS: " & assertions & " native AppKit assertions. SKIP: submission while a mouse button is held."

@@ -101,10 +101,27 @@ on statusItemClicked_(sender)
         set showFullMenu to my wantsFullMenu(clickEvent's type() as integer, clickEvent's modifierFlags() as integer)
     end if
     my prepareStatusMenu(showFullMenu)
-    -- Reuse the same menu and slider, including its pending request/session.
-    -- AppKit handles menu tracking, outside-click dismissal, and Esc.
-    statusMenu's popUpMenuPositioningItem:(missing value) atLocation:{0, 0} inView:(statusItem's button)
+    my showStatusMenu()
 end statusItemClicked_
+
+on showStatusMenu()
+    -- Let NSStatusItem anchor either menu below the system menu bar. A generic
+    -- pop-up at button coordinates anchors the content, not the menu's outer
+    -- frame, and can overlap the bar when the first visible item is our slider.
+    statusItem's setMenu:statusMenu
+    try
+        statusItem's button's performClick:(missing value)
+    on error errorMessage number errorNumber
+        statusItem's setMenu:(missing value)
+        error errorMessage number errorNumber
+    end try
+end showStatusMenu
+
+on menuDidClose_(sender)
+    -- Restore custom click routing after tracking ends; a permanent attachment
+    -- would make the next left/right click reopen the previous menu mode.
+    statusItem's setMenu:(missing value)
+end menuDidClose_
 
 on readJSON(fileName)
     set jsonData to current application's NSData's dataWithContentsOfFile:(appDir & fileName)
