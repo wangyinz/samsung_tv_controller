@@ -262,6 +262,11 @@ use a Windows 11-inspired design with light/dark and high-contrast themes, a thi
 volume track, and rounded corners on Windows 11. They use Windows' built-in WPF
 libraries, with no extra UI runtime to install. This controls the TV directly;
 it is not the Windows system-volume mixer. Press Esc or click outside to dismiss.
+The flyout has a short fade-in/out, respecting Windows' client-area animation and
+high-contrast settings. Reopening cancels an in-progress close; repair and log
+actions close immediately. On small or highly scaled displays, the panel fits
+the monitor work area and scrolls to keep its actions reachable. Volume track
+drags retain mouse capture so releasing outside still applies the final target.
 The status process is separate, so it remains available when the controller stops.
 On either platform, **Quit Controller** stops both the background controller and
 its status UI while leaving login startup installed for the next sign-in.
@@ -460,8 +465,9 @@ powershell.exe -NoProfile -Sta -ExecutionPolicy Bypass -File .\QN990F_Windows_Co
 PowerShell 7 on other platforms can run the same script without `-RequireWpf`
 for protocol and placement checks; WPF checks are explicitly skipped. On Windows,
 also check left/right tray clicks, drag-release and keyboard adjustment, outside
-click/Esc dismissal, and light/dark/high-contrast appearance at the display scales
-you use. These interactive checks require a Windows desktop.
+click/Esc dismissal, closing/reopening during a fade, and light/dark/high-contrast
+appearance at the display scales you use. These interactive checks require a
+Windows desktop.
 
 Do not use `--test`, `--off`, or `--wake` during automated testing: those modes
 send real commands to the configured TV.

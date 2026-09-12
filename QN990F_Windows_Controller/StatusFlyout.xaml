@@ -128,11 +128,17 @@
                 </Setter.Value>
             </Setter>
         </Style>
+        <Style TargetType="AccessText">
+            <Setter Property="TextWrapping" Value="Wrap"/>
+        </Style>
     </Window.Resources>
     <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="8" Padding="18">
-        <StackPanel>
+        <ScrollViewer x:Name="FlyoutScroll" VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled" CanContentScroll="False"
+                      Focusable="False" PanningMode="VerticalOnly">
+          <StackPanel>
             <StackPanel x:Name="StatusPanel" Margin="0,0,0,16">
-                <TextBlock Text="Samsung TV Picture Controller" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                <TextBlock Text="Samsung TV Picture Controller" FontWeight="SemiBold" Margin="0,0,0,10" TextWrapping="Wrap"/>
                 <TextBlock x:Name="ControllerItem" Text="Controller: loading" Foreground="{DynamicResource SecondaryBrush}"
                            TextWrapping="Wrap" FontSize="12"/>
                 <TextBlock x:Name="VolumeItem" Text="Keyboard volume: loading" Foreground="{DynamicResource SecondaryBrush}"
@@ -175,6 +181,7 @@
                 <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="6,8"/>
                 <Button x:Name="ExitItem" Content="_Quit controller"/>
             </StackPanel>
-        </StackPanel>
+          </StackPanel>
+        </ScrollViewer>
     </Border>
 </Window>

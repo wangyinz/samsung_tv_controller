@@ -63,6 +63,51 @@ public static class TVFlyoutNative {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern int GetWindowLong32(IntPtr hwnd, int index);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern IntPtr GetWindowLong64(IntPtr hwnd, int index);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
+    private static extern int SetWindowLong32(IntPtr hwnd, int index, int value);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern IntPtr SetWindowLong64(IntPtr hwnd, int index, IntPtr value);
+    [DllImport("user32.dll")]
+    private static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
+
+    private const long LayeredStyle = 0x80000;
+    private static IntPtr opacityWindow;
+    private static long ExtendedStyle(IntPtr hwnd) {
+        return IntPtr.Size == 8 ? GetWindowLong64(hwnd, -20).ToInt64() : GetWindowLong32(hwnd, -20);
+    }
+    private static void SetExtendedStyle(IntPtr hwnd, long style) {
+        if (IntPtr.Size == 8) { SetWindowLong64(hwnd, -20, new IntPtr(style)); }
+        else { SetWindowLong32(hwnd, -20, (int)style); }
+    }
+    public static bool SetOpacity(IntPtr hwnd, byte alpha) {
+        if (hwnd == IntPtr.Zero) { return false; }
+        if (opacityWindow != hwnd) {
+            long style = ExtendedStyle(hwnd);
+            // Do not interfere with another owner's per-pixel/layered rendering.
+            if ((style & LayeredStyle) != 0) { return false; }
+            SetExtendedStyle(hwnd, style | LayeredStyle);
+            if ((ExtendedStyle(hwnd) & LayeredStyle) == 0) { return false; }
+            opacityWindow = hwnd;
+        }
+        return SetLayeredWindowAttributes(hwnd, 0, alpha, 2);
+    }
+    public static void ResetOpacity(IntPtr hwnd) {
+        if (opacityWindow == IntPtr.Zero || opacityWindow != hwnd) { return; }
+        SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+        SetExtendedStyle(hwnd, ExtendedStyle(hwnd) & ~LayeredStyle);
+        opacityWindow = IntPtr.Zero;
+        // Restore the ordinary WPF/DWM window after each transition.
+        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, 0x37);
+    }
+    public static byte OpacityAt(double from, double to, double elapsedMs, double durationMs) {
+        double t = durationMs <= 0 ? 1 : Math.Max(0, Math.Min(1, elapsedMs / durationMs));
+        double eased = 1 - Math.Pow(1 - t, 3);
+        return (byte)Math.Max(0, Math.Min(255, Math.Round(from + (to - from) * eased)));
+    }
 
     public static void Style(IntPtr hwnd, bool dark) {
         int rounded = 2, darkMode = dark ? 1 : 0;
@@ -72,17 +117,27 @@ public static class TVFlyoutNative {
     }
 
     public static Rect Placement(Rect area, int x, int y, int width, int height) {
-        int left = Math.Max(area.Left + 8, Math.Min(x - width, area.Right - width - 8));
-        int top = Math.Max(area.Top + 8, Math.Min(y - height - 8, area.Bottom - height - 8));
+        Rect inner = InsetArea(area);
+        width = Math.Max(1, Math.Min(width, inner.Right - inner.Left));
+        height = Math.Max(1, Math.Min(height, inner.Bottom - inner.Top));
+        int left = Math.Max(inner.Left, Math.Min(x - width, inner.Right - width));
+        int top = Math.Max(inner.Top, Math.Min(y - height - 8, inner.Bottom - height));
         return new Rect { Left = left, Top = top, Right = left + width, Bottom = top + height };
+    }
+    public static Rect InsetArea(Rect area) {
+        int x = Math.Min(8, Math.Max(0, (area.Right - area.Left - 1) / 2));
+        int y = Math.Min(8, Math.Max(0, (area.Bottom - area.Top - 1) / 2));
+        return new Rect { Left = area.Left + x, Top = area.Top + y, Right = area.Right - x, Bottom = area.Bottom - y };
     }
 
     private static Point anchor;
     private static Rect workArea;
     private static bool hasAnchor;
+    public static Rect WorkArea { get { return workArea; } }
 
     public static void CaptureAnchor() {
         hasAnchor = false;
+        workArea = new Rect();
         if (!GetCursorPos(out anchor)) { return; }
         var info = new MonitorInfo { Size = Marshal.SizeOf(typeof(MonitorInfo)) };
         if (!GetMonitorInfo(MonitorFromPoint(anchor, 2), ref info)) { return; }
@@ -90,12 +145,22 @@ public static class TVFlyoutNative {
         hasAnchor = true;
     }
 
+    public static void RefreshWorkArea() {
+        if (!hasAnchor) { return; }
+        var info = new MonitorInfo { Size = Marshal.SizeOf(typeof(MonitorInfo)) };
+        if (GetMonitorInfo(MonitorFromPoint(anchor, 2), ref info)) { workArea = info.Work; }
+    }
+
     public static void Position(IntPtr hwnd) {
         Rect window;
         if (!hasAnchor || !GetWindowRect(hwnd, out window)) { return; }
         var target = Placement(workArea, anchor.X, anchor.Y, window.Right - window.Left, window.Bottom - window.Top);
-        // Native coordinates keep the flyout inside the clicked monitor's work area.
-        SetWindowPos(hwnd, IntPtr.Zero, target.Left, target.Top, 0, 0, 0x15);
+        // WPF's MaxWidth/MaxHeight normally fit the window first. The native size
+        // clamp is a final guard while a monitor/DPI change is being processed.
+        bool sameSize = target.Right - target.Left == window.Right - window.Left &&
+                        target.Bottom - target.Top == window.Bottom - window.Top;
+        SetWindowPos(hwnd, IntPtr.Zero, target.Left, target.Top,
+            target.Right - target.Left, target.Bottom - target.Top, sameSize ? 0x15u : 0x14u);
     }
 }
 '@
@@ -153,9 +218,78 @@ try {
     $ExitItem = $Flyout.FindName("ExitItem")
     $StatusPanel = $Flyout.FindName("StatusPanel")
     $ActionsPanel = $Flyout.FindName("ActionsPanel")
+    $FlyoutScroll = $Flyout.FindName("FlyoutScroll")
     $WindowHelper = New-Object System.Windows.Interop.WindowInteropHelper($Flyout)
     $WindowHandle = $WindowHelper.EnsureHandle()
     $script:Exiting = $false
+    $script:FlyoutTargetVisible = $false
+    $script:FlyoutAlpha = 255
+    $FadeTimer = [System.Windows.Forms.Timer]::new()
+    $FadeTimer.Interval = 15
+    $FadeClock = [System.Diagnostics.Stopwatch]::new()
+
+    function Set-FlyoutOpacity([byte]$Alpha) {
+        return [TVFlyoutNative]::SetOpacity($WindowHandle, $Alpha)
+    }
+
+    function Restore-FlyoutOpacity {
+        [TVFlyoutNative]::ResetOpacity($WindowHandle)
+    }
+
+    function Complete-FlyoutFade {
+        $FadeTimer.Stop()
+        if (-not $script:FlyoutTargetVisible) { $Flyout.Hide() }
+        Restore-FlyoutOpacity
+        $script:FlyoutAlpha = 255
+    }
+
+    function Start-FlyoutFade([bool]$Visible, [bool]$Animate) {
+        $FadeTimer.Stop()
+        $script:FlyoutTargetVisible = $Visible
+        $TargetAlpha = if ($Visible) { 255 } else { 0 }
+        if (-not $Animate -or $script:FlyoutAlpha -eq $TargetAlpha -or
+            -not (Set-FlyoutOpacity $script:FlyoutAlpha)) {
+            Complete-FlyoutFade
+            return
+        }
+        $script:FadeFrom = $script:FlyoutAlpha
+        $script:FadeTo = $TargetAlpha
+        $script:FadeDuration = if ($Visible) { 180 } else { 120 }
+        $FadeClock.Restart()
+        $FadeTimer.Start()
+    }
+
+    function Test-FlyoutAnimation {
+        return [System.Windows.SystemParameters]::ClientAreaAnimation -and
+            -not [System.Windows.SystemParameters]::HighContrast
+    }
+
+    # One timer owns the current transition. Reopening cancels/reverses a close;
+    # no delayed completion callback can hide a newly opened flyout.
+    $FadeTimer.Add_Tick({
+        if ($script:Exiting) { $FadeTimer.Stop(); return }
+        $Elapsed = $FadeClock.Elapsed.TotalMilliseconds
+        $script:FlyoutAlpha = [TVFlyoutNative]::OpacityAt(
+            $script:FadeFrom, $script:FadeTo, $Elapsed, $script:FadeDuration
+        )
+        if (-not (Set-FlyoutOpacity $script:FlyoutAlpha) -or
+            $Elapsed -ge $script:FadeDuration) {
+            Complete-FlyoutFade
+        }
+    })
+
+    function Set-FlyoutBounds {
+        [TVFlyoutNative]::RefreshWorkArea()
+        $Area = [TVFlyoutNative]::WorkArea
+        if ($Area.Right -le $Area.Left -or $Area.Bottom -le $Area.Top) { return }
+        $Inner = [TVFlyoutNative]::InsetArea($Area)
+        $Source = [System.Windows.Interop.HwndSource]::FromHwnd($WindowHandle)
+        $Transform = $Source.CompositionTarget.TransformFromDevice
+        $Flyout.MaxWidth = [Math]::Max(1, ($Inner.Right - $Inner.Left) * $Transform.M11)
+        $Flyout.MaxHeight = [Math]::Max(1, ($Inner.Bottom - $Inner.Top) * $Transform.M22)
+        $Flyout.Width = [Math]::Min(360, $Flyout.MaxWidth)
+        $Flyout.SizeToContent = "Height"
+    }
 
     function Set-FlyoutTheme {
         $ThemePath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
@@ -194,34 +328,49 @@ try {
     }
 
     function Show-Flyout([bool]$FullMenu) {
+        $FadeTimer.Stop()
+        $script:FlyoutTargetVisible = $true
+        $Animate = Test-FlyoutAnimation
+        if (-not $Flyout.IsVisible) { $script:FlyoutAlpha = if ($Animate) { 0 } else { 255 } }
+        if ($Animate -and -not (Set-FlyoutOpacity $script:FlyoutAlpha)) {
+            $Animate = $false
+        }
         [TVFlyoutNative]::CaptureAnchor()
         Update-TrayStatus
         Set-FlyoutTheme
         $PanelVisibility = if ($FullMenu) { "Visible" } else { "Collapsed" }
         $StatusPanel.Visibility = $PanelVisibility
         $ActionsPanel.Visibility = $PanelVisibility
-        $Flyout.Opacity = 0
+        $Flyout.IsHitTestVisible = $true
+        $Flyout.IsEnabled = $true
+        $FlyoutScroll.ScrollToTop()
+        Set-FlyoutBounds
         $Flyout.Show()
         $Flyout.UpdateLayout()
         [TVFlyoutNative]::Position($WindowHandle)
+        # Moving to another monitor may change the WPF pixel-to-DIP transform.
+        Set-FlyoutBounds
         $Flyout.UpdateLayout()
         [TVFlyoutNative]::Position($WindowHandle)
-        $Flyout.Opacity = 1
         [void][TVFlyoutNative]::SetForegroundWindow($WindowHandle)
         [void]$Flyout.Activate()
         if ($VolumeSlider.IsEnabled) { [void]$VolumeSlider.Focus() }
         elseif ($FullMenu) { [void]$ConfigureItem.Focus() }
+        Start-FlyoutFade $true $Animate
     }
 
-    function Hide-Flyout {
-        $script:VolumeDragging = $false
+    function Hide-Flyout([bool]$Immediate = $false) {
         $script:VolumeEditing = $false
-        Submit-Volume
-        $Flyout.Hide()
+        Complete-VolumeDrag
+        if (-not $Flyout.IsVisible) { return }
+        if (-not $script:FlyoutTargetVisible -and -not $Immediate) { return }
+        $Flyout.IsHitTestVisible = $false
+        $Flyout.IsEnabled = $false
+        Start-FlyoutFade $false (-not $Immediate -and (Test-FlyoutAnimation))
     }
 
     $Flyout.Add_Deactivated({
-        if ($Flyout.IsVisible -and -not $script:Exiting) { Hide-Flyout }
+        if ($script:FlyoutTargetVisible -and -not $script:Exiting) { Hide-Flyout }
     })
     $Flyout.Add_PreviewKeyDown({
         param($Source, $EventArgs)
@@ -234,11 +383,20 @@ try {
         param($Source, $EventArgs)
         if (-not $script:Exiting) {
             $EventArgs.Cancel = $true
-            Hide-Flyout
+            Hide-Flyout $true
         }
     })
     $Flyout.Add_SizeChanged({
         if ($Flyout.IsVisible) { [TVFlyoutNative]::Position($WindowHandle) }
+    })
+    $Flyout.Add_DpiChanged({
+        # Let WPF finish updating its DPI transform before measuring again.
+        [void]$Flyout.Dispatcher.BeginInvoke([Action]{
+            if ($script:Exiting -or -not $Flyout.IsVisible) { return }
+            Set-FlyoutBounds
+            $Flyout.UpdateLayout()
+            [TVFlyoutNative]::Position($WindowHandle)
+        }, [System.Windows.Threading.DispatcherPriority]::Loaded)
     })
 
     function Show-TrayError([string]$Message) {
@@ -254,6 +412,7 @@ try {
     $script:PendingVolumeId = ""
     $script:PendingVolumeTime = [DateTime]::MinValue
     $script:VolumeDragging = $false
+    $script:TrackDragging = $false
     $script:VolumeEditing = $false
     $script:VolumeSyncing = $false
     $script:VolumeDirty = $false
@@ -281,29 +440,69 @@ try {
             $VolumeNotice.Text = "Setting TV volume to $([int]$VolumeSlider.Value)..."
         } catch { Show-TrayError $_.Exception.Message }
     }
-    # Observe the tunneling event at the window BEFORE Slider's class handler
-    # changes Value for a track click. Do not send cloud requests while dragging.
+    function Complete-VolumeDrag {
+        $script:VolumeDragging = $false
+        $script:TrackDragging = $false
+        if ($VolumeSlider.IsMouseCaptured) { $VolumeSlider.ReleaseMouseCapture() }
+        Submit-Volume
+    }
+
+    function Set-VolumeFromPointer($EventArgs) {
+        if ($null -eq $VolumeSlider.Template) { return }
+        $Track = $VolumeSlider.Template.FindName("PART_Track", $VolumeSlider)
+        if ($null -eq $Track) { return }
+        $Value = $Track.ValueFromPoint($EventArgs.GetPosition($Track))
+        if (-not [double]::IsNaN($Value) -and -not [double]::IsInfinity($Value)) {
+            $VolumeSlider.Value = [Math]::Max(0, [Math]::Min(100, [Math]::Round($Value)))
+        }
+    }
+
+    # Observe the tunneling event before Slider's move-to-point class handler.
+    # Thumb drags keep WPF's own capture; track drags need their own capture so
+    # releasing outside the flyout still submits exactly one final target.
     $Flyout.Add_PreviewMouseDown({
         param($Source, $EventArgs)
         if ($EventArgs.ChangedButton -eq [System.Windows.Input.MouseButton]::Left -and
-            $VolumeSlider.IsMouseOver) {
+            $VolumeSlider.IsEnabled -and $VolumeSlider.IsMouseOver) {
+            if ($null -eq $VolumeSlider.Template) { return }
+            $Track = $VolumeSlider.Template.FindName("PART_Track", $VolumeSlider)
+            if ($null -eq $Track) { return }
             $script:VolumeDragging = $true
+            if (-not $Track.Thumb.IsMouseOver) {
+                $script:TrackDragging = $VolumeSlider.CaptureMouse()
+                # If capture was refused, let ValueChanged apply the track click
+                # immediately instead of leaving the UI in a stuck drag state.
+                $script:VolumeDragging = $script:TrackDragging
+            }
+        }
+    })
+    $VolumeSlider.Add_PreviewMouseMove({
+        param($Source, $EventArgs)
+        if (-not $script:TrackDragging) { return }
+        if ($EventArgs.LeftButton -eq [System.Windows.Input.MouseButtonState]::Released) {
+            Complete-VolumeDrag
+        } else {
+            Set-VolumeFromPointer $EventArgs
         }
     })
     $Flyout.Add_PreviewMouseUp({
         param($Source, $EventArgs)
         if ($EventArgs.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) {
-            $script:VolumeDragging = $false
-            Submit-Volume
+            if ($script:TrackDragging) { Set-VolumeFromPointer $EventArgs }
+            Complete-VolumeDrag
         }
     })
     $VolumeSlider.AddHandler(
         [System.Windows.Controls.Primitives.Thumb]::DragCompletedEvent,
         [System.Windows.Controls.Primitives.DragCompletedEventHandler]{
-            $script:VolumeDragging = $false
-            Submit-Volume
+            Complete-VolumeDrag
         }, $true
     )
+    $VolumeSlider.Add_LostMouseCapture({
+        if ($script:VolumeDragging -and -not $VolumeSlider.IsMouseCaptureWithin) {
+            Complete-VolumeDrag
+        }
+    })
     $VolumeSlider.Add_PreviewKeyDown({
         param($Source, $EventArgs)
         if ($EventArgs.Key.ToString() -in @("Left", "Right", "Up", "Down", "Home", "End", "PageUp", "PageDown")) {
@@ -405,17 +604,17 @@ try {
     }
 
     $ConfigureItem.Add_Click({
-        Hide-Flyout
+        Hide-Flyout $true
         try { Start-ControllerHelper $ConfigurePath }
         catch { Show-TrayError $_.Exception.Message }
     })
     $ReauthorizeItem.Add_Click({
-        Hide-Flyout
+        Hide-Flyout $true
         try { Start-ControllerHelper $ReauthorizePath }
         catch { Show-TrayError $_.Exception.Message }
     })
     $LogItem.Add_Click({
-        Hide-Flyout
+        Hide-Flyout $true
         try {
             if (-not (Test-Path -LiteralPath $LogPath)) {
                 throw "The controller log does not exist yet."
@@ -424,7 +623,7 @@ try {
         } catch { Show-TrayError $_.Exception.Message }
     })
     $RestartItem.Add_Click({
-        Hide-Flyout
+        Hide-Flyout $true
         try {
             Stop-Controller
             if (-not (Test-Path -LiteralPath $PythonWPath)) {
@@ -450,7 +649,12 @@ try {
             } elseif ($EventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
                 Show-Flyout $true
             }
-        } catch { Show-TrayError $_.Exception.Message }
+        } catch {
+            $Message = $_.Exception.Message
+            $script:FlyoutTargetVisible = $false
+            Complete-FlyoutFade
+            Show-TrayError $Message
+        }
     })
 
     $script:LastState = $null
@@ -530,9 +734,11 @@ try {
     $Timer.Start()
     [System.Windows.Forms.Application]::Run()
 } finally {
+    $script:Exiting = $true
+    if ($FadeTimer) { $FadeTimer.Stop(); $FadeTimer.Dispose() }
+    if ($WindowHandle) { [TVFlyoutNative]::ResetOpacity($WindowHandle) }
     if ($Timer) { $Timer.Stop(); $Timer.Dispose() }
     if ($Notify) { $Notify.Visible = $false; $Notify.Dispose() }
-    $script:Exiting = $true
     if ($Flyout) { $Flyout.Close() }
     if ($ReadyIcon) { $ReadyIcon.Dispose() }
     if ($AttentionIcon) { $AttentionIcon.Dispose() }

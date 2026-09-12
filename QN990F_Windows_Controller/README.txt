@@ -162,6 +162,12 @@ Notification-area icon:
     theme. This is the controller's own TV-volume UI, not the Windows audio mixer.
     No additional UI runtime is installed; it uses Windows' built-in WPF libraries.
     Press Esc or click outside to dismiss the panel without stopping the controller.
+    Opening fades in over 180 ms; dismissal fades out over 120 ms. Animations are
+    skipped when Windows client-area animations are disabled or high contrast is on.
+    Reopening during a fade cancels the old close. Repair/log actions close immediately.
+    The panel fits the clicked monitor's work area; on small/high-scaling displays,
+    scroll to reach all actions. Track clicks and drags also apply when released
+    outside the panel, without streaming intermediate volume requests.
     A recognizable TV icon has a yellow ! badge when attention is needed and a red x
     badge when the controller is stopped. It notifies once on these state changes.
     Quit Controller stops both the controller and notification icon; the Startup
