@@ -114,7 +114,10 @@ automatic Picture Off idle interval. Enter 0 to disable automatic blanking.
 Keep the TV connected to this Mac through HDMI during installation. The installer
 asks you to bind the TV's physical display identity (EDID). USB-C to HDMI adapters
 that expose the TV's native EDID are supported. If the display cannot be identified,
-installation stops. Existing installations must run INSTALL.command or
+installation stops. Newer Apple Silicon built-in HDMI ports are verified through
+their live native port transport, including connection-active, hot-plug, and ready
+states. A cached EDID or a virtual display alone cannot enable TV commands.
+Existing installations must run INSTALL.command or
 Configure.command once to create the HDMI binding; without it the controller
 will not send any TV commands. The binding is checked again before every TV
 command, including SmartThings cloud commands. Disconnecting HDMI leaves Mac

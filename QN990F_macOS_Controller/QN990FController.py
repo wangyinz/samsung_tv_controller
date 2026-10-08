@@ -200,6 +200,18 @@ def _online_display_ids():
     ) for display in displays]
 
 
+def _active_native_hdmi_port(properties, ancestors, parent_connected):
+    """Fail closed on cached EDID from a disconnected Apple Silicon HDMI port."""
+    return (
+        parent_connected is True
+        and "applehdmiportcontroller" in ancestors
+        and properties.get("Active") is True
+        and properties.get("HPD_StateDescription") == "High"
+        and properties.get("DriverStatusDescription") == "Ready"
+        and properties.get("RoleDescription") == "Source"
+    )
+
+
 def _hdmi_display_edids():
     """Read live EDID only from native, wired I/O Kit display providers."""
     iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
@@ -229,70 +241,99 @@ def _hdmi_display_edids():
     cf.CFDataGetLength.restype = c_long
     cf.CFDataGetBytePtr.argtypes = [c_void_p]
     cf.CFDataGetBytePtr.restype = POINTER(c_uint8)
-    key = cf.CFStringCreateWithCString(None, b"IODisplayEDID", 0x08000100)
-    if not key:
-        raise RuntimeError("Could not inspect display EDID")
+    cf.CFBooleanGetTypeID.restype = c_ulong
+    cf.CFBooleanGetValue.argtypes = [c_void_p]
+    cf.CFBooleanGetValue.restype = c_bool
+    cf.CFStringGetTypeID.restype = c_ulong
+    cf.CFStringGetCString.argtypes = [c_void_p, ctypes.c_char_p, c_long, c_uint32]
+    cf.CFStringGetCString.restype = c_bool
+
+    def read_property(service, name):
+        key = cf.CFStringCreateWithCString(None, name.encode("ascii"), 0x08000100)
+        if not key:
+            raise RuntimeError("Could not inspect display property")
+        try:
+            value = iokit.IORegistryEntryCreateCFProperty(service, key, None, 0)
+        finally:
+            cf.CFRelease(key)
+        if not value:
+            return None
+        try:
+            kind = cf.CFGetTypeID(value)
+            if kind == cf.CFDataGetTypeID():
+                length = cf.CFDataGetLength(value)
+                if 128 <= length <= 2048:
+                    return ctypes.string_at(cf.CFDataGetBytePtr(value), length)
+            elif kind == cf.CFBooleanGetTypeID():
+                return bool(cf.CFBooleanGetValue(value))
+            elif kind == cf.CFStringGetTypeID():
+                buffer = ctypes.create_string_buffer(256)
+                if cf.CFStringGetCString(value, buffer, len(buffer), 0x08000100):
+                    return buffer.value.decode("utf-8")
+            return None
+        finally:
+            cf.CFRelease(value)
+
     edids = []
     seen_services = set()
-    try:
-        for service_class in (b"IODisplayConnect", b"AppleDisplay"):
-            iterator = c_uint32()
-            matching = iokit.IOServiceMatching(service_class)
-            if not matching or iokit.IOServiceGetMatchingServices(0, matching, ctypes.byref(iterator)) != 0:
-                raise RuntimeError("Could not enumerate physical displays")
-            try:
-                while service := iokit.IOIteratorNext(iterator.value):
+    for service_class in (b"IODisplayConnect", b"AppleDisplay", b"IOPortTransportStateDisplayPort"):
+        # Newer Apple Silicon exposes the EDID on the live port transport,
+        # not on an AppleDisplay/IODisplayConnect node. It is still HDMI
+        # downstream even though the SoC-side transport is named DisplayPort.
+        modern_port = service_class == b"IOPortTransportStateDisplayPort"
+        iterator = c_uint32()
+        matching = iokit.IOServiceMatching(service_class)
+        if not matching or iokit.IOServiceGetMatchingServices(0, matching, ctypes.byref(iterator)) != 0:
+            raise RuntimeError("Could not enumerate physical displays")
+        try:
+            while service := iokit.IOIteratorNext(iterator.value):
+                try:
+                    service_id = ctypes.c_uint64()
+                    if iokit.IORegistryEntryGetRegistryEntryID(service, ctypes.byref(service_id)) != 0:
+                        continue
+                    if service_id.value in seen_services:
+                        continue
+                    seen_services.add(service_id.value)
+                    edid = read_property(service, "EDID" if modern_port else "IODisplayEDID")
+                    if not _hdmi_edid(edid):
+                        continue
+                    ancestors = []
+                    parent_connected = False
+                    current = service
+                    held = []
                     try:
-                        service_id = ctypes.c_uint64()
-                        if iokit.IORegistryEntryGetRegistryEntryID(service, ctypes.byref(service_id)) != 0:
-                            continue
-                        if service_id.value in seen_services:
-                            continue
-                        seen_services.add(service_id.value)
-                        value = iokit.IORegistryEntryCreateCFProperty(service, key, None, 0)
-                        if not value:
-                            continue
-                        try:
-                            if cf.CFGetTypeID(value) != cf.CFDataGetTypeID():
-                                continue
-                            length = cf.CFDataGetLength(value)
-                            if length < 128 or length > 2048:
-                                continue
-                            edid = ctypes.string_at(cf.CFDataGetBytePtr(value), length)
-                        finally:
-                            cf.CFRelease(value)
-                        if not _hdmi_edid(edid):
-                            continue
-                        ancestors = []
-                        current = service
-                        held = []
-                        try:
-                            for _ in range(32):
-                                parent = c_uint32()
-                                if iokit.IORegistryEntryGetParentEntry(current, b"IOService", ctypes.byref(parent)) != 0:
-                                    break
-                                held.append(parent.value)
-                                class_name = ctypes.create_string_buffer(128)
-                                if iokit.IOObjectGetClass(parent.value, class_name) != 0:
-                                    break
-                                ancestors.append(class_name.value.decode("ascii", "replace").lower())
-                                current = parent.value
-                        finally:
-                            for parent in held:
-                                iokit.IOObjectRelease(parent)
-                        if any(word in name for name in ancestors for word in
-                               ("airplay", "sidecar", "virtual", "remote", "displaylink")):
-                            continue
-                        if not any(word in name for name in ancestors for word in
-                                   ("ioframebuffer", "appledcp", "iomobileframebuffer")):
-                            continue
-                        edids.append(edid)
+                        for _ in range(32):
+                            parent = c_uint32()
+                            if iokit.IORegistryEntryGetParentEntry(current, b"IOService", ctypes.byref(parent)) != 0:
+                                break
+                            held.append(parent.value)
+                            class_name = ctypes.create_string_buffer(128)
+                            if iokit.IOObjectGetClass(parent.value, class_name) != 0:
+                                break
+                            ancestors.append(class_name.value.decode("ascii", "replace").lower())
+                            if ancestors[-1] == "applehdmiportcontroller":
+                                parent_connected = read_property(parent.value, "ConnectionActive") is True
+                            current = parent.value
                     finally:
-                        iokit.IOObjectRelease(service)
-            finally:
-                iokit.IOObjectRelease(iterator.value)
-    finally:
-        cf.CFRelease(key)
+                        for parent in held:
+                            iokit.IOObjectRelease(parent)
+                    if any(word in name for name in ancestors for word in
+                           ("airplay", "sidecar", "virtual", "remote", "displaylink")):
+                        continue
+                    if modern_port:
+                        properties = {name: read_property(service, name) for name in (
+                            "Active", "HPD_StateDescription", "DriverStatusDescription", "RoleDescription"
+                        )}
+                        if not _active_native_hdmi_port(properties, ancestors, parent_connected):
+                            continue
+                    elif not any(word in name for name in ancestors for word in
+                                 ("ioframebuffer", "appledcp", "iomobileframebuffer")):
+                        continue
+                    edids.append(edid)
+                finally:
+                    iokit.IOObjectRelease(service)
+        finally:
+            iokit.IOObjectRelease(iterator.value)
     return edids
 
 

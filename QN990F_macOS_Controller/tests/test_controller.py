@@ -57,6 +57,47 @@ def samsung_hdmi_edid(product=42, serial=123, hdmi=True):
 
 
 class HdmiBindingTests(unittest.TestCase):
+    def test_apple_silicon_native_hdmi_requires_live_port_signals(self):
+        properties = {
+            "Active": True,
+            "HPD_StateDescription": "High",
+            "DriverStatusDescription": "Ready",
+            "RoleDescription": "Source",
+        }
+        ancestors = ["applehdmiportcontroller", "appleatcdphdmiport"]
+        self.assertTrue(controller._active_native_hdmi_port(properties, ancestors, True))
+        for name, value in (
+            ("Active", False), ("Active", 1),
+            ("HPD_StateDescription", "Low"),
+            ("DriverStatusDescription", "Offline"),
+            ("RoleDescription", "Sink"),
+        ):
+            with self.subTest(name=name, value=value):
+                self.assertFalse(controller._active_native_hdmi_port(
+                    {**properties, name: value}, ancestors, True
+                ))
+        for name in properties:
+            with self.subTest(missing=name):
+                self.assertFalse(controller._active_native_hdmi_port(
+                    {k: v for k, v in properties.items() if k != name}, ancestors, True
+                ))
+        self.assertFalse(controller._active_native_hdmi_port(properties, ancestors, False))
+        self.assertFalse(controller._active_native_hdmi_port(properties, ancestors, None))
+        self.assertFalse(controller._active_native_hdmi_port(properties, ["virtualdisplay"], True))
+
+    def test_hdmi_binding_still_requires_online_identity_and_exact_hash(self):
+        tv = samsung_hdmi_edid()
+        binding = {"tv_hdmi_edid_sha256": controller.hashlib.sha256(tv).hexdigest()}
+        with mock.patch.object(controller, "_hdmi_display_edids", return_value=[tv]):
+            # A BetterDisplay-style virtual display cannot stand in for the TV.
+            with mock.patch.object(controller, "_online_display_ids", return_value=[(0x1234, 0x5678, 123)]):
+                self.assertFalse(controller.hdmi_tv_connected(binding))
+            with mock.patch.object(controller, "_online_display_ids", return_value=[
+                (0x1234, 0x5678, 123), (0x4c2d, 42, 123)
+            ]):
+                self.assertTrue(controller.hdmi_tv_connected(binding))
+                self.assertFalse(controller.hdmi_tv_connected({"tv_hdmi_edid_sha256": "0" * 64}))
+
     def test_only_online_unique_samsung_hdmi_edid_is_bindable(self):
         tv = samsung_hdmi_edid()
         other = samsung_hdmi_edid(product=43)
