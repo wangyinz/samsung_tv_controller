@@ -8,6 +8,7 @@ from ctypes import (
     c_void_p, POINTER, Structure,
 )
 import fcntl
+import hashlib
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -47,6 +48,7 @@ SMARTTHINGS_OAUTH_CLIENT_ID = "d18cf96e-c626-4433-bf51-ddbb10c5d1ed"
 SMARTTHINGS_OAUTH_TOKEN_URL = (
     "https://auth-global.api.smartthings.com/oauth/token"
 )
+SMARTTHINGS_API_URL = "https://api.smartthings.com/v1"
 SMARTTHINGS_REFRESH_WINDOW = timedelta(hours=6)
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 3
@@ -82,6 +84,7 @@ DEFAULT_CONFIG = {
     "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": True,
     "tv_audio_output_uid": "",
+    "tv_hdmi_edid_sha256": "",
     "tv_volume_floor": 10,
     "tv_volume_refresh_seconds": 30.0,
 }
@@ -114,6 +117,9 @@ class BoundedRotatingFileHandler(RotatingFileHandler):
 
 
 logger = logging.getLogger("QN990FController")
+_status_hdmi_connected = None
+_hdmi_probe_warning_at = 0.0
+_hdmi_probe_warning_lock = threading.Lock()
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     h = BoundedRotatingFileHandler(
@@ -142,6 +148,186 @@ def audio_output_matches(bound_uid, current_uid):
     bound = physical_audio_output_uid(bound_uid)
     current = physical_audio_output_uid(current_uid)
     return bool(bound) and bound == current
+
+
+def _hdmi_edid(edid):
+    """An attached display must advertise an HDMI vendor data block."""
+    if not isinstance(edid, bytes) or len(edid) < 128 or edid[:8] != bytes.fromhex("00ffffffffffff00"):
+        return False
+    if len(edid) < (int(edid[126]) + 1) * 128 or sum(edid[:128]) % 256:
+        return False
+    for index in range(min(edid[126], len(edid) // 128 - 1)):
+        extension = edid[(index + 1) * 128:(index + 2) * 128]
+        if len(extension) != 128 or extension[0] != 2 or sum(extension) % 256:
+            continue
+        end = extension[2]
+        if end < 4 or end > 127:
+            continue
+        position = 4
+        while position < min(end, 127):
+            header = extension[position]
+            size = header & 31
+            next_position = position + 1 + size
+            if next_position > end or next_position > 127:
+                break
+            if header >> 5 == 3 and size >= 3 and extension[position + 1:position + 4] in (
+                bytes.fromhex("030c00"), bytes.fromhex("d85dc4")
+            ):
+                return True
+            position = next_position
+    return False
+
+
+def _online_display_ids():
+    coregraphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    coregraphics.CGGetOnlineDisplayList.argtypes = [c_uint32, POINTER(c_uint32), POINTER(c_uint32)]
+    coregraphics.CGGetOnlineDisplayList.restype = c_int32
+    count = c_uint32()
+    if coregraphics.CGGetOnlineDisplayList(0, None, ctypes.byref(count)) != 0 or count.value > 32:
+        raise RuntimeError("Could not enumerate online displays")
+    displays = (c_uint32 * count.value)()
+    if coregraphics.CGGetOnlineDisplayList(count.value, displays, ctypes.byref(count)) != 0:
+        raise RuntimeError("Could not enumerate online displays")
+    for name in ("CGDisplayVendorNumber", "CGDisplayModelNumber", "CGDisplaySerialNumber"):
+        fn = getattr(coregraphics, name)
+        fn.argtypes = [c_uint32]
+        fn.restype = c_uint32
+    return [(
+        int(coregraphics.CGDisplayVendorNumber(display)),
+        int(coregraphics.CGDisplayModelNumber(display)),
+        int(coregraphics.CGDisplaySerialNumber(display)),
+    ) for display in displays]
+
+
+def _hdmi_display_edids():
+    """Read live EDID only from native, wired I/O Kit display providers."""
+    iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+    iokit.IOServiceMatching.restype = c_void_p
+    iokit.IOServiceGetMatchingServices.argtypes = [c_uint32, c_void_p, POINTER(c_uint32)]
+    iokit.IOServiceGetMatchingServices.restype = c_int32
+    iokit.IOIteratorNext.argtypes = [c_uint32]
+    iokit.IOIteratorNext.restype = c_uint32
+    iokit.IOObjectRelease.argtypes = [c_uint32]
+    iokit.IORegistryEntryGetParentEntry.argtypes = [c_uint32, ctypes.c_char_p, POINTER(c_uint32)]
+    iokit.IORegistryEntryGetParentEntry.restype = c_int32
+    iokit.IOObjectGetClass.argtypes = [c_uint32, ctypes.c_void_p]
+    iokit.IOObjectGetClass.restype = c_int32
+    iokit.IORegistryEntryGetRegistryEntryID.argtypes = [c_uint32, POINTER(ctypes.c_uint64)]
+    iokit.IORegistryEntryGetRegistryEntryID.restype = c_int32
+    iokit.IORegistryEntryCreateCFProperty.argtypes = [c_uint32, c_void_p, c_void_p, c_uint32]
+    iokit.IORegistryEntryCreateCFProperty.restype = c_void_p
+    cf.CFStringCreateWithCString.argtypes = [c_void_p, ctypes.c_char_p, c_uint32]
+    cf.CFStringCreateWithCString.restype = c_void_p
+    cf.CFRelease.argtypes = [c_void_p]
+    cf.CFGetTypeID.argtypes = [c_void_p]
+    cf.CFGetTypeID.restype = c_ulong
+    cf.CFDataGetTypeID.restype = c_ulong
+    cf.CFDataGetLength.argtypes = [c_void_p]
+    cf.CFDataGetLength.restype = c_long
+    cf.CFDataGetBytePtr.argtypes = [c_void_p]
+    cf.CFDataGetBytePtr.restype = POINTER(c_uint8)
+    key = cf.CFStringCreateWithCString(None, b"IODisplayEDID", 0x08000100)
+    if not key:
+        raise RuntimeError("Could not inspect display EDID")
+    edids = []
+    seen_services = set()
+    try:
+        for service_class in (b"IODisplayConnect", b"AppleDisplay"):
+            iterator = c_uint32()
+            matching = iokit.IOServiceMatching(service_class)
+            if not matching or iokit.IOServiceGetMatchingServices(0, matching, ctypes.byref(iterator)) != 0:
+                raise RuntimeError("Could not enumerate physical displays")
+            try:
+                while service := iokit.IOIteratorNext(iterator.value):
+                    try:
+                        service_id = ctypes.c_uint64()
+                        if iokit.IORegistryEntryGetRegistryEntryID(service, ctypes.byref(service_id)) != 0:
+                            continue
+                        if service_id.value in seen_services:
+                            continue
+                        seen_services.add(service_id.value)
+                        value = iokit.IORegistryEntryCreateCFProperty(service, key, None, 0)
+                        if not value:
+                            continue
+                        try:
+                            if cf.CFGetTypeID(value) != cf.CFDataGetTypeID():
+                                continue
+                            length = cf.CFDataGetLength(value)
+                            if length < 128 or length > 2048:
+                                continue
+                            edid = ctypes.string_at(cf.CFDataGetBytePtr(value), length)
+                        finally:
+                            cf.CFRelease(value)
+                        if not _hdmi_edid(edid):
+                            continue
+                        ancestors = []
+                        current = service
+                        held = []
+                        try:
+                            for _ in range(32):
+                                parent = c_uint32()
+                                if iokit.IORegistryEntryGetParentEntry(current, b"IOService", ctypes.byref(parent)) != 0:
+                                    break
+                                held.append(parent.value)
+                                class_name = ctypes.create_string_buffer(128)
+                                if iokit.IOObjectGetClass(parent.value, class_name) != 0:
+                                    break
+                                ancestors.append(class_name.value.decode("ascii", "replace").lower())
+                                current = parent.value
+                        finally:
+                            for parent in held:
+                                iokit.IOObjectRelease(parent)
+                        if any(word in name for name in ancestors for word in
+                               ("airplay", "sidecar", "virtual", "remote", "displaylink")):
+                            continue
+                        if not any(word in name for name in ancestors for word in
+                                   ("ioframebuffer", "appledcp", "iomobileframebuffer")):
+                            continue
+                        edids.append(edid)
+                    finally:
+                        iokit.IOObjectRelease(service)
+            finally:
+                iokit.IOObjectRelease(iterator.value)
+    finally:
+        cf.CFRelease(key)
+    return edids
+
+
+def available_hdmi_tv_bindings():
+    """Match CoreGraphics online displays to physical HDMI EDID records."""
+    online = _online_display_ids()
+    bindings = []
+    for edid in _hdmi_display_edids():
+        vendor = int.from_bytes(edid[8:10], "big")
+        product = int.from_bytes(edid[10:12], "little")
+        serial = int.from_bytes(edid[12:16], "little")
+        if vendor != 0x4c2d or online.count((vendor, product, serial)) != 1:
+            continue
+        bindings.append({
+            "vendor": vendor, "product": product, "serial": serial,
+            "edid_sha256": hashlib.sha256(edid).hexdigest(),
+        })
+    # Repeated identical EDIDs cannot identify the intended physical TV.
+    hashes = [item["edid_sha256"] for item in bindings]
+    return [item for item in bindings if hashes.count(item["edid_sha256"]) == 1]
+
+
+def hdmi_tv_connected(cfg):
+    global _hdmi_probe_warning_at
+    expected = str(cfg.get("tv_hdmi_edid_sha256", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return False
+    try:
+        return any(item["edid_sha256"] == expected for item in available_hdmi_tv_bindings())
+    except Exception as exc:
+        with _hdmi_probe_warning_lock:
+            now = time.monotonic()
+            if now >= _hdmi_probe_warning_at:
+                _hdmi_probe_warning_at = now + 60.0
+                logger.warning("Cannot verify TV HDMI attachment: %s", exc)
+        return False
 
 
 class EventTypeSpec(Structure):
@@ -885,6 +1071,7 @@ def load_config():
     cfg["tv_audio_output_uid"] = physical_audio_output_uid(
         cfg.get("tv_audio_output_uid", "")
     )
+    cfg["tv_hdmi_edid_sha256"] = str(cfg.get("tv_hdmi_edid_sha256", "")).lower()
     cfg["tv_volume_floor"] = min(100, max(0, int(cfg.get("tv_volume_floor", 10))))
     cfg["tv_volume_refresh_seconds"] = max(
         30.0, float(cfg.get("tv_volume_refresh_seconds", 30.0))
@@ -930,6 +1117,8 @@ def load_config():
 
 def write_status(**kwargs):
     try:
+        if "hdmi_connected" not in kwargs and _status_hdmi_connected is not None:
+            kwargs["hdmi_connected"] = _status_hdmi_connected
         STATUS_FILE.write_text(json.dumps({
             "pid": os.getpid(), "timestamp": time.time(), **kwargs
         }, indent=2), encoding="utf-8")
@@ -1097,6 +1286,8 @@ class TVClient:
         )
 
     def pair(self):
+        if not hdmi_tv_connected(self.cfg):
+            raise RuntimeError("Bound TV is not connected by HDMI")
         tv = self._new(pairing=True)
         try: tv.open()
         finally:
@@ -1113,8 +1304,16 @@ class TVClient:
         with self._lock:
             for attempt in range(2):
                 try:
+                    if not hdmi_tv_connected(self.cfg):
+                        logger.info("Skipped %s: bound TV is not connected by HDMI", key)
+                        self._reset()
+                        return False
                     if self._tv is None:
                         self._tv = self._new()
+                        self._tv.open()
+                    if not hdmi_tv_connected(self.cfg):
+                        self._reset()
+                        return False
                     self._tv.send_key(
                         key, key_press_delay=float(self.cfg["key_press_delay_seconds"])
                     )
@@ -1140,6 +1339,11 @@ class SmartThingsAuthRequired(RuntimeError):
     pass
 
 
+class SmartThingsCommandRejected(RuntimeError):
+    """The service explicitly rejected a command before its effect."""
+    pass
+
+
 class SmartThingsTVClient:
     # Samsung's TV web plugin maps the Accessibility Mode button to
     # KEY_PICTURE_OFF/Click, then maps Click to this OCF pressAndRelease write.
@@ -1147,6 +1351,50 @@ class SmartThingsTVClient:
     REMOTE_MARKER_CAPABILITY = "samsungvd.remoteControl"
     AUDIO_VOLUME_CAPABILITY = "audioVolume"
     REMOTE_RESOURCE = "/sec/tv/remotecontrol"
+
+    def _api_request(self, method, path, payload, timeout):
+        credentials = json.loads(SMARTTHINGS_CREDENTIALS_FILE.read_text(encoding="utf-8-sig"))
+        credential = credentials.get(self._credential_key(), {})
+        token = credential.get("accessToken")
+        if not isinstance(token, str) or not token:
+            raise SmartThingsAuthRequired("Saved SmartThings access token is missing.")
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib_request.Request(
+            SMARTTHINGS_API_URL + path,
+            data=body,
+            headers={
+                "Authorization": "Bearer " + token,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        if method == "POST" and path.endswith("/commands") and not hdmi_tv_connected(self.cfg):
+            raise RuntimeError("Bound TV is not connected by HDMI")
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+
+    @staticmethod
+    def _command_receipt(output, command):
+        try:
+            results = json.loads(output)["results"]
+            if not isinstance(results, list) or len(results) != 1:
+                raise ValueError("unexpected result count")
+            receipt = results[0]
+            status = receipt["status"]
+            command_id = receipt["id"]
+            if not isinstance(command_id, str) or not command_id:
+                raise ValueError("missing command ID")
+            if status == "FAILED":
+                raise SmartThingsCommandRejected(
+                    "SmartThings reported FAILED for {} id={}".format(command, command_id)
+                )
+            if status not in {"ACCEPTED", "COMPLETED"}:
+                raise ValueError("command rejected or missing receipt")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("SmartThings command receipt was missing or failed.") from exc
+        logger.info("SmartThings %s receipt status=%s id=%s; TV panel unverified", command, status, command_id)
+        return status
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -1302,7 +1550,8 @@ class SmartThingsTVClient:
         ).strip()
         return detail[-1200:] if len(detail) > 1200 else detail
 
-    def _run(self, *args, timeout=None, allow_login=False, force_login=False):
+    def _run(self, *args, timeout=None, allow_login=False, force_login=False,
+             api_request=None):
         auth_message = (
             "SmartThings authorization requires user interaction; "
             "run Reauthorize.command."
@@ -1350,6 +1599,38 @@ class SmartThingsTVClient:
                             self._authorization_required = True
                             raise SmartThingsAuthRequired(auth_message) from exc
                         self._remove_saved_authorization()
+
+                if api_request is not None:
+                    method, path, payload = api_request
+                    try:
+                        return self._api_request(method, path, payload, command_timeout)
+                    except urllib_error.HTTPError as exc:
+                        if exc.code != 401:
+                            if 400 <= exc.code < 500:
+                                raise SmartThingsCommandRejected(
+                                    f"SmartThings API rejected command with HTTP {exc.code}."
+                                ) from exc
+                            raise RuntimeError(
+                                f"SmartThings API returned HTTP {exc.code}."
+                            ) from exc
+                        try:
+                            self._refresh_saved_authorization(command_timeout, force=True)
+                        except SmartThingsAuthRequired as refresh_error:
+                            self._authorization_required = True
+                            raise SmartThingsAuthRequired(auth_message) from refresh_error
+                        try:
+                            return self._api_request(method, path, payload, command_timeout)
+                        except urllib_error.HTTPError as retry_error:
+                            if retry_error.code == 401:
+                                self._authorization_required = True
+                                raise SmartThingsAuthRequired(auth_message) from retry_error
+                            if 400 <= retry_error.code < 500:
+                                raise SmartThingsCommandRejected(
+                                    f"SmartThings API rejected command with HTTP {retry_error.code}."
+                                ) from retry_error
+                            raise RuntimeError(
+                                f"SmartThings API returned HTTP {retry_error.code}."
+                            ) from retry_error
 
                 def invoke():
                     return subprocess.run(
@@ -1465,26 +1746,29 @@ class SmartThingsTVClient:
             "x.com.samsung.tv.keyvalue": remote_key,
             "x.com.samsung.tv.keystatus": "pressAndRelease",
         }
-        argument = "main:{capability}:execute({resource},{payload})".format(
-            capability=self.EXECUTE_CAPABILITY,
-            resource=json.dumps(self.REMOTE_RESOURCE),
-            payload=json.dumps(payload, separators=(",", ":")),
+        path = "/devices/{}/commands".format(
+            urllib_parse.quote(str(self.cfg["smartthings_device_id"]), safe="")
         )
+        command = {"commands": [{
+            "component": "main", "capability": self.EXECUTE_CAPABILITY,
+            "command": "execute", "arguments": [self.REMOTE_RESOURCE, payload],
+        }]}
         self._command_times.append(time.monotonic())
-        self._run(
-            "devices:commands", str(self.cfg["smartthings_device_id"]), argument
-        )
-        logger.info("SmartThings sent OCF remote key %s", remote_key)
+        output = self._run(api_request=("POST", path, command))
+        self._command_receipt(output, remote_key)
 
     def _send_volume_command(self, remote_key):
         command = "volumeUp" if remote_key == "KEY_VOLUP" else "volumeDown"
-        self._command_times.append(time.monotonic())
-        self._run(
-            "devices:commands",
-            str(self.cfg["smartthings_device_id"]),
-            f"main:{self.AUDIO_VOLUME_CAPABILITY}:{command}()",
+        path = "/devices/{}/commands".format(
+            urllib_parse.quote(str(self.cfg["smartthings_device_id"]), safe="")
         )
-        logger.info("SmartThings sent audioVolume.%s", command)
+        payload = {"commands": [{
+            "component": "main", "capability": self.AUDIO_VOLUME_CAPABILITY,
+            "command": command, "arguments": [],
+        }]}
+        self._command_times.append(time.monotonic())
+        output = self._run(api_request=("POST", path, payload))
+        self._command_receipt(output, "audioVolume." + command)
 
     def get_volume(self):
         with self._lock:
@@ -1502,15 +1786,21 @@ class SmartThingsTVClient:
     def set_volume(self, value):
         with self._lock:
             try:
+                if not hdmi_tv_connected(self.cfg):
+                    logger.info("Skipped TV volume: bound TV is not connected by HDMI")
+                    return False
                 target = min(100, max(0, int(value)))
                 self._ensure_command_budget(1)
-                self._command_times.append(time.monotonic())
-                self._run(
-                    "devices:commands",
-                    str(self.cfg["smartthings_device_id"]),
-                    f"main:{self.AUDIO_VOLUME_CAPABILITY}:setVolume({target})",
+                path = "/devices/{}/commands".format(
+                    urllib_parse.quote(str(self.cfg["smartthings_device_id"]), safe="")
                 )
-                logger.info("SmartThings set audioVolume to %d", target)
+                payload = {"commands": [{
+                    "component": "main", "capability": self.AUDIO_VOLUME_CAPABILITY,
+                    "command": "setVolume", "arguments": [target],
+                }]}
+                self._command_times.append(time.monotonic())
+                output = self._run(api_request=("POST", path, payload))
+                self._command_receipt(output, "audioVolume.setVolume")
                 return True
             except Exception as exc:
                 logger.warning("SmartThings set volume failed: %r", exc)
@@ -1518,7 +1808,11 @@ class SmartThingsTVClient:
 
     def send(self, key):
         with self._lock:
+            self.last_send_definitive_failure = False
             try:
+                if not hdmi_tv_connected(self.cfg):
+                    logger.info("Skipped %s: bound TV is not connected by HDMI", key)
+                    return False
                 if key == str(self.cfg["picture_off_key"]):
                     self._ensure_command_budget(1)
                     self._send_ocf_remote(key)
@@ -1531,6 +1825,10 @@ class SmartThingsTVClient:
                 else:
                     raise ValueError(f"Unsupported SmartThings action: {key}")
                 return True
+            except SmartThingsCommandRejected as exc:
+                self.last_send_definitive_failure = True
+                logger.warning("SmartThings action %s rejected: %s", key, exc)
+                return False
             except Exception as exc:
                 logger.warning("SmartThings action %s failed: %r", key, exc)
                 return False
@@ -1554,6 +1852,7 @@ class VolumeCoordinator:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._commands = queue.SimpleQueue()
+        self._epoch = 0
         self._tv_volume = None
         self._estimate_valid_until = 0.0
         self._buffer_start_volume = None
@@ -1634,6 +1933,8 @@ class VolumeCoordinator:
             error = "Exact TV volume requires SmartThings."
         elif getattr(self.tv, "authorization_required", lambda: False)():
             error = "Reauthorize SmartThings to control TV volume."
+        elif not hdmi_tv_connected(self.cfg):
+            error = "Bound TV is not connected by HDMI."
         with self._lock:
             self._menu_error = error
             if error:
@@ -1647,12 +1948,32 @@ class VolumeCoordinator:
             now = time.monotonic()
             self._buffer_deadline = now + self.BUFFER_SECONDS
             self._estimate_valid_until = now + 2 * float(self.cfg["tv_volume_refresh_seconds"])
+            epoch = self._epoch
         if notify:
-            self._commands.put("flush_volume")
+            self._commands.put((epoch, "flush_volume"))
+
+    def on_hdmi_disconnected(self):
+        with self._lock:
+            self._epoch += 1
+            self._tv_volume = None
+            self._buffer_start_volume = None
+            self._buffer_deadline = 0.0
+            self._estimate_valid_until = 0.0
+            self._menu_error = "TV HDMI connection was lost."
+            self._menu_completed_id = self._menu_request_id
+            while True:
+                try:
+                    self._commands.get_nowait()
+                except queue.Empty:
+                    break
+        self._publish_menu_status()
 
     def handle_key(
         self, direction, system_is_max=False, system_is_adjustable=True
     ):
+        if not hdmi_tv_connected(self.cfg):
+            self.on_hdmi_disconnected()
+            return False
         if getattr(self.tv, "authorization_required", lambda: False)():
             return False
         if direction == "up":
@@ -1660,7 +1981,7 @@ class VolumeCoordinator:
                 return False
             with self._lock:
                 if self._tv_volume is None:
-                    self._commands.put("KEY_VOLUP")
+                    self._commands.put((self._epoch, "KEY_VOLUP"))
                     return True
                 if self._tv_volume >= 100:
                     return True
@@ -1673,15 +1994,16 @@ class VolumeCoordinator:
                 self._estimate_valid_until = now + max(
                     5.0, float(self.cfg["tv_volume_refresh_seconds"]) * 2
                 )
+                epoch = self._epoch
             if notify:
-                self._commands.put("flush_volume")
+                self._commands.put((epoch, "flush_volume"))
             return True
 
         floor = int(self.cfg["tv_volume_floor"]) if system_is_adjustable else 0
         with self._lock:
             if self._tv_volume is None:
                 if not system_is_adjustable:
-                    self._commands.put("KEY_VOLDOWN")
+                    self._commands.put((self._epoch, "KEY_VOLDOWN"))
                     return True
                 return False
             if self._tv_volume <= floor:
@@ -1695,12 +2017,19 @@ class VolumeCoordinator:
             self._estimate_valid_until = now + max(
                 5.0, float(self.cfg["tv_volume_refresh_seconds"]) * 2
             )
+            epoch = self._epoch
         if notify:
-            self._commands.put("flush_volume")
+            self._commands.put((epoch, "flush_volume"))
         return True
 
-    def _flush_volume_buffer(self):
+    def _flush_volume_buffer(self, epoch):
         while not self._stop.is_set():
+            with self._lock:
+                if epoch != self._epoch:
+                    return
+            if not hdmi_tv_connected(self.cfg):
+                self.on_hdmi_disconnected()
+                return
             self._poll_menu_request()
             self._publish_menu_status()
             with self._lock:
@@ -1710,6 +2039,8 @@ class VolumeCoordinator:
                     return
                 continue
             with self._lock:
+                if epoch != self._epoch:
+                    return
                 target = self._tv_volume
                 start = self._buffer_start_volume
                 self._buffer_deadline = 0.0
@@ -1757,16 +2088,25 @@ class VolumeCoordinator:
             if self._stop.is_set():
                 break
             try:
-                command = self._commands.get(timeout=0.1)
+                epoch, command = self._commands.get(timeout=0.1)
             except queue.Empty:
                 continue
+            with self._lock:
+                if epoch != self._epoch:
+                    continue
             if command == "flush_volume":
-                self._flush_volume_buffer()
+                self._flush_volume_buffer(epoch)
                 with self._lock:
                     if self._tv_volume is None:
                         refresh_at = 0.0
             else:
-                self.tv.send(command)
+                if hdmi_tv_connected(self.cfg):
+                    with self._lock:
+                        current = epoch == self._epoch
+                    if current:
+                        self.tv.send(command)
+                else:
+                    self.on_hdmi_disconnected()
 
     def stop(self):
         self._stop.set()
@@ -1800,6 +2140,9 @@ class Controller:
         self.wake_not_before = 0.0
         self.next_off_attempt = 0.0
         self.next_wake_attempt = 0.0
+        self.off_retry_at = 0.0
+        self.off_retry_count = 0
+        self.off_retry_token = 0
         self.hotkey_input_suppress_until = 0.0
         self.pending_input_wake_at = 0.0
         self.pending_input_source = ""
@@ -1807,6 +2150,8 @@ class Controller:
         self.mouse_motion_total = 0.0
         self._assert_cache = False
         self._assert_checked = 0.0
+        self._hdmi_checked = 0.0
+        self._hdmi_connected = None
         self.backend.reset_input_baseline()
         self.update_volume_health(force=True)
 
@@ -1900,6 +2245,9 @@ class Controller:
         elif not self.cfg["enable_volume_control"]:
             state = "disabled"
             message = "Integrated TV volume control is disabled; wheel wake is active."
+        elif _status_hdmi_connected is False:
+            state = "hdmi_disconnected"
+            message = "Bound TV is not connected by HDMI; TV volume control is inactive."
         else:
             try:
                 adjustable, _is_max, matches, output = self._volume_output_state()
@@ -1990,17 +2338,44 @@ class Controller:
             self.mouse_motion_last_time = 0.0
             self.mouse_motion_total = 0.0
 
-    def blank(self, reason, force=False):
+    def blank(self, reason, force=False, retry_token=None):
         with self._op_lock:
+            if retry_token is not None:
+                with self._state_lock:
+                    if (retry_token != self.off_retry_token or
+                            self.off_retry_at <= 0.0 or
+                            time.monotonic() < self.off_retry_at):
+                        return False
+                    self.off_retry_at = 0.0
             if self.is_off() and not force:
                 return True
             if not self.tv.send(str(self.cfg["picture_off_key"])):
+                if not hdmi_tv_connected(self.cfg):
+                    self.next_off_attempt = float("inf")
+                    write_status(running=True, state="hdmi_disconnected",
+                                 last_action="blank_skipped", reason=reason,
+                                 hdmi_connected=False)
+                    return False
                 if self.cfg["control_method"] == "lan":
                     self.next_off_attempt = time.monotonic() + 5
                 else:
                     self.next_off_attempt = float("inf")
+                retry_pending = False
+                if reason in {"hotkey", "hotkey_retry"} and \
+                   getattr(self.tv, "last_send_definitive_failure", False):
+                    with self._state_lock:
+                        if self.off_retry_count < 3:
+                            self.off_retry_at = time.monotonic() + (5, 15, 30)[self.off_retry_count]
+                            self.off_retry_count += 1
+                            retry_pending = True
+                else:
+                    with self._state_lock:
+                        self.off_retry_at = 0.0
                 if not self._report_auth_after_failure():
-                    write_status(running=True,state="error",last_action="blank_failed",reason=reason)
+                    write_status(running=True,state="error",last_action="blank_failed",reason=reason,
+                                 picture_confirmation=("rejected" if getattr(
+                                     self.tv, "last_send_definitive_failure", False
+                                 ) else "unknown"),off_retry_pending=retry_pending)
                 return False
 
             self.backend.reset_input_baseline()
@@ -2010,8 +2385,11 @@ class Controller:
             self._clear_pending_wake()
             self.set_off(True)
             self.next_off_attempt = 0.0
-            logger.info("Picture off (%s)", reason)
-            write_status(running=True,state="picture_off",last_action="blank",reason=reason)
+            with self._state_lock:
+                self.off_retry_at = 0.0
+            logger.info("Picture Off request accepted (%s); physical panel unverified", reason)
+            write_status(running=True,state="picture_off",last_action="blank",reason=reason,
+                         picture_confirmation="unverified",off_retry_pending=False)
             return True
 
     def wake(self, reason, source=""):
@@ -2023,11 +2401,19 @@ class Controller:
                 return False
             if now < self.next_wake_attempt: return False
             if not self.tv.send(str(self.cfg["wake_key"])):
+                if not hdmi_tv_connected(self.cfg):
+                    write_status(running=True, state="hdmi_disconnected",
+                                 last_action="wake_skipped", reason=reason,
+                                 hdmi_connected=False)
+                    return False
                 self.next_wake_attempt = now + 1
                 if not self._report_auth_after_failure():
                     write_status(running=True,state="error",last_action="wake_failed",reason=reason)
                 return False
             self.set_off(False)
+            with self._state_lock:
+                self.off_retry_at = 0.0
+                self.off_retry_token += 1
             self._clear_pending_wake()
             self.next_wake_attempt = 0
             if source:
@@ -2044,12 +2430,28 @@ class Controller:
         now = time.monotonic()
         with self._input_lock:
             self.hotkey_input_suppress_until = now + 0.60
-            self.pending_input_wake_at = 0.0
-            self.pending_input_source = ""
+            if self.pending_input_source.startswith("keyboard:"):
+                self.pending_input_wake_at = 0.0
+                self.pending_input_source = ""
             self.mouse_motion_last_time = 0.0
             self.mouse_motion_total = 0.0
+        if self.is_off():
+            logger.info("Picture Off hotkey ignored: local off intent already active")
+            return
         logger.info("Global hotkey action; local_picture_off=%s", self.is_off())
-        self.blank("hotkey", force=True)
+        with self._state_lock:
+            self.off_retry_token += 1
+            self.off_retry_at = 0.0
+            self.off_retry_count = 0
+        self.blank("hotkey")
+
+    def _retry_rejected_hotkey(self, now):
+        with self._state_lock:
+            due = self.off_retry_at > 0.0 and now >= self.off_retry_at
+            token = self.off_retry_token
+        if due:
+            logger.info("Retrying explicitly rejected Picture Off command")
+            self.blank("hotkey_retry", force=True, retry_token=token)
 
     def _schedule_input_wake(self, source, delay_ms=None):
         now = time.monotonic()
@@ -2058,9 +2460,12 @@ class Controller:
             if delay_ms is None else max(0, int(delay_ms))
         ) / 1000.0
         with self._input_lock:
-            if now < self.hotkey_input_suppress_until:
+            if now < self.hotkey_input_suppress_until and source.startswith("keyboard:"):
                 logger.info("Input wake suppressed by hotkey source=%s", source)
                 return
+            with self._state_lock:
+                self.off_retry_at = 0.0
+                self.off_retry_token += 1
             due = now + delay
             pending_is_mouse = self.pending_input_source.startswith("mouse_move:")
             source_is_mouse = source.startswith("mouse_move:")
@@ -2125,15 +2530,23 @@ class Controller:
         if not source:
             return
 
+        if now >= self.hotkey_input_suppress_until:
+            with self._state_lock:
+                if self.off_retry_at > 0.0:
+                    self.off_retry_at = 0.0
+                    self.off_retry_token += 1
+                    logger.info("Cancelled rejected Picture Off retry after hardware input")
+
         if not off:
-            if self.cfg["control_method"] == "smartthings" and \
-               self.next_off_attempt == float("inf"):
+            if self.next_off_attempt == float("inf") and \
+               self._hdmi_connected is True and hdmi_tv_connected(self.cfg):
                 self.next_off_attempt = 0.0
-                logger.info("SmartThings Picture Off retry rearmed by input source=%s", source)
+                logger.info("Picture Off eligibility rearmed by input source=%s", source)
             return
 
-        delay_ms = 80 if event.get("kind") in {"mouse_button", "mouse_wheel"} else None
-        self._schedule_input_wake(source, delay_ms=delay_ms)
+        if self._hdmi_connected is True and hdmi_tv_connected(self.cfg):
+            delay_ms = 80 if event.get("kind") in {"mouse_button", "mouse_wheel"} else None
+            self._schedule_input_wake(source, delay_ms=delay_ms)
 
     def _process_pending_wake(self, now):
         due = 0.0
@@ -2141,7 +2554,8 @@ class Controller:
         suppressed = False
         with self._input_lock:
             if self.pending_input_wake_at > 0.0 and now >= self.pending_input_wake_at:
-                if now < self.hotkey_input_suppress_until:
+                if now < self.hotkey_input_suppress_until and \
+                   self.pending_input_source.startswith("keyboard:"):
                     suppressed = True
                 else:
                     due = self.pending_input_wake_at
@@ -2164,26 +2578,58 @@ class Controller:
             self._assert_cache = display_is_explicitly_required()
         return self._assert_cache
 
+    def check_hdmi_connection(self):
+        global _status_hdmi_connected
+        connected = hdmi_tv_connected(self.cfg)
+        if connected == self._hdmi_connected:
+            return connected
+        self._hdmi_connected = connected
+        _status_hdmi_connected = connected
+        if not connected:
+            with self._state_lock:
+                self.off_retry_at = 0.0
+                self.off_retry_token += 1
+                self.picture_off = False
+            self._clear_pending_wake()
+            self.next_wake_attempt = 0.0
+            self.next_off_attempt = float("inf")
+            if self.volume:
+                self.volume.on_hdmi_disconnected()
+            logger.warning("Bound TV HDMI connection is unavailable; commands paused")
+            write_status(running=True, state="hdmi_disconnected",
+                         reason="bound_tv_hdmi_unavailable")
+        else:
+            logger.info("Bound TV HDMI connection restored")
+            write_status(running=True, state="awake",
+                         reason="bound_tv_hdmi_restored")
+        self.update_volume_health(force=True)
+        return connected
+
     def monitor(self):
         interval = int(self.cfg["poll_interval_ms"])/1000.0
         threshold = max(0.0,float(self.cfg["idle_minutes"]))*60.0
         while not self._stop.is_set():
             try:
                 now = time.monotonic()
+                if now - self._hdmi_checked >= 2.0:
+                    self._hdmi_checked = now
+                    self.check_hdmi_connection()
                 if now - self._volume_health_checked >= 2.0:
                     self._volume_health_checked = now
                     self.update_volume_health()
                 for event in self.backend.poll_input_events():
                     self.handle_input(event)
-                if self.is_off():
-                    self._process_pending_wake(now)
-                else:
-                    auto = bool(self.cfg["enable_idle_off"]) and threshold > 0
-                    if auto and now >= self.next_off_attempt and \
-                       self.backend.idle_seconds() >= threshold:
-                        keep = bool(self.cfg["respect_display_required"]) and self.display_required()
-                        if not keep:
-                            self.blank("idle")
+                if self._hdmi_connected is True:
+                    self._retry_rejected_hotkey(now)
+                    if self.is_off():
+                        self._process_pending_wake(now)
+                    else:
+                        auto = bool(self.cfg["enable_idle_off"]) and threshold > 0
+                        if auto and now >= self.next_off_attempt and \
+                           self.backend.idle_seconds() >= threshold:
+                            keep = bool(self.cfg["respect_display_required"]) and self.display_required()
+                            if not keep:
+                                self.blank("idle")
             except Exception as exc:
                 logger.exception("Monitor error: %r", exc)
             self._stop.wait(interval)
@@ -2340,10 +2786,18 @@ def main():
     g.add_argument("--check-hotkey",action="store_true")
     g.add_argument("--check-volume-keys",action="store_true")
     g.add_argument("--audio-output",action="store_true")
+    g.add_argument("--hdmi-displays",action="store_true")
     g.add_argument("--input-access",action="store_true")
     g.add_argument("--request-input-access",action="store_true")
     g.add_argument("--idle",action="store_true")
     a = ap.parse_args()
+    if a.hdmi_displays:
+        try:
+            print(json.dumps(available_hdmi_tv_bindings()))
+            return 0
+        except Exception as exc:
+            print(f"Cannot inspect HDMI TVs: {exc}", file=sys.stderr)
+            return 2
     if a.input_access or a.request_input_access:
         backend = MacOSBackend()
         access = (

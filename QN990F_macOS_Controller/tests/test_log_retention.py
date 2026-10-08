@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import re
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -34,7 +35,8 @@ def load_logging(platform, directory):
                 break
     logger = logging.Logger(f"retention-{platform}")
     namespace = dict(logging=logging, RotatingFileHandler=RotatingFileHandler,
-                     os=os, LOG_FILE=directory / "controller.log")
+                     os=os, threading=threading,
+                     LOG_FILE=directory / "controller.log")
     with mock.patch.object(logging, "getLogger", return_value=logger):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return logger, namespace

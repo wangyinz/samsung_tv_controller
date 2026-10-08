@@ -72,6 +72,33 @@ if [[ "$RESPECT" == "false" ]]; then DEFAULT_RESPECT="N"; fi
 read -r -p "Respect macOS media/display-sleep assertions? [$DEFAULT_RESPECT]: " NEW_RESPECT
 NEW_RESPECT="${NEW_RESPECT:-$DEFAULT_RESPECT}"
 
+echo
+echo "Connect this Mac to the TV through HDMI to bind remote control."
+HDMI_DISPLAYS_JSON="$("$PYTHON" "$CONTROLLER" --hdmi-displays)"
+HDMI_COUNT="$("$PYTHON" -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$HDMI_DISPLAYS_JSON")"
+if [[ "$HDMI_COUNT" == "0" ]]; then
+  echo "No uniquely identifiable Samsung HDMI TV is connected."
+  read -r -p "Press Return to close."
+  exit 2
+fi
+"$PYTHON" - "$HDMI_DISPLAYS_JSON" <<'PY'
+import json,sys
+for number, item in enumerate(json.loads(sys.argv[1]), 1):
+    print(f"  {number}. Samsung HDMI display product={item['product']} serial={item['serial']} EDID={item['edid_sha256'][:12]}")
+PY
+read -r -p "Bind the TV above [1]: " HDMI_CHOICE
+HDMI_CHOICE="${HDMI_CHOICE:-1}"
+if ! [[ "$HDMI_CHOICE" =~ ^[0-9]+$ ]] || \
+   (( HDMI_CHOICE < 1 || HDMI_CHOICE > HDMI_COUNT )); then
+  echo "Invalid HDMI display selection."
+  exit 2
+fi
+read -r -p "Confirm this is the exact TV controlled by this app? [y/N]: " HDMI_CONFIRM
+if ! [[ "$HDMI_CONFIRM" =~ ^[Yy]$ ]]; then exit 2; fi
+TV_HDMI_EDID_SHA256="$("$PYTHON" -c \
+  'import json,sys; print(json.loads(sys.argv[1])[int(sys.argv[2])-1]["edid_sha256"])' \
+  "$HDMI_DISPLAYS_JSON" "$HDMI_CHOICE")"
+
 stop_agent
 if [[ -f "$PLIST" ]]; then
   mv -f "$PLIST" "$STAGED_PLIST"
@@ -82,9 +109,10 @@ elif [[ ! -f "$STAGED_PLIST" ]]; then
 fi
 
 "$PYTHON" - \
-  "$CONFIG" "$NEW_IP" "$NEW_IDLE" "$NEW_HOTKEY" "$NEW_RESPECT" <<'PY'
+  "$CONFIG" "$NEW_IP" "$NEW_IDLE" "$NEW_HOTKEY" "$NEW_RESPECT" \
+  "$TV_HDMI_EDID_SHA256" <<'PY'
 import json, sys
-path, ip, idle, hotkey, respect = sys.argv[1:]
+path, ip, idle, hotkey, respect, hdmi_edid = sys.argv[1:]
 with open(path, encoding="utf-8") as f:
     c = json.load(f)
 c["tv_ip"] = ip.strip()
@@ -92,6 +120,7 @@ c["idle_minutes"] = float(idle)
 c["enable_idle_off"] = float(idle) > 0
 c["hotkey"] = hotkey.strip()
 c["respect_display_required"] = not respect.lower().startswith("n")
+c["tv_hdmi_edid_sha256"] = hdmi_edid
 with open(path, "w", encoding="utf-8") as f:
     json.dump(c, f, indent=2)
 PY

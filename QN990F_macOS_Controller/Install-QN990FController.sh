@@ -385,6 +385,35 @@ if [[ "$ENABLE_VOLUME" == "true" ]]; then
   fi
 fi
 
+step "Binding the TV's physical HDMI connection"
+echo "Connect this Mac to the exact TV selected above with HDMI (directly or through a USB-C HDMI adapter)."
+HDMI_DISPLAYS_JSON="$("$PYTHON" "$CONTROLLER" --hdmi-displays)"
+HDMI_COUNT="$("$PYTHON" -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$HDMI_DISPLAYS_JSON")"
+if [[ "$HDMI_COUNT" == "0" ]]; then
+  echo "No uniquely identifiable Samsung HDMI TV is connected. Remote control will remain disabled."
+  exit 2
+fi
+"$PYTHON" - "$HDMI_DISPLAYS_JSON" <<'PY'
+import json,sys
+for number, item in enumerate(json.loads(sys.argv[1]), 1):
+    print(f"  {number}. Samsung HDMI display product={item['product']} serial={item['serial']} EDID={item['edid_sha256'][:12]}")
+PY
+if [[ "$HDMI_COUNT" == "1" ]]; then
+  read -r -p "Bind this exact TV to the controller? [y/N]: " HDMI_CONFIRM
+  if ! [[ "$HDMI_CONFIRM" =~ ^[Yy]$ ]]; then exit 2; fi
+  HDMI_CHOICE=1
+else
+  read -r -p "Which HDMI display is the TV selected above? " HDMI_CHOICE
+  if ! [[ "$HDMI_CHOICE" =~ ^[0-9]+$ ]] || \
+     (( HDMI_CHOICE < 1 || HDMI_CHOICE > HDMI_COUNT )); then
+    echo "Invalid HDMI display selection."
+    exit 2
+  fi
+fi
+TV_HDMI_EDID_SHA256="$("$PYTHON" -c \
+  'import json,sys; print(json.loads(sys.argv[1])[int(sys.argv[2])-1]["edid_sha256"])' \
+  "$HDMI_DISPLAYS_JSON" "$HDMI_CHOICE")"
+
 step "Writing configuration"
 ENABLE_IDLE="true"
 if [[ "$IDLE" == "0" || "$IDLE" == "0.0" ]]; then
@@ -409,12 +438,12 @@ fi
   "$CONFIG" "$CONTROL_METHOD" "$TV_IP" "$IDLE" "$HOTKEY" "$ENABLE_IDLE" \
   "$SMARTTHINGS" "$SMARTTHINGS_NO_BROWSER_DIR" \
   "$SMARTTHINGS_PROFILE" "$SMARTTHINGS_DEVICE_ID" "$ENABLE_VOLUME" \
-  "$REMOTE_NAME" "$TV_AUDIO_OUTPUT_UID" <<'PY'
+  "$REMOTE_NAME" "$TV_AUDIO_OUTPUT_UID" "$TV_HDMI_EDID_SHA256" <<'PY'
 import json, sys
 (
     path, method, ip, idle, hotkey, enable_idle, smartthings_cli,
     smartthings_no_browser_dir, smartthings_profile, smartthings_device_id,
-    enable_volume, remote_name, tv_audio_output_uid,
+    enable_volume, remote_name, tv_audio_output_uid, tv_hdmi_edid_sha256,
 ) = sys.argv[1:]
 config = {
     "control_method": method,
@@ -443,6 +472,7 @@ config = {
     "smartthings_auth_check_interval_seconds": 1800.0,
     "enable_volume_control": enable_volume.lower() == "true",
     "tv_audio_output_uid": tv_audio_output_uid,
+    "tv_hdmi_edid_sha256": tv_hdmi_edid_sha256,
     "tv_volume_floor": 10,
     "tv_volume_refresh_seconds": 30.0,
 }

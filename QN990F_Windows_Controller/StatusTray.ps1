@@ -662,6 +662,7 @@ try {
         $State = "stopped"
         $Running = $false
         $StatusPid = 0
+        $Status = $null
         if (Test-Path -LiteralPath $StatusPath) {
             try {
                 $Status = Get-Content -LiteralPath $StatusPath -Raw | ConvertFrom-Json
@@ -692,7 +693,28 @@ try {
             } catch {}
         }
 
-        $ControllerItem.Text = "Controller: $State ($ControlMethod)"
+        $DisplayState = $State
+        $TooltipState = $State
+        if ($State -eq "hdmi_disconnected") {
+            $DisplayState = "TV HDMI disconnected"
+            $TooltipState = "TV HDMI disconnected"
+        } elseif ($State -eq "picture_off") {
+            $DisplayState = "Picture Off request sent; screen unverified"
+            $TooltipState = "Picture Off unverified"
+        } elseif ($State -eq "error" -and $Status.last_action -eq "blank_failed") {
+            if ([bool]$Status.off_retry_pending) {
+                $DisplayState = "Picture Off failed; retry pending"
+                $TooltipState = "Picture Off failed (retry pending)"
+            } elseif ($Status.picture_confirmation -eq "rejected") {
+                $DisplayState = "Picture Off failed"
+                $TooltipState = "Picture Off failed"
+            } else {
+                $DisplayState = "Picture Off outcome unknown"
+                $TooltipState = "Picture Off outcome unknown"
+            }
+        }
+
+        $ControllerItem.Text = "Controller: $DisplayState ($ControlMethod)"
         $VolumeItem.Text = if ($VolumeEnabled) {
             "Keyboard volume: enabled"
         } else {
@@ -701,7 +723,7 @@ try {
         $ReauthorizeItem.Visibility = if ($ControlMethod -eq "smartthings") { "Visible" } else { "Collapsed" }
         Update-VolumeStatus $Running $StatusPid
 
-        $NeedsAttention = $State -in @("authorization_required", "error", "stopped")
+        $NeedsAttention = $State -in @("authorization_required", "error", "stopped", "hdmi_disconnected")
         $Notify.Icon = if ($State -eq "stopped" -or -not $Running) {
             $StoppedIcon
         } elseif ($NeedsAttention) {
@@ -709,7 +731,7 @@ try {
         } else {
             $ReadyIcon
         }
-        $Tooltip = "Samsung TV Controller: $State"
+        $Tooltip = "Samsung TV Controller: $TooltipState"
         if ($Tooltip.Length -gt 63) { $Tooltip = $Tooltip.Substring(0, 63) }
         $Notify.Text = $Tooltip
 
@@ -717,8 +739,18 @@ try {
             $NeedsAttention) {
             $Detail = if ($State -eq "authorization_required") {
                 "SmartThings authorization needs renewal."
+            } elseif ($State -eq "hdmi_disconnected") {
+                "TV HDMI disconnected. Connect or bind the TV HDMI display."
             } elseif ($State -eq "stopped") {
                 "The background controller is stopped."
+            } elseif ($State -eq "error" -and $Status.last_action -eq "blank_failed") {
+                if ([bool]$Status.off_retry_pending) {
+                    "Picture Off failed. A retry is pending."
+                } elseif ($Status.picture_confirmation -eq "rejected") {
+                    "Picture Off failed. The TV rejected the command."
+                } else {
+                    "Picture Off outcome is unknown. Open the controller log for details."
+                }
             } else {
                 "The background controller reported an error. Open the log for details."
             }

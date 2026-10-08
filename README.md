@@ -19,6 +19,8 @@ monitor.
 ## Features
 
 - Global, configurable `Picture Off` hotkey.
+- Mandatory local HDMI binding: TV commands are blocked unless this computer
+  detects the configured TV as a connected physical HDMI display.
 - Automatic picture restore after qualifying keyboard or mouse input.
 - Pointer movement alone is ignored by default on both platforms to prevent
   unattended wake events; an advanced opt-in retains anti-jitter filtering.
@@ -39,9 +41,16 @@ monitor.
   value from 0 to 100 and release the slider to apply it. On either platform,
   left-click the status icon for volume only; right-click for the full menu.
 
-The hotkey is intentionally one-way: it always sends `Picture Off`; it is not a
-power toggle. Automatic input wake is active only after this controller believes
-that it successfully blanked the picture.
+The hotkey requests `Picture Off` only while the controller considers the picture
+awake. Repeated presses during its local off intent are ignored because Samsung's
+key can toggle the panel back on. Command acceptance does not prove the physical
+panel is dark. Automatic input wake is active only after a successful off request.
+
+Both LAN and SmartThings commands require the bound TV to be detected on local
+HDMI. Network reachability or a cloud device ID alone does not enable control.
+When a disconnect is detected, queued control operations are cleared;
+reconnecting does not replay them. If display detection fails or the HDMI binding is missing or ambiguous,
+the controller blocks commands and leaves volume keys to the operating system.
 
 ## Compatibility
 
@@ -166,6 +175,7 @@ directory together.
 1. Open [`QN990F_macOS_Controller`](QN990F_macOS_Controller/).
 2. Double-click [`INSTALL.command`](QN990F_macOS_Controller/INSTALL.command).
 3. Choose Direct LAN or SmartThings cloud and follow the prompts.
+   With the TV connected by HDMI, select its local display identity when prompted.
 4. Approve the two-second `Picture Off` and restore test when you are ready to
    interrupt the TV picture, then confirm what you observed.
 
@@ -189,6 +199,7 @@ configuration, file locations, and manual commands.
 3. Choose Direct LAN or SmartThings cloud. In cloud mode, the installer
    installs the pinned official npm CLI with a verified signed Node.js runtime.
 4. Choose whether to install integrated volume-key control.
+   Select the local HDMI display that corresponds to the configured TV.
 5. Approve the two-second `Picture Off` and restore test, then confirm what you
    observed.
 
@@ -198,6 +209,11 @@ isolated virtual environment and a per-user Startup shortcut.
 
 See the [Windows guide](QN990F_Windows_Controller/README.txt) for detailed
 setup, upgrades, configuration, and manual commands.
+
+Existing installations need to run the updated installer with the TV connected
+by HDMI to establish this binding. Copying only the updated controller without
+binding the display deliberately disables TV commands. A different TV, adapter,
+or Windows display identity may require rebinding with Configure.
 
 Some repository filenames, application-data paths, service labels, and OAuth
 profile names retain the original `QN990F` identifier. They are preserved to

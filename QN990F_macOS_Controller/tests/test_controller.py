@@ -40,6 +40,101 @@ finally:
 DEVICE_ID = "12345678-1234-4234-8234-123456789abc"
 
 
+def samsung_hdmi_edid(product=42, serial=123, hdmi=True):
+    value = bytearray(256)
+    value[:8] = bytes.fromhex("00ffffffffffff00")
+    value[8:10] = (0x4c2d).to_bytes(2, "big")
+    value[10:12] = product.to_bytes(2, "little")
+    value[12:16] = serial.to_bytes(4, "little")
+    value[126] = 1
+    value[128] = 2
+    value[130] = 8
+    if hdmi:
+        value[132:136] = bytes.fromhex("63030c00")
+    value[127] = (-sum(value[:127])) & 255
+    value[255] = (-sum(value[128:255])) & 255
+    return bytes(value)
+
+
+class HdmiBindingTests(unittest.TestCase):
+    def test_only_online_unique_samsung_hdmi_edid_is_bindable(self):
+        tv = samsung_hdmi_edid()
+        other = samsung_hdmi_edid(product=43)
+        virtual = samsung_hdmi_edid(product=44, hdmi=False)
+        self.assertFalse(controller._hdmi_edid(virtual))
+        with mock.patch.object(controller, "_online_display_ids", return_value=[
+            (0x4c2d, 42, 123), (0x4c2d, 44, 123)
+        ]), mock.patch.object(controller, "_hdmi_display_edids", return_value=[tv, other]):
+            self.assertEqual(controller.available_hdmi_tv_bindings(), [{
+                "vendor": 0x4c2d, "product": 42, "serial": 123,
+                "edid_sha256": controller.hashlib.sha256(tv).hexdigest(),
+            }])
+
+    def test_missing_binding_and_probe_failure_fail_closed(self):
+        self.assertFalse(controller.hdmi_tv_connected({}))
+        cfg = {"tv_hdmi_edid_sha256": "0" * 64}
+        with mock.patch.object(controller, "available_hdmi_tv_bindings", side_effect=RuntimeError("no access")):
+            self.assertFalse(controller.hdmi_tv_connected(cfg))
+
+    def test_probe_errors_are_logged_once_per_interval(self):
+        controller._hdmi_probe_warning_at = 0.0
+        cfg = {"tv_hdmi_edid_sha256": "0" * 64}
+        with mock.patch.object(controller, "available_hdmi_tv_bindings", side_effect=RuntimeError("no access")), \
+             mock.patch.object(controller.logger, "warning") as warning:
+            self.assertFalse(controller.hdmi_tv_connected(cfg))
+            self.assertFalse(controller.hdmi_tv_connected(cfg))
+        warning.assert_called_once()
+
+    def test_identical_online_edids_are_ambiguous(self):
+        tv = samsung_hdmi_edid()
+        with mock.patch.object(controller, "_online_display_ids", return_value=[
+            (0x4c2d, 42, 123), (0x4c2d, 42, 123)
+        ]), mock.patch.object(controller, "_hdmi_display_edids", return_value=[tv, tv]):
+            self.assertEqual(controller.available_hdmi_tv_bindings(), [])
+        with mock.patch.object(controller, "_online_display_ids", return_value=[
+            (0x4c2d, 42, 123), (0x4c2d, 42, 123)
+        ]), mock.patch.object(controller, "_hdmi_display_edids", return_value=[tv]):
+            self.assertEqual(controller.available_hdmi_tv_bindings(), [])
+
+    def test_malformed_hdmi_data_block_fails_closed(self):
+        edid = bytearray(samsung_hdmi_edid())
+        edid[132] = 0x61  # vendor block shorter than the 3-byte HDMI OUI
+        edid[255] = (-sum(edid[128:255])) & 255
+        self.assertFalse(controller._hdmi_edid(bytes(edid)))
+        edid = bytearray(samsung_hdmi_edid())
+        edid[255] ^= 1
+        self.assertFalse(controller._hdmi_edid(bytes(edid)))
+
+    def test_lan_and_cloud_do_not_send_without_hdmi(self):
+        lan = controller.TVClient(controller_config())
+        cloud = controller.SmartThingsTVClient(cloud_config(TEST_HOME.name))
+        with mock.patch.object(controller, "hdmi_tv_connected", return_value=False), \
+             mock.patch.object(lan, "_new") as new, \
+             mock.patch.object(cloud, "_run") as run:
+            self.assertFalse(lan.send("KEY_PICTURE_OFF"))
+            self.assertFalse(cloud.send("KEY_RETURN"))
+            self.assertFalse(cloud.set_volume(20))
+        new.assert_not_called()
+        run.assert_not_called()
+
+    def test_lan_rechecks_after_open_before_key(self):
+        lan = controller.TVClient(controller_config())
+        tv = mock.Mock()
+        with mock.patch.object(controller, "hdmi_tv_connected", side_effect=[True, False]), \
+             mock.patch.object(lan, "_new", return_value=tv):
+            self.assertFalse(lan.send("KEY_PICTURE_OFF"))
+        tv.open.assert_called_once()
+        tv.send_key.assert_not_called()
+
+    def test_lan_pair_does_not_open_remote_without_hdmi(self):
+        lan = controller.TVClient(controller_config())
+        with mock.patch.object(controller, "hdmi_tv_connected", return_value=False), \
+             mock.patch.object(lan, "_new") as new:
+            with self.assertRaisesRegex(RuntimeError, "HDMI"):
+                lan.pair()
+        new.assert_not_called()
+
+
 def cloud_config(temp_dir):
     return {
         "control_method": "smartthings",
@@ -174,7 +269,9 @@ class AudioIdentityTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with mock.patch.object(controller, "CONFIG_FILE", config_path):
+        with mock.patch.object(controller, "CONFIG_FILE", config_path), \
+             mock.patch.object(controller, "MacOSBackend") as backend:
+            backend.return_value.parse_hotkey.return_value = (0, 0)
             loaded = controller.load_config()
 
         self.assertEqual(
@@ -508,6 +605,9 @@ class LANClientTests(unittest.TestCase):
 
 class SmartThingsTVClientTests(unittest.TestCase):
     def setUp(self):
+        hdmi_patch = mock.patch.object(controller, "hdmi_tv_connected", return_value=True)
+        hdmi_patch.start()
+        self.addCleanup(hdmi_patch.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.cfg = cloud_config(self.temp_dir.name)
         self.client = controller.SmartThingsTVClient(self.cfg)
@@ -535,15 +635,19 @@ class SmartThingsTVClientTests(unittest.TestCase):
         self.client._write_credentials(credentials)
 
     def test_picture_off_uses_phone_accessibility_ocf_payload(self):
-        with mock.patch.object(self.client, "_run") as run:
+        receipt = json.dumps({"results": [{"id": "command-1", "status": "ACCEPTED"}]})
+        with mock.patch.object(self.client, "_run", return_value=receipt) as run:
             self.client._send_ocf_remote("KEY_PICTURE_OFF")
 
         run.assert_called_once_with(
-            "devices:commands",
-            DEVICE_ID,
-            'main:execute:execute("/sec/tv/remotecontrol",'
-            '{"x.com.samsung.tv.keyvalue":"KEY_PICTURE_OFF",'
-            '"x.com.samsung.tv.keystatus":"pressAndRelease"})',
+            api_request=("POST", f"/devices/{DEVICE_ID}/commands", {
+                "commands": [{"component": "main", "capability": "execute",
+                              "command": "execute", "arguments": [
+                                  "/sec/tv/remotecontrol",
+                                  {"x.com.samsung.tv.keyvalue": "KEY_PICTURE_OFF",
+                                   "x.com.samsung.tv.keystatus": "pressAndRelease"},
+                              ]}]
+            }),
         )
 
     def test_send_uses_same_ocf_transport_for_off_and_wake(self):
@@ -570,13 +674,15 @@ class SmartThingsTVClientTests(unittest.TestCase):
         run.assert_called_once_with("devices:status", DEVICE_ID, "--json")
 
     def test_set_volume_uses_explicit_audio_volume_target(self):
-        with mock.patch.object(self.client, "_run") as run:
+        receipt = json.dumps({"results": [{"id": "command-2", "status": "COMPLETED"}]})
+        with mock.patch.object(self.client, "_run", return_value=receipt) as run:
             self.assertTrue(self.client.set_volume(10))
 
         run.assert_called_once_with(
-            "devices:commands",
-            DEVICE_ID,
-            "main:audioVolume:setVolume(10)",
+            api_request=("POST", f"/devices/{DEVICE_ID}/commands", {
+                "commands": [{"component": "main", "capability": "audioVolume",
+                              "command": "setVolume", "arguments": [10]}]
+            }),
         )
 
     def test_volume_keys_use_audio_volume_capability(self):
@@ -590,14 +696,30 @@ class SmartThingsTVClientTests(unittest.TestCase):
         )
 
     def test_volume_down_command_uses_standard_audio_volume_capability(self):
-        with mock.patch.object(self.client, "_run") as run:
+        receipt = json.dumps({"results": [{"id": "command-3", "status": "ACCEPTED"}]})
+        with mock.patch.object(self.client, "_run", return_value=receipt) as run:
             self.client._send_volume_command("KEY_VOLDOWN")
 
         run.assert_called_once_with(
-            "devices:commands",
-            DEVICE_ID,
-            "main:audioVolume:volumeDown()",
+            api_request=("POST", f"/devices/{DEVICE_ID}/commands", {
+                "commands": [{"component": "main", "capability": "audioVolume",
+                              "command": "volumeDown", "arguments": []}]
+            }),
         )
+
+    def test_failed_receipt_is_not_reported_as_a_successful_off(self):
+        receipt = json.dumps({"results": [{"id": "command-4", "status": "FAILED"}]})
+        with mock.patch.object(self.client, "_run", return_value=receipt):
+            self.assertFalse(self.client.send("KEY_PICTURE_OFF"))
+        self.assertTrue(self.client.last_send_definitive_failure)
+
+    def test_empty_or_malformed_receipt_is_not_retried_as_definite_failure(self):
+        for receipt in ('{"results":[]}', 'not json'):
+            with self.subTest(receipt=receipt), mock.patch.object(
+                self.client, "_run", return_value=receipt
+            ):
+                self.assertFalse(self.client.send("KEY_PICTURE_OFF"))
+                self.assertFalse(self.client.last_send_definitive_failure)
 
     def test_run_is_noninteractive_and_does_not_inherit_pat(self):
         completed = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
@@ -638,6 +760,44 @@ class SmartThingsTVClientTests(unittest.TestCase):
                 self.client._run("devices", DEVICE_ID, "--json")
 
         self.assertTrue(self.client.authorization_required())
+
+    def test_structured_api_401_refreshes_under_existing_lock(self):
+        rejected = controller.urllib_error.HTTPError(
+            "https://api.smartthings.com/v1/devices/x/commands", 401,
+            "Unauthorized", {}, None,
+        )
+        with mock.patch.object(self.client, "_refresh_saved_authorization", return_value=True) as refresh, \
+             mock.patch.object(self.client, "_api_request", side_effect=[rejected, '{"results":[]}']) as request, \
+             mock.patch.object(controller.subprocess, "run") as cli:
+            output = self.client._run(
+                api_request=("POST", "/devices/x/commands", {"commands": []})
+            )
+
+        self.assertEqual(output, '{"results":[]}')
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(refresh.call_count, 2)
+        self.assertTrue(refresh.call_args_list[-1].kwargs["force"])
+        cli.assert_not_called()
+
+    def test_structured_api_403_is_a_definite_rejection(self):
+        rejected = controller.urllib_error.HTTPError(
+            "https://api.smartthings.com/v1/devices/x/commands", 403,
+            "Forbidden", {}, None,
+        )
+        with mock.patch.object(self.client, "_refresh_saved_authorization", return_value=False), \
+             mock.patch.object(self.client, "_api_request", side_effect=rejected):
+            self.assertFalse(self.client.send("KEY_PICTURE_OFF"))
+        self.assertTrue(self.client.last_send_definitive_failure)
+
+    def test_structured_api_500_does_not_trigger_toggle_retry(self):
+        unavailable = controller.urllib_error.HTTPError(
+            "https://api.smartthings.com/v1/devices/x/commands", 500,
+            "Unavailable", {}, None,
+        )
+        with mock.patch.object(self.client, "_refresh_saved_authorization", return_value=False), \
+             mock.patch.object(self.client, "_api_request", side_effect=unavailable):
+            self.assertFalse(self.client.send("KEY_PICTURE_OFF"))
+        self.assertFalse(self.client.last_send_definitive_failure)
 
     def test_early_api_401_forces_refresh_and_retries_once(self):
         self.write_credentials()
@@ -975,6 +1135,9 @@ class CloudConfigTests(unittest.TestCase):
 
 class VolumeCoordinatorTests(unittest.TestCase):
     def setUp(self):
+        hdmi_patch = mock.patch.object(controller, "hdmi_tv_connected", return_value=True)
+        hdmi_patch.start()
+        self.addCleanup(hdmi_patch.stop)
         self.tv = RecordingTV()
         self.cfg = {
             **controller.DEFAULT_CONFIG,
@@ -988,6 +1151,22 @@ class VolumeCoordinatorTests(unittest.TestCase):
     def test_volume_up_routes_to_tv_only_after_system_reaches_maximum(self):
         self.assertFalse(self.volume.handle_key("up", system_is_max=False))
         self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+
+    def test_disconnect_then_reconnect_drops_buffer_and_old_queue_items(self):
+        connected = [True]
+        self.volume.BUFFER_SECONDS = 0.2
+        with mock.patch.object(controller, "hdmi_tv_connected", side_effect=lambda _cfg: connected[0]):
+            with self.volume._lock:
+                self.volume._tv_volume = 20
+            self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+            old_epoch = self.volume._epoch
+            connected[0] = False
+            self.volume.on_hdmi_disconnected()
+            connected[0] = True
+            self.volume._commands.put((old_epoch, "KEY_VOLUP"))
+            time.sleep(0.3)
+        self.assertEqual(self.tv.set_volumes, [])
+        self.assertEqual(self.tv.sent, [])
 
     def test_volume_keys_are_released_after_authorization_failure(self):
         self.tv.auth_required = True
@@ -1065,6 +1244,10 @@ class VolumeCoordinatorTests(unittest.TestCase):
 
 class ControllerInputTests(unittest.TestCase):
     def setUp(self):
+        controller._status_hdmi_connected = None
+        hdmi_patch = mock.patch.object(controller, "hdmi_tv_connected", return_value=True)
+        hdmi_patch.start()
+        self.addCleanup(hdmi_patch.stop)
         self.status_patch = mock.patch.object(controller, "write_status")
         self.status_patch.start()
         self.addCleanup(self.status_patch.stop)
@@ -1076,8 +1259,33 @@ class ControllerInputTests(unittest.TestCase):
                 controller_config(control_method),
                 backend,
             )
+            instance._hdmi_connected = True
         self.addCleanup(instance.stop)
         return instance, backend
+
+    def test_disconnect_clears_local_off_and_reconnect_does_not_send(self):
+        tv = RecordingTV()
+        instance, _backend = self.make_controller(tv=tv)
+        connected = [True]
+        with mock.patch.object(controller, "hdmi_tv_connected", side_effect=lambda _cfg: connected[0]):
+            self.assertTrue(instance.check_hdmi_connection())
+            instance.set_off(True)
+            instance.off_retry_at = 123.0
+            instance.pending_input_wake_at = 123.0
+            connected[0] = False
+            self.assertFalse(instance.check_hdmi_connection())
+            self.assertFalse(instance.is_off())
+            self.assertEqual(instance.off_retry_at, 0.0)
+            self.assertEqual(instance.pending_input_wake_at, 0.0)
+            self.assertEqual(instance.next_off_attempt, float("inf"))
+            instance.handle_input({"kind": "keyboard"})
+            self.assertEqual(instance.next_off_attempt, float("inf"))
+            connected[0] = True
+            self.assertTrue(instance.check_hdmi_connection())
+            self.assertEqual(instance.next_off_attempt, float("inf"))
+            instance.handle_input({"kind": "keyboard"})
+            self.assertEqual(instance.next_off_attempt, 0.0)
+        self.assertEqual(tv.sent, [])
 
     @staticmethod
     def enable_mouse_move_wake(instance):
@@ -1233,7 +1441,7 @@ class ControllerInputTests(unittest.TestCase):
         thread.assert_called_once()
         thread.return_value.start.assert_called_once_with()
 
-    def test_hotkey_is_one_way_picture_off_even_when_already_off(self):
+    def test_repeated_hotkey_does_not_toggle_picture_back_on(self):
         instance, backend = self.make_controller()
         clock = Clock(100.0)
 
@@ -1246,10 +1454,57 @@ class ControllerInputTests(unittest.TestCase):
         self.assertTrue(instance.is_off())
         self.assertEqual(
             instance.tv.sent,
-            ["KEY_PICTURE_OFF", "KEY_PICTURE_OFF"],
+            ["KEY_PICTURE_OFF"],
         )
         self.assertEqual(instance.pending_input_wake_at, 0.0)
-        self.assertEqual(backend.reset_calls, 3)
+        self.assertEqual(backend.reset_calls, 2)
+
+        instance.wake_not_before = 0.0
+        self.assertTrue(instance.wake("input", source="mouse_wheel"))
+        instance.handle_hotkey()
+        self.assertEqual(
+            instance.tv.sent,
+            ["KEY_PICTURE_OFF", "KEY_RETURN", "KEY_PICTURE_OFF"],
+        )
+
+    def test_definitely_rejected_hotkey_retries_once_after_delay(self):
+        tv = RecordingTV(results=[False, True])
+        tv.last_send_definitive_failure = True
+        instance, _backend = self.make_controller("smartthings", tv=tv)
+        clock = Clock(100.0)
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_hotkey()
+            self.assertEqual(instance.off_retry_at, 105.0)
+            instance._retry_rejected_hotkey(104.9)
+            self.assertEqual(tv.sent, ["KEY_PICTURE_OFF"])
+            clock.value = 105.0
+            instance._retry_rejected_hotkey(105.0)
+        self.assertEqual(tv.sent, ["KEY_PICTURE_OFF", "KEY_PICTURE_OFF"])
+        self.assertTrue(instance.is_off())
+        self.assertEqual(instance.off_retry_at, 0.0)
+
+    def test_ambiguous_failure_is_not_retried(self):
+        tv = RecordingTV(results=[False])
+        tv.last_send_definitive_failure = False
+        instance, _backend = self.make_controller("smartthings", tv=tv)
+        with mock.patch.object(controller.time, "monotonic", Clock(100.0)):
+            instance.handle_hotkey()
+            instance._retry_rejected_hotkey(1000.0)
+        self.assertEqual(tv.sent, ["KEY_PICTURE_OFF"])
+        self.assertEqual(instance.off_retry_at, 0.0)
+
+    def test_hardware_input_cancels_rejected_hotkey_retry(self):
+        tv = RecordingTV(results=[False])
+        tv.last_send_definitive_failure = True
+        instance, _backend = self.make_controller("smartthings", tv=tv)
+        clock = Clock(100.0)
+        with mock.patch.object(controller.time, "monotonic", clock):
+            instance.handle_hotkey()
+            clock.value = 101.0
+            instance.handle_input({"kind": "keyboard"})
+            instance._retry_rejected_hotkey(110.0)
+        self.assertEqual(tv.sent, ["KEY_PICTURE_OFF"])
+        self.assertEqual(instance.off_retry_at, 0.0)
 
     def test_hotkey_suppression_rejects_a_concurrent_key_event(self):
         instance, _backend = self.make_controller()

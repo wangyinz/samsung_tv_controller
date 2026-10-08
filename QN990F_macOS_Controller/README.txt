@@ -29,6 +29,10 @@ Makes a compatible Samsung TV behave more like a conventional computer display o
 6. Provides a TV menu-bar status item with repair, rebinding, reauthorization,
    restart, and log actions.
 
+7. Sends TV commands only while this Mac detects the exact Samsung TV bound at
+   setup as an online, native HDMI display. An absent, virtual, AirPlay, Sidecar,
+   or unidentified display cannot receive Picture Off, wake, or TV volume commands.
+
 
 Compatibility
 -------------
@@ -107,6 +111,14 @@ Direct LAN installation flow:
 
 Both modes ask whether to enable integrated volume control and ask for the
 automatic Picture Off idle interval. Enter 0 to disable automatic blanking.
+Keep the TV connected to this Mac through HDMI during installation. The installer
+asks you to bind the TV's physical display identity (EDID). USB-C to HDMI adapters
+that expose the TV's native EDID are supported. If the display cannot be identified,
+installation stops. Existing installations must run INSTALL.command or
+Configure.command once to create the HDMI binding; without it the controller
+will not send any TV commands. The binding is checked again before every TV
+command, including SmartThings cloud commands. Disconnecting HDMI leaves Mac
+volume keys under macOS control and suppresses pending TV retries.
 The installer enables automatic startup at login only after you confirm that the visual
 test actually succeeded.
 
@@ -187,8 +199,9 @@ listener may require Input Monitoring permission.
 Normal Use
 ----------
 Control + Command + P:
-    Sends Picture Off immediately. The hotkey is a one-way command: pressing it again
-    sends Picture Off again. It does not restore the picture and is not a toggle.
+    Requests Picture Off while the controller considers the picture awake.
+    Pressing it again while the local off intent is active sends no TV key:
+    on the tested TV, a second KEY_PICTURE_OFF turns the picture back on.
 
 After Picture Off:
     Press a non-modifier key, click a mouse button, or use the scroll wheel
@@ -381,8 +394,24 @@ Important Limitations
    turning a conventional TV off and on.
 
 2. SmartThings cloud mode depends on a public internet service. A successful API response
-   indicates only that the command was accepted, not that the TV executed it. Installation
-   and reconfiguration therefore require your visual confirmation.
+   reports a command receipt, not physical panel state. ACCEPTED means queued and even
+   COMPLETED cannot prove the panel is dark. FAILED is treated as failure, and the receipt
+   ID/status is logged without tokens. Installation and reconfiguration still require your
+   visual confirmation. Background commands use the official CLI's saved OAuth profile and
+   refresh lock, without a second authorization chain.
+
+   A hotkey command explicitly reported FAILED may be retried up to three times after
+   5/15/30 seconds unless local input intervenes. Ambiguous timeouts are not retried:
+   the TV might already have toggled the picture. The controller does not periodically
+   resend KEY_PICTURE_OFF.
+
+   The off/awake state is local to this controller. A TV remote, another
+   controller on a second computer, or a TV-side event can change the picture
+   without updating it. Two computers cannot coordinate Picture Off through
+   their local state alone. If the TV is visibly on while this controller
+   still shows an off intent, use one genuine Mac input to perform the
+   configured wake action, then press the hotkey once to request Picture Off
+   again. This may briefly show the TV's wake UI.
 
 3. The SmartThings mobile plugin uses the Samsung TV's private OCF remote-control resource.
    The script reproduces the same request through the deprecated execute capability exposed

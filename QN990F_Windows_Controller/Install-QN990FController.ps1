@@ -684,6 +684,7 @@ try {
         $Config = [ordered]@{
             control_method = $ControlMethod
             tv_ip = $TvIp
+            hdmi_target = $null
             port = 8002
             idle_minutes = [double]$IdleMinutes
             enable_idle_off = ($IdleMinutes -gt 0)
@@ -738,6 +739,39 @@ try {
         $Config["tv_volume_refresh_seconds"] = [Math]::Max(
             30.0, [double]$Config["tv_volume_refresh_seconds"]
         )
+
+        Write-Step "Binding the local HDMI display"
+        $HdmiJson = & $VenvPython $SourceControllerPath --list-hdmi-targets
+        if ($LASTEXITCODE -ne 0) {
+            throw "Windows could not enumerate active HDMI displays. The controller cannot send TV commands without a local HDMI display."
+        }
+        $HdmiTargets = @($HdmiJson | ConvertFrom-Json)
+        if ($HdmiTargets.Count -eq 0) {
+            throw "No identifiable active HDMI display was found. Connect this PC to the target TV by HDMI and rerun the installer."
+        }
+        Write-Host "Select the HDMI display physically connected to the configured TV:"
+        for ($Index = 0; $Index -lt $HdmiTargets.Count; $Index++) {
+            $Target = $HdmiTargets[$Index]
+            Write-Host "  $($Index + 1). $($Target.name) [EDID $($Target.manufacturer):$($Target.product)] $($Target.path)"
+        }
+        $Previous = $Config["hdmi_target"]
+        $Matching = @($HdmiTargets | Where-Object {
+            $Previous -and $_.path -eq $Previous.path -and
+            $_.manufacturer -eq $Previous.manufacturer -and
+            $_.product -eq $Previous.product
+        })
+        if (-not $TvIpChanged -and -not $ControlMethodChanged -and $Matching.Count -eq 1) {
+            $Config["hdmi_target"] = $Matching[0]
+            Write-Host "Preserving bound HDMI display: $($Matching[0].name)"
+        } else {
+            $ChoiceText = Read-Host "Choose the configured TV's HDMI display (1-$($HdmiTargets.Count))"
+            $Choice = 0
+            if ((-not [int]::TryParse($ChoiceText, [ref]$Choice)) -or
+                $Choice -lt 1 -or $Choice -gt $HdmiTargets.Count) {
+                throw "An explicit HDMI display selection is required. No TV commands will be enabled."
+            }
+            $Config["hdmi_target"] = $HdmiTargets[$Choice - 1]
+        }
         $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigPath -Encoding UTF8
 
         Write-Step "Checking the global hotkey"

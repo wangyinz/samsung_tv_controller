@@ -221,14 +221,34 @@ on plistValue(filePath, keyName, fallbackValue)
 end plistValue
 
 on refreshStatus()
+    set controllerInfo to my readJSON("status.json")
     set controllerState to my plistValue(appDir & "status.json", "state", "stopped")
     set volumeState to my plistValue(appDir & "health.json", "volume_control_state", "unknown")
     set volumeMessage to my plistValue(appDir & "health.json", "volume_control_message", "No volume status is available.")
-    controllerLine's setTitle:("Controller: " & controllerState)
+    set controllerDisplay to controllerState
+    if controllerInfo is not missing value then
+        set lastAction to controllerInfo's objectForKey:"last_action"
+        if controllerState is "hdmi_disconnected" then
+            set controllerDisplay to "TV HDMI disconnected; connect/bind TV HDMI"
+        else if controllerState is "picture_off" then
+            set controllerDisplay to "Picture Off request sent; screen unverified"
+        else if controllerState is "error" and lastAction is not missing value and (lastAction as text) is "blank_failed" then
+            set retryPending to controllerInfo's objectForKey:"off_retry_pending"
+            set pictureConfirmation to controllerInfo's objectForKey:"picture_confirmation"
+            if retryPending is not missing value and (retryPending as boolean) then
+                set controllerDisplay to "Picture Off failed; retry pending"
+            else if pictureConfirmation is not missing value and (pictureConfirmation as text) is "rejected" then
+                set controllerDisplay to "Picture Off failed"
+            else
+                set controllerDisplay to "Picture Off outcome unknown"
+            end if
+        end if
+    end if
+    controllerLine's setTitle:("Controller: " & controllerDisplay)
     volumeLine's setTitle:("Volume: " & volumeMessage)
     if controllerState is "authorization_required" or controllerState is "error" or controllerState is "stopped" then
         statusItem's button's setTitle:"TV×"
-    else if volumeState is "input_permission_required" or volumeState is "binding_required" or volumeState is "error" then
+    else if controllerState is "hdmi_disconnected" or volumeState is "hdmi_disconnected" or volumeState is "input_permission_required" or volumeState is "binding_required" or volumeState is "error" then
         statusItem's button's setTitle:"TV!"
     else
         statusItem's button's setTitle:"TV"

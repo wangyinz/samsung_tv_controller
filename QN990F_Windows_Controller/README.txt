@@ -5,8 +5,23 @@ PURPOSE
 -------
 Makes a compatible Samsung TV behave more like a PC monitor on Windows:
 
+The controller sends TV control commands only while Windows reports the
+selected TV as an active, identifiable HDMI display on this PC. The installer
+asks you to choose that HDMI display and stores its Windows monitor path and
+EDID manufacturer/product IDs. A reachable TV IP or SmartThings account alone
+does not enable remote control. If the HDMI cable is unplugged, the display is
+inactive, the selected monitor changes, or Windows cannot inspect its display
+topology, Picture Off, wake, and TV volume commands are blocked. System volume
+keys keep their ordinary Windows behavior when the TV is not connected.
+
+Run Configure from the Start menu to select the correct HDMI display after
+changing a cable, GPU, adapter, or Windows monitor identity. Existing installs
+without an HDMI binding will block all TV commands until this is done or the
+installer is rerun. The active HDMI path is checked before each TV command;
+Picture Off normally keeps the HDMI path active while the panel is black.
+
 1) Global hotkey (default Ctrl+Alt+P)
-   -> always sends Samsung Tizen KEY_PICTURE_OFF.
+   -> requests Samsung Tizen KEY_PICTURE_OFF while locally awake.
 
 2) If this controller blanked the TV, the next qualifying keyboard or mouse
    input sends KEY_RETURN to wake the picture.
@@ -130,8 +145,9 @@ remove/clear the denied device if necessary, and pair again.
 NORMAL USE
 ----------
 Ctrl+Alt+P
-    Picture Off immediately. The hotkey is one-way: pressing it again sends
-    Picture Off again; it never acts as a wake/toggle command.
+    Request Picture Off while the controller considers the picture awake.
+    Pressing it again while the local off intent is active sends no TV key:
+    on the tested TV, a second KEY_PICTURE_OFF turns the picture back on.
 
 After Picture Off:
     Press a non-modifier key, press a mouse button, or use the wheel
@@ -262,6 +278,25 @@ IMPORTANT BEHAVIOR / LIMITATIONS
 --------------------------------
 - KEY_PICTURE_OFF is a Samsung remote key, not Windows display sleep.
   The HDMI connection remains logically active; this is why it is useful here.
+
+- SmartThings command receipts report ACCEPTED, COMPLETED, or FAILED. The
+  controller rejects FAILED and logs the receipt ID/status. Even COMPLETED
+  cannot prove the physical panel is dark; status therefore says unverified.
+  The command API reuses the official CLI's saved OAuth credentials and the
+  same refresh lock, without another authorization profile.
+
+- An explicitly FAILED hotkey command may be retried up to three times with
+  5/15/30-second delays, unless local input intervenes. An ambiguous network
+  timeout is not retried, because the TV may already have toggled the picture.
+  The controller never periodically resends KEY_PICTURE_OFF.
+
+- The off/awake state is local to this controller. A TV remote, another
+  controller on a second computer, or a TV-side event can change the picture
+  without updating this state. Two computers using the same TV cannot
+  coordinate Picture Off through their local state alone. If the TV is visibly
+  on while this controller still shows an off intent, use one genuine PC input
+  to perform the configured wake action, then press the hotkey once to request
+  Picture Off again. This may briefly show the TV's wake UI.
 
 - Samsung firmware can silently ignore unsupported KEY_* values. A new install
   therefore asks you to visually confirm the Picture Off test.

@@ -49,6 +49,40 @@ if (-not [string]::IsNullOrWhiteSpace($Respect)) {
     $Config.respect_display_required = ($Respect -notmatch '^[Nn]')
 }
 
+Write-Host ""
+Write-Host "Checking locally connected HDMI displays..."
+$HdmiJson = & $VenvPython $ControllerPath --list-hdmi-targets
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows could not inspect HDMI displays. No configuration was saved."
+}
+$HdmiTargets = @($HdmiJson | ConvertFrom-Json)
+if ($HdmiTargets.Count -eq 0) {
+    throw "No identifiable active HDMI display was found. Connect this PC to the target TV and rerun Configure."
+}
+for ($Index = 0; $Index -lt $HdmiTargets.Count; $Index++) {
+    $Target = $HdmiTargets[$Index]
+    Write-Host "  $($Index + 1). $($Target.name) [EDID $($Target.manufacturer):$($Target.product)] $($Target.path)"
+}
+$CurrentBinding = $Config.hdmi_target
+$ExistingChoice = 0
+for ($Index = 0; $Index -lt $HdmiTargets.Count; $Index++) {
+    if ($CurrentBinding -and $HdmiTargets[$Index].path -eq $CurrentBinding.path -and
+        $HdmiTargets[$Index].manufacturer -eq $CurrentBinding.manufacturer -and
+        $HdmiTargets[$Index].product -eq $CurrentBinding.product) {
+        $ExistingChoice = $Index + 1
+        break
+    }
+}
+$Prompt = if ($ExistingChoice) { "Choose the TV HDMI display [$ExistingChoice]" } else { "Choose the TV HDMI display (1-$($HdmiTargets.Count))" }
+$ChoiceText = Read-Host $Prompt
+if ([string]::IsNullOrWhiteSpace($ChoiceText) -and $ExistingChoice) { $ChoiceText = [string]$ExistingChoice }
+$Choice = 0
+if ((-not [int]::TryParse($ChoiceText, [ref]$Choice)) -or
+    $Choice -lt 1 -or $Choice -gt $HdmiTargets.Count) {
+    throw "An explicit HDMI display selection is required. No configuration was saved."
+}
+$Config | Add-Member -NotePropertyName hdmi_target -NotePropertyValue $HdmiTargets[$Choice - 1] -Force
+
 $Config | ConvertTo-Json -Depth 5 | Set-Content $ConfigPath -Encoding UTF8
 
 # Stop the current daemon so the hotkey is free for validation.

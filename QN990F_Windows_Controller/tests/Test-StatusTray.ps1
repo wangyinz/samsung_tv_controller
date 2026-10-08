@@ -253,6 +253,11 @@ try {
     Write-TestStatus
     Update-VolumeStatus $true 123
     Assert-True (-not $VolumeSlider.IsEnabled -and $VolumeNotice.Text -eq $Status.message) "Unsupported connection explanation"
+    $Status.state = "hdmi_disconnected"
+    $Status.message = "Bound TV is not connected by HDMI; TV volume control is inactive."
+    Write-TestStatus
+    Update-VolumeStatus $true 123
+    Assert-True (-not $VolumeSlider.IsEnabled -and $VolumeNotice.Text -like "*not connected by HDMI*") "HDMI disconnect disables volume and explains why"
 
     Remove-Item -LiteralPath $VolumeStatusPath
     Update-VolumeStatus $true 123

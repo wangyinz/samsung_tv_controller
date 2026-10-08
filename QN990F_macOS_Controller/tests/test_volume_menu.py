@@ -21,7 +21,11 @@ def load_worker(platform):
     path = ROOT / f"QN990F_{platform}_Controller" / "QN990FController.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "VolumeCoordinator")
-    namespace = dict(globals(), logger=logging.getLogger("volume-menu-test"))
+    namespace = dict(
+        globals(), logger=logging.getLogger("volume-menu-test"),
+        hdmi_tv_connected=lambda _cfg: True,
+        hdmi_target_connected=lambda _cfg: True,
+    )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["VolumeCoordinator"]
 
