@@ -175,6 +175,7 @@
             <StackPanel x:Name="ActionsPanel" Margin="-6,14,-6,-6">
                 <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="6,0,6,8"/>
                 <Button x:Name="ConfigureItem" Content="_Configure controller..."/>
+                <Button x:Name="RebindHdmiItem" Content="Re_bind HDMI TV..."/>
                 <Button x:Name="ReauthorizeItem" Content="_Reauthorize SmartThings..."/>
                 <Button x:Name="RestartItem" Content="Re_start controller"/>
                 <Button x:Name="LogItem" Content="Open controller _log"/>

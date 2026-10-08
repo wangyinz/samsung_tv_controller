@@ -62,6 +62,7 @@ on buildStatusMenu()
     my addFullMenuItem(current application's NSMenuItem's separatorItem())
     my addFullMenuItem(my actionItem("Repair Input Monitoring…", "repairInputMonitoring:"))
     my addFullMenuItem(my actionItem("Bind Current TV Audio Output…", "bindAudioOutput:"))
+    my addFullMenuItem(my actionItem("Rebind HDMI TV…", "rebindHDMITV:"))
     my addFullMenuItem(my actionItem("Reauthorize SmartThings…", "reauthorizeSmartThings:"))
     my addFullMenuItem(my actionItem("Restart Controller", "restartController:"))
     my addFullMenuItem(my actionItem("Open Controller Log", "openLog:"))
@@ -268,6 +269,10 @@ end repairInputMonitoring_
 on bindAudioOutput_(sender)
     do shell script "/usr/bin/open " & quoted form of (appDir & "BindAudioOutput.command")
 end bindAudioOutput_
+
+on rebindHDMITV_(sender)
+    do shell script "/usr/bin/open " & quoted form of (appDir & "Rebind-HDMI.command")
+end rebindHDMITV_
 
 on reauthorizeSmartThings_(sender)
     do shell script "/usr/bin/open " & quoted form of (appDir & "Reauthorize.command")

@@ -19,6 +19,11 @@ changing a cable, GPU, adapter, or Windows monitor identity. Existing installs
 without an HDMI binding will block all TV commands until this is done or the
 installer is rerun. The active HDMI path is checked before each TV command;
 Picture Off normally keeps the HDMI path active while the panel is black.
+To change only the HDMI binding, right-click the controller tray icon and
+choose "Rebind HDMI TV...". This works even when the current binding is
+disconnected. The helper lists currently connected HDMI displays, requires
+an explicit choice and confirmation, and preserves all other settings. It
+does not pair with the TV or send Picture Off, wake, or volume commands.
 
 1) Global hotkey (default Ctrl+Alt+P)
    -> requests Samsung Tizen KEY_PICTURE_OFF while locally awake.
@@ -201,6 +206,9 @@ CONFIGURATION
 -------------
 Use Start menu:
     Samsung TV Picture Controller -> Configure Samsung TV Picture Controller
+
+For HDMI rebinding only, right-click the notification-area icon and choose
+"Rebind HDMI TV..." after connecting this PC to the TV by HDMI.
 
 For SmartThings sign-in only, use:
     Samsung TV Picture Controller -> Reauthorize SmartThings

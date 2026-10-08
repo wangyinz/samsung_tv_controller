@@ -50,7 +50,10 @@ on run argv
     set theMenu to implementation's statusMenu
     set theSlider to implementation's volumeSlider
     set allCount to theMenu's numberOfItems() as integer
-    my assertThat(allCount is 12, "All recovery actions and the slider should be retained")
+    my assertThat(allCount is 13, "All recovery actions and the slider should be retained")
+    set rebindItem to theMenu's itemWithTitle:"Rebind HDMI TV…"
+    my assertThat(rebindItem is not missing value, "HDMI rebinding must be available in the full menu")
+    my assertThat((rebindItem's action() as text) is "rebindHDMITV:", "HDMI rebinding must have its own action")
     set implementation's pendingVolumeID to "pending-test-request"
     set implementation's volumeSession to "test-session"
     theSlider's setIntegerValue:37

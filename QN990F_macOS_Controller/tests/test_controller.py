@@ -1263,6 +1263,15 @@ class ControllerInputTests(unittest.TestCase):
         self.addCleanup(instance.stop)
         return instance, backend
 
+    def test_rebind_restart_defers_idle_off_until_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guard = Path(directory) / "hdmi-rebind-no-idle-off"
+            guard.touch()
+            with mock.patch.object(controller, "REBIND_IDLE_GUARD_FILE", guard):
+                instance, _backend = self.make_controller()
+            self.assertEqual(instance.next_off_attempt, float("inf"))
+            self.assertFalse(guard.exists())
+
     def test_disconnect_clears_local_off_and_reconnect_does_not_send(self):
         tv = RecordingTV()
         instance, _backend = self.make_controller(tv=tv)

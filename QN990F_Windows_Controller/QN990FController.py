@@ -2945,7 +2945,7 @@ def remove_pid_file() -> None:
         pass
 
 
-def run_daemon(config: dict) -> int:
+def run_daemon(config: dict, *, suppress_startup_idle: bool = False) -> int:
     mutex = None
     controller = None
     input_window = None
@@ -2960,6 +2960,10 @@ def run_daemon(config: dict) -> int:
         start_status_tray()
 
         controller = Controller(config, volume_menu=True)
+        if suppress_startup_idle:
+            # Rebinding restarts the daemon after a potentially long absence.
+            # Wait for fresh local hardware input before any idle Picture Off.
+            controller.next_off_attempt = float("inf")
         controller.start_authorization_monitor()
         input_window = RawInputWindow(config)
         input_window.create()
@@ -3056,6 +3060,7 @@ def main() -> int:
     mode.add_argument("--self-test", action="store_true")
     mode.add_argument("--list-hdmi-targets", action="store_true")
     mode.add_argument("--diagnose-hdmi-targets", action="store_true")
+    parser.add_argument("--suppress-startup-idle", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
@@ -3164,7 +3169,7 @@ def main() -> int:
         return 6
     logger.info(message)
 
-    return run_daemon(config)
+    return run_daemon(config, suppress_startup_idle=args.suppress_startup_idle)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,9 @@ monitor.
   devices, Mac speakers, headphones, and adjustable outputs remain under macOS control.
 - A macOS menu-bar item and Windows notification-area icon with live status and
   platform-appropriate repair, reauthorization, restart, and log actions.
+- A dedicated `Rebind HDMI TV` action in each full status menu. It selects a
+  currently connected TV without changing other settings or repeating TV pairing
+  or the Picture Off test.
 - A TV-volume slider in both status menus. In SmartThings mode, choose an exact
   value from 0 to 100 and release the slider to apply it. On either platform,
   left-click the status icon for volume only; right-click for the full menu.

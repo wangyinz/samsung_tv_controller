@@ -33,6 +33,18 @@ class HDMICommandGuardTests(unittest.TestCase):
         self.config = controller.DEFAULT_CONFIG.copy()
         self.config.update({"tv_ip": "192.0.2.1", "enable_volume_control": False})
 
+    def test_rebind_restart_cli_disables_idle_until_fresh_input(self):
+        fake_client = mock.Mock()
+        with mock.patch.object(controller.sys, "argv", ["QN990FController.py", "--suppress-startup-idle"]), \
+             mock.patch.object(controller, "load_config", return_value=self.config), \
+             mock.patch.object(controller, "make_tv_client", return_value=fake_client), \
+             mock.patch.object(controller, "self_test_structures", return_value=(True, "ok")), \
+             mock.patch.object(controller, "run_daemon", return_value=0) as run:
+            self.assertEqual(controller.main(), 0)
+        run.assert_called_once_with(self.config, suppress_startup_idle=True)
+        self.assertTrue(self.config["enable_idle_off"])
+        fake_client.close.assert_called_once()
+
     def test_missing_or_wrong_target_fails_closed(self):
         target = {"path": "monitor-instance#edid-hash", "manufacturer": 11596,
                   "product": 31013, "name": "SAMSUNG"}

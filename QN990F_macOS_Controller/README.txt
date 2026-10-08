@@ -119,6 +119,12 @@ Configure.command once to create the HDMI binding; without it the controller
 will not send any TV commands. The binding is checked again before every TV
 command, including SmartThings cloud commands. Disconnecting HDMI leaves Mac
 volume keys under macOS control and suppresses pending TV retries.
+After installation, right-click the TV menu-bar item and choose Rebind HDMI TV…
+to select the currently connected TV again. The rebinding prompt does not send
+any TV command or open SmartThings sign-in. It changes only the physical HDMI
+identity; existing volume, idle, network, and authorization settings are kept.
+If the controller was running, it restarts after saving. If it was stopped, it
+remains stopped. Canceling or losing the HDMI connection leaves settings alone.
 The installer enables automatic startup at login only after you confirm that the visual
 test actually succeeded.
 
@@ -299,6 +305,7 @@ To renew only the SmartThings sign-in, double-click:
 The TV menu-bar item provides the common recovery actions:
 - Left-click: the TV volume slider and its current status only
 - Right-click or Control-click: the full status and recovery menu
+- Rebind HDMI TV…: select and confirm the connected TV's HDMI identity
 - No distinct double-click action is assigned
 - TV: controller is running and no volume repair is required
 - TV!: Input Monitoring, output binding, or volume status needs attention
@@ -321,6 +328,8 @@ Use Repair Input Monitoring after privacy authorization is lost. Use Bind Curren
 Audio Output only after selecting and confirming the intended TV in macOS Sound settings;
 this explicit confirmation is how the controller relates a Core Audio device to the TV.
 It does not guess from a display name or a SmartThings label.
+Rebind HDMI TV… is also available while the menu displays TV! for a disconnected
+or mismatched HDMI connection.
 
 Hotkey examples:
     Ctrl+Cmd+P

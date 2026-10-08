@@ -97,7 +97,7 @@ try {
     $Flyout = $null
     $ControlNames = @(
         "ControllerItem", "VolumeItem", "TVVolumeLabel", "VolumeSlider", "VolumeNotice",
-        "ConfigureItem", "ReauthorizeItem", "RestartItem", "LogItem", "ExitItem", "StatusPanel", "ActionsPanel", "FlyoutScroll"
+        "ConfigureItem", "RebindHdmiItem", "ReauthorizeItem", "RestartItem", "LogItem", "ExitItem", "StatusPanel", "ActionsPanel", "FlyoutScroll"
     )
     if ($WithWpf) {
         if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") { throw "Run with -Sta." }
@@ -146,6 +146,7 @@ try {
         foreach ($Full in @($true, $false)) {
             $StatusPanel.Visibility = if ($Full) { "Visible" } else { "Collapsed" }
             $ActionsPanel.Visibility = $StatusPanel.Visibility
+            Assert-True (($RebindHdmiItem.IsVisible -eq $Full) -or -not $Flyout.IsVisible) "HDMI rebind belongs to the full right-click menu"
             $Flyout.Content.Measure([Windows.Size]::new(360, [double]::PositiveInfinity))
             $Flyout.Content.Arrange([Windows.Rect]::new(0, 0, 360, $Flyout.Content.DesiredSize.Height))
             $Flyout.Content.UpdateLayout()

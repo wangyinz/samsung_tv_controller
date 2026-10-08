@@ -215,11 +215,14 @@ cp "$SCRIPT_DIR/Configure.command" "$APP_DIR/Configure.command"
 cp "$SCRIPT_DIR/Reauthorize.command" "$APP_DIR/Reauthorize.command"
 cp "$SCRIPT_DIR/RepairInputMonitoring.command" "$APP_DIR/RepairInputMonitoring.command"
 cp "$SCRIPT_DIR/BindAudioOutput.command" "$APP_DIR/BindAudioOutput.command"
+cp "$SCRIPT_DIR/Rebind-HDMI.command" "$APP_DIR/Rebind-HDMI.command"
+cp "$SCRIPT_DIR/Rebind-HDMI.py" "$APP_DIR/Rebind-HDMI.py"
 cp "$SCRIPT_DIR/Uninstall.command" "$APP_DIR/Uninstall.command"
 cp "$SCRIPT_DIR/README.txt" "$APP_DIR/README.txt"
 chmod 755 "$CONTROLLER" "$APP_DIR/Configure.command" \
   "$APP_DIR/Reauthorize.command" "$APP_DIR/RepairInputMonitoring.command" \
-  "$APP_DIR/BindAudioOutput.command" "$APP_DIR/Uninstall.command"
+  "$APP_DIR/BindAudioOutput.command" "$APP_DIR/Rebind-HDMI.command" \
+  "$APP_DIR/Rebind-HDMI.py" "$APP_DIR/Uninstall.command"
 
 rm -rf -- "$STATUS_APP"
 /usr/bin/osacompile -s -o "$STATUS_APP" "$SCRIPT_DIR/StatusMenu.applescript"

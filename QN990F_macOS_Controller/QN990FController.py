@@ -40,6 +40,7 @@ STATUS_FILE = APP_DIR / "status.json"
 HEALTH_FILE = APP_DIR / "health.json"
 LOCK_FILE = APP_DIR / "controller.lock"
 SMARTTHINGS_LOCK_FILE = APP_DIR / "smartthings.lock"
+REBIND_IDLE_GUARD_FILE = APP_DIR / "hdmi-rebind-no-idle-off"
 SMARTTHINGS_CREDENTIALS_FILE = (
     Path.home() / "Library" / "Application Support"
     / "@smartthings" / "cli" / "credentials.json"
@@ -2139,6 +2140,15 @@ class Controller:
         self.picture_off = False
         self.wake_not_before = 0.0
         self.next_off_attempt = 0.0
+        try:
+            if REBIND_IDLE_GUARD_FILE.exists():
+                self.next_off_attempt = float("inf")
+                REBIND_IDLE_GUARD_FILE.unlink()
+                logger.info("Deferred automatic Picture Off after HDMI rebind until local input")
+        except OSError as exc:
+            # A failed marker read must never make rebinding send an idle command.
+            self.next_off_attempt = float("inf")
+            logger.warning("Could not consume HDMI rebind idle guard: %s", exc)
         self.next_wake_attempt = 0.0
         self.off_retry_at = 0.0
         self.off_retry_count = 0

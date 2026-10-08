@@ -173,6 +173,7 @@ $ControllerPidPath = Join-Path $AppDir "controller.pid"
 $PythonWPath = Join-Path $AppDir "venv\Scripts\pythonw.exe"
 $TrayPidPath = Join-Path $AppDir "status-tray.pid"
 $ConfigurePath = Join-Path $AppDir "Configure-QN990FController.ps1"
+$RebindHdmiPath = Join-Path $AppDir "Rebind-HDMI.ps1"
 $ReauthorizePath = Join-Path $AppDir "Reauthorize-SmartThings.ps1"
 $LogPath = Join-Path $AppDir "controller.log"
 $VolumeStatusPath = Join-Path $AppDir "volume-status.json"
@@ -212,6 +213,7 @@ try {
     $VolumeSlider = $Flyout.FindName("VolumeSlider")
     $VolumeNotice = $Flyout.FindName("VolumeNotice")
     $ConfigureItem = $Flyout.FindName("ConfigureItem")
+    $RebindHdmiItem = $Flyout.FindName("RebindHdmiItem")
     $ReauthorizeItem = $Flyout.FindName("ReauthorizeItem")
     $RestartItem = $Flyout.FindName("RestartItem")
     $LogItem = $Flyout.FindName("LogItem")
@@ -606,6 +608,11 @@ try {
     $ConfigureItem.Add_Click({
         Hide-Flyout $true
         try { Start-ControllerHelper $ConfigurePath }
+        catch { Show-TrayError $_.Exception.Message }
+    })
+    $RebindHdmiItem.Add_Click({
+        Hide-Flyout $true
+        try { Start-ControllerHelper $RebindHdmiPath }
         catch { Show-TrayError $_.Exception.Message }
     })
     $ReauthorizeItem.Add_Click({
