@@ -46,6 +46,24 @@ class HDMICommandGuardTests(unittest.TestCase):
                                    side_effect=OSError("topology unavailable")):
                 self.assertFalse(controller.hdmi_target_connected(self.config))
 
+    def test_native_monitor_path_changes_do_not_change_bound_identity(self):
+        name = controller._DISPLAY_NAME()
+        name.manufacturer = 11596
+        name.product = 31013
+        name.friendly = "SAMSUNG"
+        identity = "system\\currentcontrolset\\enum\\display\\sam7925\\uid4352#edid"
+        with mock.patch.object(controller, "_registry_hdmi_identity",
+                               return_value=identity) as registry:
+            name.path = ""
+            missing_path = controller._canonical_hdmi_target(4352, name)
+            name.path = r"\\?\DISPLAY#SAM7925#UID4352"
+            reported_path = controller._canonical_hdmi_target(4352, name)
+            self.assertEqual(missing_path, reported_path)
+            self.assertEqual(reported_path["path"], identity)
+            self.assertEqual(registry.call_count, 2)
+        with mock.patch.object(controller, "_registry_hdmi_identity", return_value=""):
+            self.assertIsNone(controller._canonical_hdmi_target(4352, name))
+
     def test_topology_warning_is_rate_limited_without_caching_connection(self):
         self.config["hdmi_target"] = {"path": "bound", "manufacturer": 1, "product": 2}
         controller._hdmi_warning_next_at = 0.0

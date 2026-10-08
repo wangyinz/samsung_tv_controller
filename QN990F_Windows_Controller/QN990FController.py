@@ -191,6 +191,20 @@ def _registry_hdmi_identity(target_id: int, manufacturer: int,
     return matches[0] if len(matches) == 1 else ""
 
 
+def _canonical_hdmi_target(target_id: int, name: _DISPLAY_NAME):
+    # Some Samsung drivers intermittently omit monitorDevicePath even while
+    # the native active target and EDID remain unchanged. Never use that
+    # optional field for binding, or the same TV could acquire two identities.
+    identity = _registry_hdmi_identity(
+        target_id, int(name.manufacturer), int(name.product))
+    if not identity:
+        return None
+    return {"path": identity,
+            "manufacturer": int(name.manufacturer),
+            "product": int(name.product),
+            "name": name.friendly}
+
+
 def active_hdmi_targets(diagnostics=None) -> list[dict]:
     """Return identifiable, active HDMI monitors; raise on topology errors."""
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -248,14 +262,9 @@ def active_hdmi_targets(diagnostics=None) -> list[dict]:
                 continue
             if not name.flags & 4:
                 continue
-            identity = name.path.lower() if name.path else _registry_hdmi_identity(
-                int(path.target.id), int(name.manufacturer), int(name.product))
-            if not identity:
-                continue
-            targets.append({"path": identity,
-                            "manufacturer": int(name.manufacturer),
-                            "product": int(name.product),
-                            "name": name.friendly})
+            target = _canonical_hdmi_target(int(path.target.id), name)
+            if target is not None:
+                targets.append(target)
         return targets
     raise OSError(122, "Display topology kept changing")
 
