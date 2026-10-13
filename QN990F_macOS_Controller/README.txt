@@ -157,8 +157,10 @@ optional integrated volume control.
 
 macOS Privacy Permission
 ------------------------
-The controller uses IOHIDManager matching limited to the standard scroll-wheel,
-Volume Up, and Volume Down usages. If macOS denies access, add the installed
+The controller opens only standard keyboard, pointing, and media-control HID
+interfaces, excluding unrelated vendor-specific interfaces that may reject Open
+even with permission granted. A separate input-value filter accepts only the
+standard scroll-wheel, Volume Up, and Volume Down usages. If macOS denies access, add the installed
 venv Python runtime to System Settings -> Privacy & Security -> Input Monitoring
 when macOS prompts. The controller does not subscribe to ordinary typed-key
 usages. If registration is unavailable while login is still starting, the controller
@@ -166,6 +168,9 @@ retries three times without delaying the global hotkey. If all attempts fail, Pi
 and keyboard/button wake continue, but wheel wake and volume routing are disabled for
 that run. A definite permission denial shows a recovery alert immediately and changes
 the menu-bar title to TV!.
+Device/driver startup errors are shown as errors, not as missing privacy permission;
+they do not prompt the user to reauthorize Input Monitoring. Failed opens are closed
+before retrying, including managers that opened only a subset of their devices.
 
 The required runtime is installed under the current user's Library:
     ~/Library/Application Support/QN990FController/venv/bin/python

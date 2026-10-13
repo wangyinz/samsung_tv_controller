@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 from pathlib import Path
 import subprocess
 import sys
@@ -558,6 +559,75 @@ class MacOSBackendTests(unittest.TestCase):
 
 
 class DirectHIDStartupTests(unittest.TestCase):
+    def test_input_device_matching_excludes_vendor_specific_interfaces(self):
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+        backend._create_hid_matching = mock.Mock(return_value=(123, []))
+        backend._create_device_hid_matching()
+        usages, page_key, usage_key = backend._create_hid_matching.call_args.args
+        self.assertEqual((page_key, usage_key), ("PrimaryUsagePage", "PrimaryUsage"))
+        self.assertIn((1, 2), usages)  # mouse / wheel
+        self.assertIn((1, 6), usages)  # ordinary and Karabiner keyboards
+        self.assertIn((1, 128), usages)  # standalone system controls
+        self.assertIn((12, 1), usages)  # media controls
+        self.assertFalse(any(page >= 0xff00 for page, _ in usages))
+
+    def test_partial_open_error_closes_manager_and_keeps_device_filter(self):
+        backend = controller.MacOSBackend.__new__(controller.MacOSBackend)
+        backend.iokit = mock.Mock()
+        backend.corefoundation = mock.Mock()
+        backend.iokit.IOHIDCheckAccess.return_value = 0
+        backend.iokit.IOHIDManagerCreate.return_value = 1
+        backend.iokit.IOHIDManagerOpen.return_value = -536870201
+        backend._run_loop_default_mode = controller.c_void_p(2)
+        backend.corefoundation.CFRunLoopGetCurrent.return_value = 3
+        backend._create_device_hid_matching = mock.Mock(return_value=(101, []))
+        backend._create_volume_hid_matching = mock.Mock(return_value=(102, []))
+        with self.assertRaisesRegex(RuntimeError, "IOReturn -536870201"):
+            backend.register_volume_keys(request_access=False)
+        backend._volume_thread.join(timeout=1)
+        self.assertFalse(backend._volume_thread.is_alive())
+        backend.iokit.IOHIDManagerSetDeviceMatchingMultiple.assert_called_once()
+        self.assertEqual(backend.iokit.IOHIDManagerSetDeviceMatchingMultiple.call_args.args[1], 101)
+        backend.iokit.IOHIDManagerSetDeviceMatching.assert_not_called()
+        backend.iokit.IOHIDManagerSetInputValueMatchingMultiple.assert_called_once()
+        self.assertEqual(backend.iokit.IOHIDManagerSetInputValueMatchingMultiple.call_args.args[1], 102)
+        backend.iokit.IOHIDManagerClose.assert_called_once()
+        backend.iokit.IOHIDRequestAccess.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Native CoreFoundation requires macOS")
+    def test_native_hid_matching_dictionaries_have_separate_device_and_value_keys(self):
+        # Build real CF objects but do not create/open a manager or listen to input.
+        backend = controller.MacOSBackend()
+        cf = backend.corefoundation
+        cf.CFPropertyListCreateData.argtypes = [
+            controller.c_void_p, controller.c_void_p, controller.c_long,
+            controller.c_ulong, controller.c_void_p,
+        ]
+        cf.CFPropertyListCreateData.restype = controller.c_void_p
+        cf.CFDataGetLength.argtypes = [controller.c_void_p]
+        cf.CFDataGetLength.restype = controller.c_long
+        cf.CFDataGetBytePtr.argtypes = [controller.c_void_p]
+        cf.CFDataGetBytePtr.restype = controller.POINTER(controller.c_uint8)
+        for create, keys, expected_count in (
+            (backend._create_device_hid_matching, {"PrimaryUsagePage", "PrimaryUsage"}, 6),
+            (backend._create_volume_hid_matching, {"UsagePage", "Usage"}, 5),
+        ):
+            array, refs = create()
+            data = None
+            try:
+                data = cf.CFPropertyListCreateData(None, array, 200, 0, None)
+                self.assertTrue(data)
+                decoded = plistlib.loads(controller.ctypes.string_at(
+                    cf.CFDataGetBytePtr(data), cf.CFDataGetLength(data)
+                ))
+                self.assertEqual(len(decoded), expected_count)
+                self.assertTrue(all(set(item) == keys for item in decoded))
+            finally:
+                if data:
+                    cf.CFRelease(data)
+                for ref in reversed(refs):
+                    cf.CFRelease(ref)
+
     class Backend:
         def __init__(self, failures):
             self.failures = failures
@@ -609,7 +679,7 @@ class DirectHIDStartupTests(unittest.TestCase):
         self.assertEqual(backend.register_calls, 3)
         self.assertEqual(backend.unregister_calls, 3)
         ctrl.set_hid_input_state.assert_called_once_with(
-            False, "not ready", notify=True
+            False, "not ready"
         )
         volume.stop.assert_not_called()
         self.assertIs(ctrl.volume, volume)
@@ -625,7 +695,7 @@ class DirectHIDStartupTests(unittest.TestCase):
 
         self.assertEqual(backend.register_calls, 1)
         ctrl.set_hid_input_state.assert_called_once_with(
-            False, "not ready", notify=True
+            False, "not ready", notify=True, permission_required=True
         )
         volume.stop.assert_not_called()
         self.assertIs(ctrl.volume, volume)
@@ -1429,12 +1499,20 @@ class ControllerInputTests(unittest.TestCase):
         instance, _backend = self.make_controller()
 
         with mock.patch.object(controller, "write_volume_health") as write_health:
-            instance.set_hid_input_state(False, "permission denied")
+            instance.set_hid_input_state(False, "permission denied", permission_required=True)
 
         self.assertEqual(
             write_health.call_args.args[:2],
             ("input_permission_required", "permission denied"),
         )
+
+    def test_hid_device_failure_is_not_reported_as_missing_permission(self):
+        instance, _backend = self.make_controller()
+        with mock.patch.object(controller, "write_volume_health") as write_health, \
+             mock.patch.object(controller, "show_input_monitoring_prompt") as prompt:
+            instance.set_hid_input_state(False, "Device operation unsupported", notify=True)
+            self.assertEqual(write_health.call_args.args[:2], ("error", "Device operation unsupported"))
+            prompt.assert_not_called()
 
     def test_volume_health_reports_binding_required_for_another_fixed_output(self):
         instance, backend = self.make_controller()

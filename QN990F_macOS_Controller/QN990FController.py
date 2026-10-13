@@ -575,8 +575,8 @@ class MacOSBackend:
         self.iokit.IOHIDManagerOpen.restype = c_int32
         self.iokit.IOHIDManagerClose.argtypes = [c_void_p, c_uint32]
         self.iokit.IOHIDManagerClose.restype = c_int32
-        self.iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
-        self.iokit.IOHIDManagerSetDeviceMatching.restype = None
+        self.iokit.IOHIDManagerSetDeviceMatchingMultiple.argtypes = [c_void_p, c_void_p]
+        self.iokit.IOHIDManagerSetDeviceMatchingMultiple.restype = None
         self.iokit.IOHIDManagerSetInputValueMatchingMultiple.argtypes = [
             c_void_p, c_void_p,
         ]
@@ -759,7 +759,7 @@ class MacOSBackend:
         direction = cls._volume_direction_for_hid_usage(usage_page, usage)
         return f"volume_{direction}" if direction and value > 0 else None
 
-    def _create_volume_hid_matching(self):
+    def _create_hid_matching(self, usages, page_name, usage_name):
         refs = []
 
         def cf_string(value):
@@ -781,19 +781,10 @@ class MacOSBackend:
             refs.append(c_void_p(ref))
             return ref
 
-        page_key = cf_string("UsagePage")
-        usage_key = cf_string("Usage")
+        page_key = cf_string(page_name)
+        usage_key = cf_string(usage_name)
         dictionaries = []
-        for usage_page, usage in (
-            (
-                self.K_HID_PAGE_GENERIC_DESKTOP,
-                self.K_HID_USAGE_GENERIC_DESKTOP_WHEEL,
-            ),
-            (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_UP),
-            (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_DOWN),
-            (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT),
-            (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_DECREMENT),
-        ):
+        for usage_page, usage in usages:
             keys = (c_void_p * 2)(page_key, usage_key)
             values = (c_void_p * 2)(cf_number(usage_page), cf_number(usage))
             dictionary = self.corefoundation.CFDictionaryCreate(
@@ -813,6 +804,27 @@ class MacOSBackend:
             raise RuntimeError("CFArrayCreate failed for HID matching.")
         refs.append(c_void_p(array))
         return array, refs
+
+    def _create_device_hid_matching(self):
+        # Match interfaces, not every HID device on the machine. For example,
+        # Magic Keyboard's vendor-specific 0xff00/0x4b interface rejects Open
+        # with Unsupported and must not disable the working keyboard/mouse HID
+        # interfaces. The manager continues discovering matching hot-plug devices.
+        return self._create_hid_matching(
+            ((0x01, 0x01), (0x01, 0x02), (0x01, 0x06),
+             (0x01, 0x07), (0x01, 0x80), (0x0c, 0x01)),
+            "PrimaryUsagePage", "PrimaryUsage",
+        )
+
+    def _create_volume_hid_matching(self):
+        # Device selection and event-value selection are separate filters.
+        return self._create_hid_matching((
+            (self.K_HID_PAGE_GENERIC_DESKTOP, self.K_HID_USAGE_GENERIC_DESKTOP_WHEEL),
+            (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_UP),
+            (self.K_HID_PAGE_KEYBOARD, self.K_HID_USAGE_KEYBOARD_VOLUME_DOWN),
+            (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_INCREMENT),
+            (self.K_HID_PAGE_CONSUMER, self.K_HID_USAGE_CONSUMER_VOLUME_DECREMENT),
+        ), "UsagePage", "Usage")
 
     def register_volume_keys(
         self, handler=None, wheel_handler=None, request_access=False
@@ -870,9 +882,11 @@ class MacOSBackend:
                 manager = c_void_p(self.iokit.IOHIDManagerCreate(None, 0))
                 if not manager:
                     raise RuntimeError("IOHIDManagerCreate returned NULL.")
-                matching, refs = self._create_volume_hid_matching()
+                device_matching, refs = self._create_device_hid_matching()
+                self.iokit.IOHIDManagerSetDeviceMatchingMultiple(manager, device_matching)
+                matching, value_refs = self._create_volume_hid_matching()
+                refs.extend(value_refs)
                 self._volume_cf_refs = refs
-                self.iokit.IOHIDManagerSetDeviceMatching(manager, None)
                 self.iokit.IOHIDManagerSetInputValueMatchingMultiple(
                     manager, matching
                 )
@@ -884,15 +898,15 @@ class MacOSBackend:
                     manager, run_loop, self._run_loop_default_mode
                 )
                 scheduled = True
+                # Open may succeed for some devices yet return an error for
+                # another. Always close that partially opened manager on exit.
+                opened = True
                 status = self.iokit.IOHIDManagerOpen(manager, 0)
-                if status == 0:
-                    opened = True
-                elif status == self.K_IO_RETURN_EXCLUSIVE_ACCESS:
-                    opened = True
+                if status == self.K_IO_RETURN_EXCLUSIVE_ACCESS:
                     logger.info(
                         "Some HID devices are exclusively owned; using available devices."
                     )
-                else:
+                elif status != 0:
                     raise RuntimeError(f"IOHIDManagerOpen failed: IOReturn {status}.")
                 self._volume_run_loop = run_loop
                 self._volume_hid_manager = manager
@@ -2174,6 +2188,7 @@ class Controller:
         self._auth_thread = None
         self._hid_input_ready = False
         self._hid_input_error = ""
+        self._hid_permission_required = False
         self._hid_notice_sent = False
         self._binding_notice_uid = ""
         self._volume_health_signature = None
@@ -2262,13 +2277,14 @@ class Controller:
             return True
         return False
 
-    def set_hid_input_state(self, ready, error="", notify=False):
+    def set_hid_input_state(self, ready, error="", notify=False, permission_required=False):
         self._hid_input_ready = bool(ready)
         self._hid_input_error = str(error)
+        self._hid_permission_required = bool(permission_required) and not ready
         if ready:
             self._hid_notice_sent = False
         self.update_volume_health(force=True)
-        if notify and not self._hid_notice_sent:
+        if notify and self._hid_permission_required and not self._hid_notice_sent:
             self._hid_notice_sent = True
             threading.Thread(
                 target=show_input_monitoring_prompt,
@@ -2291,7 +2307,9 @@ class Controller:
     def update_volume_health(self, force=False):
         details = {}
         if not self._hid_input_ready:
-            state = "input_permission_required" if self._hid_input_error else "starting"
+            state = "starting"
+            if self._hid_input_error:
+                state = "input_permission_required" if self._hid_permission_required else "error"
             message = self._hid_input_error or "Starting volume-key monitoring."
         elif not self.cfg["enable_volume_control"]:
             state = "disabled"
@@ -2753,7 +2771,7 @@ def register_direct_hid_input(
             access = getattr(backend, "input_monitoring_access", lambda: "unknown")()
             if access == "denied":
                 logger.warning("Direct HID input permission is denied: %s", exc)
-                ctrl.set_hid_input_state(False, str(exc), notify=True)
+                ctrl.set_hid_input_state(False, str(exc), notify=True, permission_required=True)
                 break
             if attempt + 1 < attempts:
                 logger.warning(
@@ -2764,7 +2782,7 @@ def register_direct_hid_input(
                 logger.warning(
                     "Direct HID input disabled after %d attempts: %s", attempts, exc
                 )
-                ctrl.set_hid_input_state(False, str(exc), notify=True)
+                ctrl.set_hid_input_state(False, str(exc))
     # The menu slider does not require HID access; keep its worker available.
 
 
