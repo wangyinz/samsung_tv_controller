@@ -170,6 +170,15 @@ Volume keys:
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
     Cloud volume state is refreshed no more than once every 30 seconds.
+    Volume keys use OS global hotkeys with a dedicated Core Audio worker, so an
+    elevated foreground game does not require running this controller as admin.
+    Each press/repeat either routes to TV or takes one native Windows volume
+    step through Explorer, preserving the Windows volume flyout (no simulated
+    input). Core Audio is a fallback when the shell is unavailable; ambiguous
+    shell timeouts are not retried, to avoid double volume steps.
+    TV commands recheck the exact HDMI binding before
+    transmission. If another app owns these global keys, a dedicated keyboard
+    hook is used instead; game routing may then be limited by Windows security.
 
 Direct LAN can send a TV volume key but cannot read the current TV volume, so
 the TV-first Volume Down rule is intentionally limited to SmartThings mode.

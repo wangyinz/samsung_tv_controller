@@ -341,6 +341,7 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
+WM_QUIT = 0x0012
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -586,6 +587,15 @@ kernel32.GetTickCount.argtypes = []
 kernel32.GetTickCount.restype = wintypes.DWORD
 
 user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
+user32.GetShellWindow.argtypes = []
+user32.GetShellWindow.restype = wintypes.HWND
+user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM,
+                                     wintypes.UINT, wintypes.UINT,
+                                     ctypes.POINTER(ctypes.c_size_t)]
+user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
 user32.RegisterHotKey.restype = wintypes.BOOL
 user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.UnregisterHotKey.restype = wintypes.BOOL
@@ -691,6 +701,12 @@ user32.CallNextHookEx.argtypes = [
 user32.CallNextHookEx.restype = LRESULT
 user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
 user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND,
+                               wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
 ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(GUID)]
 ole32.CLSIDFromString.restype = wintypes.LONG
@@ -884,7 +900,7 @@ class WindowsEndpointVolume:
         )
         _check_hresult(result, "CoCreateInstance(MMDeviceEnumerator)")
 
-    def is_max(self) -> bool:
+    def _with_endpoint(self, operation):
         device = ctypes.c_void_p()
         endpoint = ctypes.c_void_p()
         get_default = _com_method(
@@ -909,16 +925,31 @@ class WindowsEndpointVolume:
             )
             _check_hresult(result, "IMMDevice.Activate(IAudioEndpointVolume)")
 
-            value = ctypes.c_float()
-            get_scalar = _com_method(
-                endpoint, 9, wintypes.LONG, ctypes.POINTER(ctypes.c_float)
-            )
-            result = get_scalar(endpoint, ctypes.byref(value))
-            _check_hresult(result, "IAudioEndpointVolume.GetMasterVolumeLevelScalar")
-            return float(value.value) >= 0.999
+            return operation(endpoint)
         finally:
             self._release(endpoint)
             self._release(device)
+
+    def is_max(self) -> bool:
+        def read(endpoint):
+            value = ctypes.c_float()
+            method = _com_method(endpoint, 9, wintypes.LONG, ctypes.POINTER(ctypes.c_float))
+            _check_hresult(method(endpoint, ctypes.byref(value)),
+                           "IAudioEndpointVolume.GetMasterVolumeLevelScalar")
+            return float(value.value) >= 0.999
+        return self._with_endpoint(read)
+
+    def step(self, direction: str) -> None:
+        # Native endpoint steps, not SendInput (which cannot target an elevated
+        # foreground game from our normal-integrity controller).
+        def change(endpoint):
+            unmute = _com_method(endpoint, 14, wintypes.LONG,
+                                 wintypes.BOOL, ctypes.POINTER(GUID))
+            _check_hresult(unmute(endpoint, False, None), "IAudioEndpointVolume.SetMute")
+            method = _com_method(endpoint, 17 if direction == "up" else 18,
+                                 wintypes.LONG, ctypes.POINTER(GUID))
+            _check_hresult(method(endpoint, None), "IAudioEndpointVolume.VolumeStep")
+        self._with_endpoint(change)
 
     @staticmethod
     def _release(pointer) -> None:
@@ -934,21 +965,233 @@ class WindowsEndpointVolume:
             self._initialized = False
 
 
-class LowLevelVolumeHook:
+def step_windows_volume_with_osd(direction, endpoint):
+    """Let Explorer perform the step and display its native volume flyout.
+
+    No synthetic key is generated (which would recurse into our global hotkey).
+    A timeout is ambiguous: Explorer may already have applied the command, so
+    never follow it with a second endpoint step.
+    """
+    target = user32.FindWindowW("Shell_TrayWnd", None) or user32.GetShellWindow()
+    if not target:
+        endpoint.step(direction)
+        return
+    result = ctypes.c_size_t()
+    command = 10 if direction == "up" else 9  # APPCOMMAND_VOLUME_UP / DOWN
+    ctypes.set_last_error(0)
+    sent = user32.SendMessageTimeoutW(
+        target, 0x0319, target, command << 16,
+        0x0001 | 0x0002, 250, ctypes.byref(result))
+    if sent:
+        # The shell can forward/enqueue the action while returning zero. A
+        # delivered command must never be followed by a duplicate COM step.
+        return
+    error = ctypes.get_last_error()
+    if error == 5:  # UIPI access denied: delivery was blocked.
+        endpoint.step(direction)
+    else:
+        logger.warning("Windows volume shell delivery uncertain (error=%s); "
+                       "not applying a duplicate volume step", error)
+
+
+class GlobalVolumeHotkeys:
+    """Global media keys remain routable with an elevated foreground game.
+
+    The OS hotkey registration replaces normal key volume handling, so each
+    WM_HOTKEY has exactly one path: TV routing or native shell volume handling.
+    """
+    KEYS = {0x51A1: (VK_VOLUME_UP, "up"), 0x51A2: (VK_VOLUME_DOWN, "down")}
+
     def __init__(self, handler):
         self.handler = handler
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._audio_ready = threading.Event()
+        self._error = None
+        self._thread_id = None
+        self._commands = queue.SimpleQueue()
+        self._thread = None
+        self._worker = None
+        self._next_route_log_at = 0.0
+
+    def install(self):
+        self._worker = threading.Thread(target=self._run_audio,
+                                        name="QN990F-VolumeAudio", daemon=True)
+        self._worker.start()
+        if not self._audio_ready.wait(5) or self._error is not None:
+            self.close()
+            raise RuntimeError("Volume audio worker unavailable") from self._error
+        self._thread = threading.Thread(target=self._run_hotkeys,
+                                        name="QN990F-VolumeHotkeys", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(5) or self._error is not None:
+            self.close()
+            raise RuntimeError("Global volume hotkeys unavailable") from self._error
+        logger.info("Global volume hotkeys registered (dedicated Core Audio worker)")
+
+    def _run_audio(self):
+        endpoint = WindowsEndpointVolume()
+        try:
+            endpoint.open()
+            self._audio_ready.set()
+            while not self._stop.is_set():
+                try:
+                    direction = self._commands.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if self._stop.is_set():
+                    break
+                try:
+                    self._route(direction, endpoint)
+                except Exception as exc:
+                    logger.warning("Global volume-key routing failed: %r", exc)
+        except Exception as exc:
+            self._error = exc
+        finally:
+            try:
+                endpoint.close()
+            finally:
+                self._stop.set()
+                if self._thread_id:
+                    user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+                self._audio_ready.set()
+
+    def _route(self, direction, endpoint):
+        at_max = direction == "up" and endpoint.is_max()
+        routed_to_tv = self.handler(direction, at_max)
+        if not routed_to_tv:
+            step_windows_volume_with_osd(direction, endpoint)
+        now = time.monotonic()
+        if now >= self._next_route_log_at:
+            logger.info("Volume routing source=global_hotkey direction=%s target=%s",
+                        direction, "TV" if routed_to_tv else "Windows")
+            self._next_route_log_at = now + 1.0
+
+    def _run_hotkeys(self):
+        registered = []
+        try:
+            self._thread_id = kernel32.GetCurrentThreadId()
+            msg = MSG()
+            # Create the thread queue before advertising readiness, so close()
+            # can reliably wake a blocked GetMessage with PostThreadMessage.
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            if self._stop.is_set():
+                return
+            for identifier, (vkey, _) in self.KEYS.items():
+                # Deliberately allow repeats from held keys and physical knobs.
+                if not user32.RegisterHotKey(None, identifier, 0, vkey):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                registered.append(identifier)
+            self._ready.set()
+            while not self._stop.is_set():
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    if result == -1:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    break
+                if msg.message == WM_HOTKEY and int(msg.wParam) in self.KEYS:
+                    self._commands.put(self.KEYS[int(msg.wParam)][1])
+        except Exception as exc:
+            self._error = exc
+            logger.warning("Global volume hotkey thread stopped: %r", exc)
+        finally:
+            for identifier in registered:
+                user32.UnregisterHotKey(None, identifier)
+            self._stop.set()
+            self._ready.set()
+
+    def close(self):
+        self._stop.set()
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        for worker in (self._thread, self._worker):
+            if worker is not None:
+                worker.join(timeout=2)
+
+
+class LowLevelVolumeHook:
+    # Never perform display enumeration, COM activation or cloud work inside a
+    # low-level hook. Windows can silently remove a hook that misses its deadline.
+    SAMPLE_MAX_AGE = 0.5
+
+    def __init__(self, handler, eligible=lambda: True):
+        self.handler = handler
+        self.eligible = eligible
         self.handle = None
-        self.endpoint_volume = WindowsEndpointVolume()
+        self._sample = (0.0, False, False)
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._error = None
+        self._thread_id = None
+        self._thread = None
+        self._sampler = None
         self._consumed = set()
         self._callback = HOOKPROC(self._hook_proc)
 
     def install(self) -> None:
-        self.endpoint_volume.open()
-        self.handle = user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._callback, kernel32.GetModuleHandleW(None), 0
-        )
-        if not self.handle:
-            raise ctypes.WinError(ctypes.get_last_error())
+        self._sampler = threading.Thread(target=self._sample_endpoint,
+                                         name="QN990F-VolumeSample", daemon=True)
+        self._thread = threading.Thread(target=self._run_hook,
+                                        name="QN990F-VolumeHook", daemon=True)
+        self._sampler.start()
+        self._thread.start()
+        if not self._ready.wait(5.0):
+            self.close()
+            raise RuntimeError("Volume hook startup timed out")
+        if self._error is not None:
+            self.close()
+            raise self._error
+
+    def _sample_endpoint(self):
+        # COM creation, access and release all belong to this worker apartment.
+        endpoint = WindowsEndpointVolume()
+        try:
+            endpoint.open()
+            while not self._stop.is_set():
+                try:
+                    eligible = self.eligible()
+                    at_max = endpoint.is_max() if eligible else False
+                    self._sample = (time.monotonic(), bool(eligible), at_max)
+                except Exception:
+                    self._sample = (0.0, False, False)
+                self._stop.wait(0.1)
+        except Exception as exc:
+            logger.warning("Volume endpoint sampler unavailable: %r", exc)
+        finally:
+            self._sample = (0.0, False, False)
+            endpoint.close()
+
+    def _run_hook(self):
+        try:
+            self._thread_id = kernel32.GetCurrentThreadId()
+            msg = MSG()
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            if self._stop.is_set():
+                return
+            self.handle = user32.SetWindowsHookExW(
+                WH_KEYBOARD_LL, self._callback, kernel32.GetModuleHandleW(None), 0
+            )
+            if not self.handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            # GetMessage owns this dedicated queue, not the busy Raw Input /
+            # picture-control message loop used by games' mouse traffic.
+            self._ready.set()
+            while not self._stop.is_set():
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    if result == -1:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            self._error = exc
+            logger.warning("Volume hook thread stopped: %r", exc)
+        finally:
+            if self.handle:
+                user32.UnhookWindowsHookEx(self.handle)
+            self.handle = None
+            self._ready.set()
 
     def _hook_proc(self, code, wparam, lparam):
         if code >= 0 and int(wparam) in {
@@ -962,10 +1205,14 @@ class LowLevelVolumeHook:
                 if int(wparam) in {WM_KEYDOWN, WM_SYSKEYDOWN}:
                     direction = "up" if vkey == VK_VOLUME_UP else "down"
                     try:
-                        at_max = direction == "up" and self.endpoint_volume.is_max()
-                        if self.handler(direction, at_max):
+                        sampled_at, eligible, at_max = self._sample
+                        fresh = time.monotonic() - sampled_at <= self.SAMPLE_MAX_AGE
+                        if eligible and fresh and self.handler(direction, at_max):
                             self._consumed.add(vkey)
                             return 1
+                        # A native key can change Windows volume. Do not use the
+                        # pre-key maximum snapshot for a following opposite key.
+                        self._sample = (0.0, False, False)
                     except Exception as exc:
                         logger.warning("Volume-key routing failed: %r", exc)
                 elif vkey in self._consumed:
@@ -974,11 +1221,13 @@ class LowLevelVolumeHook:
         return user32.CallNextHookEx(self.handle, code, wparam, lparam)
 
     def close(self) -> None:
-        if self.handle:
-            user32.UnhookWindowsHookEx(self.handle)
-        self.handle = None
+        self._stop.set()
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        for worker in (self._thread, self._sampler):
+            if worker is not None:
+                worker.join(timeout=2.0)
         self._consumed.clear()
-        self.endpoint_volume.close()
 
 
 def parse_hotkey(spec: str) -> tuple[int, int]:
@@ -2196,8 +2445,8 @@ class VolumeCoordinator:
         if notify:
             self._commands.put(("flush_volume", epoch))
 
-    def handle_key(self, direction: str, system_is_max=False) -> bool:
-        if not hdmi_target_connected(self.config):
+    def handle_key(self, direction: str, system_is_max=False, *, check_hdmi=True) -> bool:
+        if check_hdmi and not hdmi_target_connected(self.config):
             self.disconnected()
             return False
         if getattr(self.tv, "authorization_required", lambda: False)():
@@ -2441,10 +2690,10 @@ class Controller:
             return True
         return False
 
-    def handle_volume_key(self, direction: str, system_is_max=False) -> bool:
+    def handle_volume_key(self, direction: str, system_is_max=False, *, check_hdmi=True) -> bool:
         if self.volume is None or not self.config["enable_volume_control"]:
             return False
-        return self.volume.handle_key(direction, system_is_max)
+        return self.volume.handle_key(direction, system_is_max, check_hdmi=check_hdmi)
 
     def _set_picture_off_state(self, off: bool) -> None:
         with self._state_lock:
@@ -2968,8 +3217,17 @@ def run_daemon(config: dict, *, suppress_startup_idle: bool = False) -> int:
         input_window = RawInputWindow(config)
         input_window.create()
         if config["enable_volume_control"]:
-            volume_hook = LowLevelVolumeHook(controller.handle_volume_key)
-            volume_hook.install()
+            volume_hook = GlobalVolumeHotkeys(controller.handle_volume_key)
+            try:
+                volume_hook.install()
+            except Exception as exc:
+                logger.warning("Global volume keys unavailable; using keyboard-hook fallback: %r", exc)
+                volume_hook = LowLevelVolumeHook(
+                    lambda direction, at_max: controller.handle_volume_key(
+                        direction, at_max, check_hdmi=False),
+                    eligible=lambda: hdmi_target_connected(config),
+                )
+                volume_hook.install()
 
         monitor = threading.Thread(
             target=controller.monitor_loop,
