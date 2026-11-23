@@ -8,6 +8,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function ConvertTo-HdmiTargets($Parsed) {
+    if ($Parsed -is [array]) { $Items = @($Parsed) }
+    elseif ($Parsed -and $Parsed.PSObject.Properties['value'] -and
+            $Parsed.PSObject.Properties['Count'] -and $Parsed.value -is [array]) { $Items = @($Parsed.value) }
+    else { $Items = @($Parsed) }
+    foreach ($Item in $Items) {
+        if (-not $Item -or $Item -is [array] -or -not $Item.path -or -not $Item.name -or
+            $null -eq $Item.manufacturer -or $null -eq $Item.product) {
+            throw "Windows returned an invalid HDMI display identity."
+        }
+        [pscustomobject]@{ name=[string]$Item.name; path=[string]$Item.path;
+            manufacturer=[int]$Item.manufacturer; product=[int]$Item.product }
+    }
+}
 $AppDir = Join-Path $env:LOCALAPPDATA "QN990FController"
 $VenvDir = Join-Path $AppDir "venv"
 $ControllerPath = Join-Path $AppDir "QN990FController.py"
@@ -747,7 +762,8 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Windows could not enumerate active HDMI displays. The controller cannot send TV commands without a local HDMI display."
         }
-        $HdmiTargets = @($HdmiJson | ConvertFrom-Json)
+        $HdmiParsed = $HdmiJson | ConvertFrom-Json
+        $HdmiTargets = @(ConvertTo-HdmiTargets $HdmiParsed)
         if ($HdmiTargets.Count -eq 0) {
             throw "No identifiable active HDMI display was found. Connect this PC to the target TV by HDMI and rerun the installer."
         }

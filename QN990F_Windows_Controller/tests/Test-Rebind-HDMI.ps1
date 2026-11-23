@@ -6,7 +6,7 @@ $Tokens = $null
 $Errors = $null
 $Ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$Tokens, [ref]$Errors)
 if ($Errors.Count) { throw ($Errors | Out-String) }
-foreach ($Name in @("Invoke-Rebind", "Test-SameTarget")) {
+foreach ($Name in @("Invoke-Rebind", "Test-SameTarget", "ConvertTo-HdmiTargets")) {
     $Definition = $Ast.Find({
         param($Node)
         $Node -is [Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $Name
@@ -23,6 +23,12 @@ function Assert-True([bool]$Value, [string]$Message) {
 
 $Old = [pscustomobject]@{ name = "OLD"; path = "old-monitor"; manufacturer = 1; product = 2 }
 $New = [pscustomobject]@{ name = "SAMSUNG"; path = "new-monitor"; manufacturer = 3; product = 4 }
+$SingleJsonShape = [pscustomobject]@{ value = @($New); Count = 1 }
+$SingleTargets = @(ConvertTo-HdmiTargets $SingleJsonShape)
+Assert-True ($SingleTargets.Count -eq 1 -and $SingleTargets[0].path -eq $New.path -and
+    -not $SingleTargets[0].PSObject.Properties['value']) "Single target JSON wrapper is flattened"
+$MultipleTargets = ConvertTo-HdmiTargets @($New, $Old)
+Assert-True ($MultipleTargets.Count -eq 2 -and $MultipleTargets[1].path -eq $Old.path) "Multiple target arrays stay flat"
 $script:MockTargets = @($New)
 $script:MockRunning = $false
 $script:StopCount = 0
@@ -72,6 +78,8 @@ try {
     Invoke-Rebind
     $Saved = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
     Assert-True (Test-SameTarget $Saved.hdmi_target $New) "Confirmed target was stored"
+    Assert-True ($Saved.hdmi_target.PSObject.Properties.Name -join ',' -eq 'name,path,manufacturer,product') "Stored HDMI identity is a scalar canonical object"
+    Assert-True ($Saved.hdmi_target.manufacturer -is [int] -and $Saved.hdmi_target.product -is [int]) "Stored EDID fields are integers"
     Assert-True ($Saved.enable_idle_off -eq $false -and $Saved.idle_minutes -eq 0) "Disabled idle setting was preserved"
     Assert-True ($Saved.enable_volume_control -eq $true -and $Saved.smartthings_device_id -eq "kept") "Unrelated options were preserved"
     Assert-True ($script:StopCount -eq 1 -and $script:StartCount -eq 1 -and $script:MockRunning) "Running daemon was gracefully stopped and restarted (stop=$script:StopCount start=$script:StartCount running=$script:MockRunning)"

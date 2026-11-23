@@ -14,6 +14,11 @@ using System.Runtime.InteropServices;
 public static class QN990FRebindWindow {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindow(string className, string windowName);
+    public static IntPtr FindControllerWindow(uint processId) {
+        // Keep the native NULL title pointer. PowerShell passes $null through
+        // this P/Invoke as an empty string, which does not match a null title.
+        return FindWindow("QN990FRawInput_" + processId, null);
+    }
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll")]
@@ -51,6 +56,32 @@ function Stop-ProbeTree($Probe) {
     [void]$Probe.WaitForExit(2000)
 }
 
+function ConvertTo-HdmiTargets($Parsed) {
+    # Windows PowerShell 5.1 can wrap a JSON top-level array as { value, Count }
+    # depending on whether ConvertFrom-Json receives pipeline or InputObject data.
+    if ($Parsed -is [array]) {
+        $Targets = @($Parsed)
+    } elseif ($Parsed -and $Parsed.PSObject.Properties['value'] -and
+              $Parsed.PSObject.Properties['Count'] -and $Parsed.value -is [array]) {
+        $Targets = @($Parsed.value)
+    } else {
+        $Targets = @($Parsed)
+    }
+    foreach ($Target in $Targets) {
+        if (-not $Target -or $Target -is [array] -or
+            -not $Target.path -or -not $Target.name -or
+            $null -eq $Target.manufacturer -or $null -eq $Target.product) {
+            throw "HDMI display probe returned an invalid target identity."
+        }
+        [pscustomobject]@{
+            name = [string]$Target.name
+            path = [string]$Target.path
+            manufacturer = [int]$Target.manufacturer
+            product = [int]$Target.product
+        }
+    }
+}
+
 function Get-HdmiTargets {
     $Startup = New-Object Diagnostics.ProcessStartInfo
     $Startup.FileName = $VenvPython
@@ -78,12 +109,13 @@ function Get-HdmiTargets {
             throw "HDMI display detection failed (exit $($Probe.ExitCode)): $ErrorOutput"
         }
         $Parsed = ConvertFrom-Json -InputObject $Output
-        $Targets = @($Parsed)
+        $Targets = @(ConvertTo-HdmiTargets $Parsed)
         if (-not $Targets -or $Targets.Count -eq 0) {
             throw "No identifiable HDMI display is connected. Connect this PC to the TV and try again."
         }
         foreach ($Target in $Targets) {
-            if (-not $Target.path -or -not $Target.name -or
+            if (-not $Target -or $Target -is [array] -or
+                -not $Target.path -or -not $Target.name -or
                 $null -eq $Target.manufacturer -or $null -eq $Target.product) {
                 throw "HDMI display detection returned an incomplete identity. The binding was not changed."
             }
@@ -118,7 +150,7 @@ function Get-ControllerProcesses {
 
 function Get-ControllerWindow($ProcessInfo) {
     $ProcessId = [uint32]$ProcessInfo.ProcessId
-    $Window = [QN990FRebindWindow]::FindWindow("QN990FRawInput_$ProcessId", $null)
+    $Window = [QN990FRebindWindow]::FindControllerWindow($ProcessId)
     if ($Window -eq [IntPtr]::Zero) { return [IntPtr]::Zero }
     $OwnerId = [uint32]0
     [void][QN990FRebindWindow]::GetWindowThreadProcessId($Window, [ref]$OwnerId)

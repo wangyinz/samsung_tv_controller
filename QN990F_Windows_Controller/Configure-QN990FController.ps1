@@ -7,6 +7,21 @@ $VenvPython = Join-Path $AppDir "venv\Scripts\python.exe"
 $VenvPythonW = Join-Path $AppDir "venv\Scripts\pythonw.exe"
 $PidPath = Join-Path $AppDir "controller.pid"
 
+function ConvertTo-HdmiTargets($Parsed) {
+    if ($Parsed -is [array]) { $Items = @($Parsed) }
+    elseif ($Parsed -and $Parsed.PSObject.Properties['value'] -and
+            $Parsed.PSObject.Properties['Count'] -and $Parsed.value -is [array]) { $Items = @($Parsed.value) }
+    else { $Items = @($Parsed) }
+    foreach ($Item in $Items) {
+        if (-not $Item -or $Item -is [array] -or -not $Item.path -or -not $Item.name -or
+            $null -eq $Item.manufacturer -or $null -eq $Item.product) {
+            throw "Windows returned an invalid HDMI display identity."
+        }
+        [pscustomobject]@{ name=[string]$Item.name; path=[string]$Item.path;
+            manufacturer=[int]$Item.manufacturer; product=[int]$Item.product }
+    }
+}
+
 if (-not (Test-Path $ConfigPath)) {
     throw "Samsung TV Picture Controller is not installed."
 }
@@ -55,7 +70,8 @@ $HdmiJson = & $VenvPython $ControllerPath --list-hdmi-targets
 if ($LASTEXITCODE -ne 0) {
     throw "Windows could not inspect HDMI displays. No configuration was saved."
 }
-$HdmiTargets = @($HdmiJson | ConvertFrom-Json)
+$HdmiParsed = $HdmiJson | ConvertFrom-Json
+$HdmiTargets = @(ConvertTo-HdmiTargets $HdmiParsed)
 if ($HdmiTargets.Count -eq 0) {
     throw "No identifiable active HDMI display was found. Connect this PC to the target TV and rerun Configure."
 }
