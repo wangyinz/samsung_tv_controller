@@ -2477,6 +2477,7 @@ class VolumeCoordinator:
         self._tv_volume = None
         # Do not use a previous session's estimate as a new keypress baseline.
         self._volume_as_of = time.time()
+        self._volume_write_generation = 0
         self._volume_is_local = False
         self._relative_pending = 0
         self._estimate_valid_until = 0.0
@@ -2683,6 +2684,7 @@ class VolumeCoordinator:
                     return
                 # An older report cannot resolve even a failed or ambiguous send.
                 self._volume_as_of = max(time.time(), self._volume_as_of)
+                self._volume_write_generation += 1
                 self._volume_is_local = bool(success)
                 self._last_accepted_volume = (target, self._volume_as_of) if success else None
                 self._menu_completed_id = request_id
@@ -2721,6 +2723,7 @@ class VolumeCoordinator:
                 self._relative_pending -= 1
                 self._last_accepted_volume = None
                 self._volume_as_of = max(time.time(), self._volume_as_of)
+                self._volume_write_generation += 1
                 if not self._buffer_deadline:
                     self._tv_volume = None
                     self._volume_is_local = False
@@ -2756,6 +2759,7 @@ class VolumeCoordinator:
                 return
             epoch = self._connection_epoch
             fence = self._volume_as_of
+            write_generation = self._volume_write_generation
             known = None if self._volume_is_local else (self._tv_volume, fence)
             last_set = self._last_accepted_volume
         if self._reader is None:
@@ -2765,6 +2769,7 @@ class VolumeCoordinator:
             def still_current():
                 with self._lock:
                     return (not self._stop.is_set() and epoch == self._connection_epoch and fence == self._volume_as_of
+                            and write_generation == self._volume_write_generation
                             and not self._relative_pending and not self._buffer_deadline)
             sample = self._reader.read(fence, demand, known=known, last_set=last_set, valid=still_current)
             if self._stop.is_set() or not self._reader.allowed():
@@ -2773,6 +2778,7 @@ class VolumeCoordinator:
         with self._lock:
             now = time.time()
             if (epoch != self._connection_epoch or self._relative_pending or self._buffer_deadline
+                    or self._volume_write_generation != write_generation
                     or self._volume_as_of != fence or (time.monotonic() < self._estimate_valid_until
                     and (not demand or not report or report[0] != self._tv_volume))):
                 return
@@ -2780,7 +2786,11 @@ class VolumeCoordinator:
             if report is None:
                 return
             value, reported_at = report
-            if self._volume_as_of < reported_at <= now and now - reported_at <= self.MAX_REPORT_AGE:
+            # Local reads use the epoch and fence checks above to reject
+            # overlapping writes. They can share one Windows clock tick.
+            fresh = (reported_at >= fence if source in {"HDMI DDC", "LAN UPnP"}
+                     else reported_at > fence)
+            if fresh and reported_at <= now and now - reported_at <= self.MAX_REPORT_AGE:
                 self._tv_volume = value
                 self._volume_as_of = reported_at
                 self._volume_is_local = False

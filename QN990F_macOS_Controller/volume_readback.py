@@ -207,7 +207,7 @@ class VolumeReadback:
                 value = getter()
                 if type(value) is not int or not 0 <= value <= 100:
                     raise Unavailable("Invalid volume value")
-                if started > fence and allowed():
+                if started >= fence and allowed():
                     # A DDC/UPnP implementation can return a fixed number too.
                     # If it did not reflect a subsequent local write, quarantine
                     # that number until this provider demonstrates a change.
@@ -256,7 +256,9 @@ def menu_read_requested(directory, session, previous):
     try:
         stat = path.stat()
         key = stat.st_mtime_ns
-        if key == previous or stat.st_size > 128 or not 0 <= time.time() - stat.st_mtime <= 10:
+        # NTFS modification timestamps can lead Python's wall clock by a
+        # timer tick. Allow a small skew while rejecting stale requests.
+        if key == previous or stat.st_size > 128 or not -2 <= time.time() - stat.st_mtime <= 10:
             return False, key
         return path.read_text(encoding="utf-8").strip() == session, key
     except (OSError, UnicodeError):
