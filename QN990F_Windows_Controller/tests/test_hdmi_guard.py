@@ -102,7 +102,7 @@ class HDMICommandGuardTests(unittest.TestCase):
             volume._tv_volume = None
             self.assertTrue(volume.handle_key("up", system_is_max=True))
             key, epoch = volume._commands.get_nowait()
-            self.assertEqual(key, "KEY_VOLUP")
+            self.assertEqual(key, "flush_volume")
             volume.disconnected()
             volume._process_command(key, epoch)
             volume._process_command("flush_volume", epoch)

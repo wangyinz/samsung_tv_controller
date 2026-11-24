@@ -1888,6 +1888,9 @@ class SmartThingsTVClient:
         )
         if method == "POST" and not hdmi_target_connected(self.config):
             raise RuntimeError("Bound HDMI display is no longer active")
+        step_guard = getattr(self, "_volume_step_guard", None)
+        if method == "POST" and step_guard is not None and not step_guard():
+            raise RuntimeError("Volume key batch no longer belongs to the active connection")
         if method == "POST" and any(cmd.get("capability") == "refresh" for cmd in (payload or {}).get("commands", [])):
             guard = getattr(self, "_volume_refresh_guard", None)
             if not guard or not guard():
@@ -1896,25 +1899,26 @@ class SmartThingsTVClient:
             return response.read().decode("utf-8")
 
     @staticmethod
-    def _command_receipt(output, command):
+    def _command_receipt(output, command, count=1):
         try:
             results = json.loads(output)["results"]
-            if not isinstance(results, list) or len(results) != 1:
+            if not isinstance(results, list) or len(results) != count:
                 raise ValueError("unexpected result count")
-            receipt = results[0]
-            status = receipt["status"]
-            command_id = receipt["id"]
-            if not isinstance(command_id, str) or not command_id:
-                raise ValueError("missing command ID")
-            if status == "FAILED":
-                raise SmartThingsCommandRejected(
-                    "SmartThings reported FAILED for {} id={}".format(command, command_id)
-                )
-            if status not in {"ACCEPTED", "COMPLETED"}:
-                raise ValueError("command rejected or missing receipt")
+            ids, statuses = [], []
+            for receipt in results:
+                command_id, status = receipt["id"], receipt["status"]
+                if not isinstance(command_id, str) or not command_id or command_id in ids:
+                    raise ValueError("missing or duplicate command ID")
+                if status == "FAILED" and count == 1:
+                    raise SmartThingsCommandRejected(f"SmartThings reported FAILED for {command} id={command_id}")
+                if status not in {"ACCEPTED", "COMPLETED"}:
+                    raise ValueError("batch not fully accepted")
+                ids.append(command_id)
+                statuses.append(status)
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("SmartThings command receipt was missing or failed.") from exc
-        logger.info("SmartThings %s receipt status=%s id=%s; TV panel unverified", command, status, command_id)
+        status = "COMPLETED" if all(s == "COMPLETED" for s in statuses) else "ACCEPTED"
+        logger.info("SmartThings %s receipt status=%s id=%s; TV panel unverified", command, status, ",".join(ids))
         return status
 
     def __init__(self, config: dict):
@@ -2333,7 +2337,7 @@ class SmartThingsTVClient:
         output = self._run(api_request=("POST", path, command))
         self._command_receipt(output, remote_key)
 
-    def _send_volume_command(self, remote_key):
+    def _send_volume_command(self, remote_key, count=1):
         command = "volumeUp" if remote_key == "KEY_VOLUP" else "volumeDown"
         path = "/devices/{}/commands".format(
             urllib_parse.quote(str(self.config["smartthings_device_id"]), safe="")
@@ -2341,10 +2345,33 @@ class SmartThingsTVClient:
         payload = {"commands": [{
             "component": "main", "capability": self.AUDIO_VOLUME_CAPABILITY,
             "command": command, "arguments": [],
-        }]}
-        self._command_times.append(time.monotonic())
+        } for _ in range(count)]}
+        self._command_times.extend([time.monotonic()] * count)
         output = self._run(api_request=("POST", path, payload))
-        self._command_receipt(output, "audioVolume." + command)
+        self._command_receipt(output, f"audioVolume.{command} x{count}", count)
+
+    def send_volume_steps(self, delta, current):
+        """Send a net relative gesture without guessing an absolute TV volume."""
+        key = "KEY_VOLUP" if delta > 0 else "KEY_VOLDOWN"
+        remaining = min(100, abs(delta))  # The full TV range is 0-100.
+        while remaining:
+            count = min(remaining, 10)  # SmartThings guards at most ten commands per POST.
+            with self._lock:
+                if not current() or not hdmi_target_connected(self.config):
+                    return False
+                self._volume_step_guard = current
+                try:
+                    self._ensure_command_budget(count)
+                    self._send_volume_command(key, count)
+                except Exception as exc:
+                    # A partial receipt/timeout can mean some steps took effect.
+                    # Never replay the POST or send the rest of this gesture.
+                    logger.warning("Volume key batch not confirmed; not replaying: %s", exc)
+                    return False
+                finally:
+                    self._volume_step_guard = None
+            remaining -= count
+        return True
 
     def send(self, key: str) -> bool:
         with self._lock:
@@ -2463,6 +2490,8 @@ def make_tv_client(config: dict):
 class VolumeCoordinator:
     BUFFER_SECONDS = 0.2
     MAX_REPORT_AGE = 120.0
+    FEEDBACK_SETTLE = 0.5
+    FEEDBACK_MIN_INTERVAL = 15.0
 
     def __init__(self, config: dict, tv, menu_dir=None, *, reader=None):
         self._reader = reader
@@ -2479,7 +2508,10 @@ class VolumeCoordinator:
         self._volume_as_of = time.time()
         self._volume_write_generation = 0
         self._volume_is_local = False
-        self._relative_pending = 0
+        self._inflight = None
+        self._relative_delta = None
+        self._feedback_due = self._feedback_not_before = 0.0
+        self._feedback_state = ""
         self._estimate_valid_until = 0.0
         self._buffer_start_volume = None
         self._buffer_deadline = 0.0
@@ -2505,6 +2537,7 @@ class VolumeCoordinator:
         supported = callable(getattr(self.tv, "set_volume", None))
         auth_required = getattr(self.tv, "authorization_required", lambda: False)()
         with self._lock:
+            absolute_pending = self._relative_delta is None and bool(self._buffer_deadline or self._inflight == "absolute")
             available = supported and self._menu_hdmi_connected and not auth_required and not self._stop.is_set()
             if self._stop.is_set():
                 state, message = "stopped", "Controller is stopped."
@@ -2518,8 +2551,15 @@ class VolumeCoordinator:
                 state, message = "authorization_required", "Reauthorize SmartThings to control TV volume."
             elif self._menu_error:
                 state, message = "error", self._menu_error
-            elif self._menu_request_id != self._menu_completed_id:
+            elif self._menu_request_id != self._menu_completed_id or absolute_pending:
                 state, message = "pending", "Setting TV volume..."
+            elif self._relative_delta is not None or self._inflight == "relative":
+                state, message = "pending", "Adjusting TV volume..."
+            elif self._tv_volume is None and self._feedback_state:
+                state = "ready"
+                message = {"waiting": "Volume adjustment sent; checking the TV's level...",
+                           "baseline": "Checking TV volume for keyboard control...",
+                           "unconfirmed": "TV has not reported its current volume."}[self._feedback_state]
             elif self._tv_volume is None:
                 state, message = "ready", "No recent TV volume report. Choose a level with the slider."
             elif self._volume_is_local:
@@ -2533,7 +2573,8 @@ class VolumeCoordinator:
                 "state": state,
                 "message": message,
                 "value": self._tv_volume,
-                "source": ("last_set" if self._volume_is_local else self._read_source) if self._tv_volume is not None else "unknown",
+                "source": ("pending" if absolute_pending else "last_set" if self._volume_is_local
+                           else self._read_source) if self._tv_volume is not None else "unknown",
                 "request_id": self._menu_completed_id,
             }
             if payload == self._menu_last_status:
@@ -2593,6 +2634,7 @@ class VolumeCoordinator:
             # Absolute menu targets share the media-key buffer and its worker.
             # A new target replaces earlier unsent steps, including targets below 10.
             notify = self._buffer_deadline == 0.0
+            self._relative_delta = None  # Explicit slider target supersedes any unsent steps.
             self._buffer_start_volume = None
             self._tv_volume = target
             now = time.monotonic()
@@ -2612,8 +2654,7 @@ class VolumeCoordinator:
                 return False
             with self._lock:
                 if not self._has_key_baseline():
-                    self._relative_pending += 1
-                    self._commands.put(("KEY_VOLUP", self._connection_epoch))
+                    self._queue_relative_locked(1)
                     return True
                 if self._tv_volume >= 100:
                     return True
@@ -2633,7 +2674,20 @@ class VolumeCoordinator:
 
         floor = int(self.config["tv_volume_floor"])
         with self._lock:
-            if not self._has_key_baseline() or self._tv_volume <= floor:
+            if not self._has_key_baseline():
+                # An opposite step can cancel an unsent increase without taking
+                # an unknown TV below its floor. Other decreases stay native.
+                if (self._relative_delta or 0) > 0 or floor == 0:
+                    self._queue_relative_locked(-1)
+                    return True
+                # Pass this key to Windows, but obtain a safe baseline for the
+                # next press instead of requiring the user to open the tray.
+                if (self._reader is not None and self._menu_hdmi_connected
+                        and callable(getattr(self.tv, "set_volume", None)) and self._feedback_state != "waiting"):
+                    self._feedback_due = time.monotonic() + self.FEEDBACK_SETTLE
+                    self._feedback_state = "baseline"
+                return False
+            if self._tv_volume <= floor:
                 return False
             notify = self._buffer_deadline == 0.0
             if notify:
@@ -2656,7 +2710,9 @@ class VolumeCoordinator:
             self._tv_volume = None
             self._volume_as_of = max(time.time(), self._volume_as_of)
             self._volume_is_local = False
-            self._relative_pending = 0
+            self._inflight = self._relative_delta = None
+            self._feedback_state = ""
+            self._feedback_due = 0.0
             self._last_accepted_volume = None
             self._buffer_deadline = 0.0
             self._buffer_start_volume = None
@@ -2675,6 +2731,13 @@ class VolumeCoordinator:
             self._volume_as_of = max(self._volume_as_of, time.time())
         self._publish_menu_status()
 
+    def _queue_relative_locked(self, step):
+        notify = self._buffer_deadline == 0.0
+        self._relative_delta = (self._relative_delta or 0) + step
+        self._buffer_deadline = time.monotonic() + self.BUFFER_SECONDS
+        if notify:
+            self._commands.put(("flush_volume", self._connection_epoch))
+
     def _flush_volume_buffer(self, epoch: int) -> None:
         while not self._stop.is_set():
             with self._lock:
@@ -2686,74 +2749,77 @@ class VolumeCoordinator:
             self._poll_menu_request()
             self._publish_menu_status()
             with self._lock:
+                if epoch != self._connection_epoch or not self._buffer_deadline:
+                    return
                 remaining = self._buffer_deadline - time.monotonic()
+                if remaining <= 0:
+                    target, start = self._tv_volume, self._buffer_start_volume
+                    steps = self._relative_delta
+                    self._relative_delta = self._buffer_start_volume = None
+                    self._buffer_deadline = 0.0
+                    request_id = self._menu_request_id
+                    if steps == 0 or (steps is None and (target is None or target == start)):
+                        self._menu_completed_id = request_id
+                        return
+                    self._inflight = "absolute" if steps is None else "relative"
             if remaining > 0:
-                if self._stop.wait(remaining):
-                    return
+                self._stop.wait(remaining)
                 continue
+
+            def current():
+                if steps is not None:
+                    self._poll_menu_request()  # A slider may supersede remaining chunks during I/O.
+                with self._lock:
+                    return (not self._stop.is_set() and self._menu_hdmi_connected and epoch == self._connection_epoch
+                            and not (steps is not None and self._buffer_deadline and self._relative_delta is None))
+
+            try:
+                if steps is None:
+                    success = current() and self.tv.set_volume(target)
+                elif callable(getattr(self.tv, "send_volume_steps", None)):
+                    success = self.tv.send_volume_steps(steps, current)
+                else:
+                    # LAN remotes expose only individual keys. Still cancel opposing
+                    # steps locally and stop on disconnect, failure or a new slider target.
+                    key = "KEY_VOLUP" if steps > 0 else "KEY_VOLDOWN"
+                    success = all(current() and self.tv.send(key) for _ in range(min(100, abs(steps))))
+            except Exception as exc:
+                logger.warning("Volume write outcome unknown; not replaying: %s", exc)
+                success = False
             with self._lock:
                 if epoch != self._connection_epoch:
                     return
-                target = self._tv_volume
-                start = self._buffer_start_volume
-                self._buffer_deadline = 0.0
-                self._buffer_start_volume = None
-                request_id = self._menu_request_id
-                if target is None or target == start:
-                    self._menu_completed_id = request_id
-                    return
-            with self._lock:
-                if epoch != self._connection_epoch:
-                    return
-            success = self.tv.set_volume(target)
-            with self._lock:
-                if epoch != self._connection_epoch:
-                    return
-                # An older report cannot resolve even a failed or ambiguous send.
+                self._inflight = None
                 self._volume_as_of = max(time.time(), self._volume_as_of)
                 self._volume_write_generation += 1
-                self._volume_is_local = bool(success)
-                self._last_accepted_volume = (target, self._volume_as_of) if success else None
-                self._menu_completed_id = request_id
-                self._menu_error = "" if success else "TV volume change failed; check the controller log."
-                if not success and not self._buffer_deadline:
+                self._volume_is_local = bool(success and steps is None)
+                self._last_accepted_volume = (target, self._volume_as_of) if self._volume_is_local else None
+                if request_id == self._menu_request_id:
+                    self._menu_completed_id = request_id
+                    self._menu_error = "" if success else "TV volume change failed or was not confirmed; check the controller log."
+                if not self._volume_is_local and not (self._buffer_deadline and self._relative_delta is None):
                     self._tv_volume = None
                     self._estimate_valid_until = 0.0
+                # A receipt does not report a numeric level. Coalesce readbacks
+                # for successive writes on the separate reader, never replay a write.
+                if self._reader is not None:
+                    self._feedback_due = time.monotonic() + self.FEEDBACK_SETTLE
+                    self._feedback_state = "waiting"
             self._publish_menu_status()
             return
 
     def _process_command(self, command: str, epoch: int) -> None:
-        with self._lock:
-            if epoch != self._connection_epoch:
-                return
-        if not hdmi_target_connected(self.config):
-            self.disconnected()
-            return
         if command == "flush_volume":
             self._flush_volume_buffer(epoch)
-        else:
-            self.tv.send(command)
-            self._finish_relative_key(epoch)
 
     def _has_key_baseline(self):
-        # Never derive a new absolute write from an old estimate. The slider
-        # may still show the last accepted target, labelled as such.
-        return callable(getattr(self.tv, "set_volume", None)) and self._tv_volume is not None and (
-            self._buffer_deadline > 0 or (
-                not self._relative_pending and 0 <= time.time() - self._volume_as_of <= self.MAX_REPORT_AGE
-            )
-        )
-
-    def _finish_relative_key(self, epoch):
-        with self._lock:
-            if epoch == self._connection_epoch:
-                self._relative_pending -= 1
-                self._last_accepted_volume = None
-                self._volume_as_of = max(time.time(), self._volume_as_of)
-                self._volume_write_generation += 1
-                if not self._buffer_deadline:
-                    self._tv_volume = None
-                    self._volume_is_local = False
+        # A pending relative gesture never inherits a stale absolute estimate.
+        return (self._relative_delta is None and callable(getattr(self.tv, "set_volume", None))
+                and self._tv_volume is not None and (
+                    self._buffer_deadline > 0 or self._inflight == "absolute" or (
+                        self._inflight is None and 0 <= time.time() - self._volume_as_of <= self.MAX_REPORT_AGE
+                    )
+                ))
 
     def _expire_volume_report(self, now):
         # Under the lock: a last-set estimate is not an aging cloud report.
@@ -2769,26 +2835,46 @@ class VolumeCoordinator:
             demand, seen = menu_read_requested(self._menu_dir, self._menu_session, seen)
             now = time.monotonic()
             demand = demand and now >= next_demand
-            if demand or now >= next_poll:
+            with self._lock:
+                ticket = None
+                busy = self._inflight or self._buffer_deadline
+                if (not busy and self._feedback_due
+                        and now >= max(self._feedback_due, self._feedback_not_before)):
+                    ticket = (self._connection_epoch, self._volume_write_generation)
+                    self._feedback_due = 0.0
+                feedback_queued = bool(self._feedback_due)
+            if ticket is not None or (not busy and not feedback_queued and (demand or now >= next_poll)):
                 if demand:
                     next_demand = now + 5
+                confirmed = False
                 try:
-                    self._refresh_volume(demand)
+                    confirmed = self._refresh_volume(demand or ticket is not None, ticket=ticket)
                 except Exception as exc:
                     logger.warning("Volume readback failed: %s", type(exc).__name__)
+                if ticket is not None:
+                    with self._lock:
+                        self._feedback_not_before = time.monotonic() + self.FEEDBACK_MIN_INTERVAL
+                        if ticket == (self._connection_epoch, self._volume_write_generation):
+                            if not confirmed and (self._inflight or self._buffer_deadline):
+                                self._feedback_due = time.monotonic() + self.FEEDBACK_SETTLE
+                            else:
+                                self._feedback_state = "" if confirmed else "unconfirmed"
+                    self._publish_menu_status()
                 next_poll = time.monotonic() + float(self.config["tv_volume_refresh_seconds"])
-            self._stop.wait(0.35)
+            self._stop.wait(0.2)
 
-    def _refresh_volume(self, demand=False):
+    def _refresh_volume(self, demand=False, *, ticket=None):
         with self._lock:
             if not self._menu_hdmi_connected:
                 return
             self._expire_volume_report(time.time())
-            if self._relative_pending or self._buffer_deadline or (not demand and time.monotonic() < self._estimate_valid_until):
+            if self._inflight or self._buffer_deadline or (not demand and time.monotonic() < self._estimate_valid_until):
                 return
             epoch = self._connection_epoch
             fence = self._volume_as_of
             write_generation = self._volume_write_generation
+            if ticket is not None and ticket != (epoch, write_generation):
+                return
             known = None if self._volume_is_local else (self._tv_volume, fence)
             last_set = self._last_accepted_volume
         if self._reader is None:
@@ -2799,31 +2885,37 @@ class VolumeCoordinator:
                 with self._lock:
                     return (not self._stop.is_set() and epoch == self._connection_epoch and fence == self._volume_as_of
                             and write_generation == self._volume_write_generation
-                            and not self._relative_pending and not self._buffer_deadline)
-            sample = self._reader.read(fence, demand, known=known, last_set=last_set, valid=still_current)
+                            and not self._inflight and not self._buffer_deadline)
+            sample = self._reader.read(fence, demand, known=known, last_set=last_set,
+                                       valid=still_current, after_write=ticket is not None)
             if self._stop.is_set() or not self._reader.allowed():
                 return
             report, source = (sample[:2], sample[2]) if sample else (None, "")
         with self._lock:
             now = time.time()
-            if (epoch != self._connection_epoch or self._relative_pending or self._buffer_deadline
-                    or self._volume_write_generation != write_generation
-                    or self._volume_as_of != fence or (time.monotonic() < self._estimate_valid_until
-                    and (not demand or not report or report[0] != self._tv_volume))):
+            if (epoch != self._connection_epoch or self._inflight or self._buffer_deadline
+                    or self._volume_write_generation != write_generation or self._volume_as_of != fence):
+                return
+            if (ticket is None and time.monotonic() < self._estimate_valid_until
+                    and (not demand or not report or report[0] != self._tv_volume)):
                 return
             self._expire_volume_report(now)
             if report is None:
                 return
             value, reported_at = report
-            # Local reads use the epoch and fence checks above to reject
-            # overlapping writes. They can share one Windows clock tick.
-            fresh = (reported_at >= fence if source in {"HDMI DDC", "LAN UPnP"}
-                     else reported_at > fence)
+            # A local read may start on the same clock tick as a write receipt;
+            # the generation check above handles concurrency. Cloud events must be newer.
+            fresh = reported_at >= fence if source in {"HDMI DDC", "LAN UPnP"} else reported_at > fence
             if fresh and reported_at <= now and now - reported_at <= self.MAX_REPORT_AGE:
                 self._tv_volume = value
                 self._volume_as_of = reported_at
                 self._volume_is_local = False
                 self._read_source = source
+                self._feedback_state = ""
+                self._estimate_valid_until = 0.0
+                if ticket is not None:
+                    logger.info("Keyboard/slider volume feedback: level=%d source=%s", value, source)
+                return True
 
     def _run(self) -> None:
         refresh_at = 0.0

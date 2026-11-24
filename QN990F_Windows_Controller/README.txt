@@ -167,11 +167,16 @@ Volume keys:
     INSTALL-ME.cmd to enable or disable it; press Enter to keep the current choice.
     Volume Up -> Windows volume until maximum, then TV volume.
     Volume Down in SmartThings mode -> TV volume down to 10, then Windows.
-    SmartThings TV-volume steps within 200 ms are combined into one target;
-    volume-up and volume-down steps cancel each other within that buffer.
+    TV-directed steps within 200 ms combine into one target if the level is
+    known, or net relative commands (up to ten per SmartThings request) otherwise.
+    Opposite TV steps cancel. With an unknown level and positive TV floor,
+    Volume Down stays native unless it cancels an unsent TV increase; the
+    controller requests a baseline for subsequent keys.
     The tray tries native HDMI DDC (unique, non-cloned physical monitor),
     pinned LAN UPnP, then fresh SmartThings status. Opening the menu can
     refresh stale cloud data once per five minutes; background polls do not.
+    Volume adjustments schedule their own readback after the write. Rapid
+    gestures share a trailing check, at most once per 15 seconds.
     Use --bind-volume-upnp TV_IP to confirm the LAN reader (root README)
     and --probe-volume to test each source while the TV is awake. Older or undated
     cloud reports cannot roll back a local setting. The slider distinguishes the

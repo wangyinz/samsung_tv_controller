@@ -191,7 +191,7 @@ class VolumeReadback:
         self.checked_write = {}
         self.disputed = {}
 
-    def read(self, fence, demand=False, *, known=None, last_set=None, valid=lambda: True):
+    def read(self, fence, demand=False, *, known=None, last_set=None, valid=lambda: True, after_write=False):
         def allowed():
             return not self.stop.is_set() and valid() and self.allowed()
         def recent(report):
@@ -233,7 +233,9 @@ class VolumeReadback:
             return (*report, "SmartThings")
         if report and report == known and 0 <= time.time() - report[1] <= 120:
             return None  # The same still-current report doesn't warrant a refresh.
-        if not (demand and self.refresh and allowed() and time.monotonic() >= self.refresh_after):
+        # A completed user adjustment has its own coalesced, rate-limited
+        # feedback schedule. A recent menu open must not suppress that feedback.
+        if not (demand and self.refresh and allowed() and (after_write or time.monotonic() >= self.refresh_after)):
             return None
         self.refresh_after = time.monotonic() + 300
         requested = time.time()
@@ -243,8 +245,13 @@ class VolumeReadback:
             if self.stop.wait(delay) or not allowed():
                 return None
             report = self.cloud()
-            if recent(report) and report[1] >= requested and allowed():
-                return (*report, "SmartThings refresh")
+            if recent(report) and allowed():
+                if report[1] >= requested:
+                    return (*report, "SmartThings refresh")
+                if after_write:
+                    # An update from after the write but just before refresh is
+                    # also independent evidence. Do not label it refresh-generated.
+                    return (*report, "SmartThings")
         return None
 
 

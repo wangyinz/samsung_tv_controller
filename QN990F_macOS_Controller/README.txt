@@ -230,11 +230,14 @@ Volume keys:
     update; that suffix is intentionally ignored. A different physical UID remains a
     mismatch. Only the confirmed fixed-volume output routes Volume Up and Volume Down to
     the TV across its full 0-100 range. Every other output remains under macOS control.
-    SmartThings TV-volume steps within 200 ms are combined into one target;
-    volume-up and volume-down steps cancel each other within that buffer.
+    TV-volume steps within 200 ms combine into one target if the starting level
+    is known, or net relative commands in batches of up to ten per SmartThings
+    request if unknown. Opposite steps cancel without sending a command.
     The menu tries bound HDMI DDC, pinned LAN UPnP, then fresh SmartThings
     status. Background polls do not request a device refresh. Opening the
-    menu can refresh stale cloud data once per five minutes. On Apple Silicon
+    menu can refresh stale cloud data once per five minutes. A volume adjustment
+    also triggers a separate readback after the write; rapid gestures share a
+    trailing check, at most once per 15 seconds. On Apple Silicon
     run Install-DDC.command once to install the optional DDC reader. Use
     --bind-volume-upnp TV_IP to confirm the LAN reader; see the root README.
     Use --probe-volume to test each source separately while the TV is awake.

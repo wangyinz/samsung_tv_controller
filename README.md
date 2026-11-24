@@ -249,11 +249,17 @@ left blank.
   are tolerated across macOS updates, while another physical HDMI sink is rejected.
   Volume keys for other HDMI devices, Mac speakers, and headphones never alter TV volume. The bound
   TV output uses its full range from 0 to 100.
-- SmartThings TV-volume steps received within 200 ms are combined locally. Up
-  and down steps cancel each other, and one final target volume is sent.
-- Background volume reads run at most once every 30 seconds. Opening the volume
-  menu requests an extra read; only that explicit request can refresh stale cloud
-  status, at most once in five minutes. Neither operation sets the TV volume.
+- TV-directed keys are combined until there is a 200 ms gap. With a trustworthy
+  starting level, SmartThings receives one absolute target. Otherwise, four
+  quick increases travel in one POST containing four relative steps. Opposite
+  steps cancel; larger bursts are split at [ten commands per request](https://developer.smartthings.com/docs/getting-started/rate-limits).
+  A partial or ambiguous response is never replayed.
+- After a write settles, the controller checks the actual level without waiting
+  for the menu to open. If the local readers and cloud status have no fresh
+  value, it requests a device refresh and reads back. Further gestures share a
+  trailing check (at most one adjustment feedback cycle per 15 seconds).
+  Periodic background polling stays passive; a menu-only refresh retains its
+  five-minute limit. A receipt is not a measured volume.
 - The Samsung LAN remote sends relative volume keys. Optional DDC/UPnP readers
   can display an actual level, but the absolute-write and Windows TV-floor
   features still require SmartThings.
@@ -313,7 +319,8 @@ independent TV reading. If there is no trustworthy value after a restart or
 reconnection, the slider shows an unknown level and can still set an exact target.
 After two minutes without a reliable baseline, media keys use a relative TV step
 where allowed; Windows leaves Volume Down to the system when it cannot verify
-the TV volume floor. Exact values require SmartThings and the TV's `audioVolume` capability;
+a positive TV floor, and requests a baseline for subsequent keys. An unsent
+increase can still be canceled by a decrease. Exact values require SmartThings and the TV's `audioVolume` capability;
 LAN mode displays an explanation in place of an active slider.
 
 ### Reading the actual TV volume
@@ -338,7 +345,7 @@ input loop:
    the TV's advertised description. Readers do not trust a different renderer
    at the same IP or alter network routes when a VPN blocks the LAN.
 3. **SmartThings** reads the bound device's timestamped volume attribute. If
-   the menu needs a fresh reading and that value is stale, the controller checks
+   a menu or adjustment needs feedback and that value is stale, the controller checks
    for the `refresh` capability, requests it once, then reads back twice at
    most. A command receipt alone is never taken as a volume measurement.
 
