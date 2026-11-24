@@ -2488,7 +2488,9 @@ def make_tv_client(config: dict):
 
 
 class VolumeCoordinator:
-    BUFFER_SECONDS = 0.2
+    BUFFER_SECONDS = 0.35  # A quick manual tap sequence can have 200-300 ms gaps.
+    MAX_KEY_BATCH_SECONDS = 1.0
+    SLIDER_BUFFER_SECONDS = 0.2
     MAX_REPORT_AGE = 120.0
     FEEDBACK_SETTLE = 0.5
     FEEDBACK_MIN_INTERVAL = 15.0
@@ -2515,6 +2517,7 @@ class VolumeCoordinator:
         self._estimate_valid_until = 0.0
         self._buffer_start_volume = None
         self._buffer_deadline = 0.0
+        self._key_batch_limit = 0.0
         self._menu_dir = menu_dir
         self._menu_hdmi_connected = hdmi_target_connected(config)
         self._menu_session = uuid.uuid4().hex
@@ -2638,7 +2641,8 @@ class VolumeCoordinator:
             self._buffer_start_volume = None
             self._tv_volume = target
             now = time.monotonic()
-            self._buffer_deadline = now + self.BUFFER_SECONDS
+            self._key_batch_limit = 0.0
+            self._buffer_deadline = now + self.SLIDER_BUFFER_SECONDS
             self._estimate_valid_until = now + 2 * float(self.config["tv_volume_refresh_seconds"])
         if notify:
             self._commands.put(("flush_volume", epoch))
@@ -2663,7 +2667,7 @@ class VolumeCoordinator:
                     self._buffer_start_volume = self._tv_volume
                 self._tv_volume += 1
                 now = time.monotonic()
-                self._buffer_deadline = now + self.BUFFER_SECONDS
+                self._extend_key_batch_locked(now)
                 self._estimate_valid_until = now + max(
                     5.0, float(self.config["tv_volume_refresh_seconds"]) * 2
                 )
@@ -2694,7 +2698,7 @@ class VolumeCoordinator:
                 self._buffer_start_volume = self._tv_volume
             self._tv_volume -= 1
             now = time.monotonic()
-            self._buffer_deadline = now + self.BUFFER_SECONDS
+            self._extend_key_batch_locked(now)
             self._estimate_valid_until = now + max(
                 5.0, float(self.config["tv_volume_refresh_seconds"]) * 2
             )
@@ -2731,10 +2735,15 @@ class VolumeCoordinator:
             self._volume_as_of = max(self._volume_as_of, time.time())
         self._publish_menu_status()
 
+    def _extend_key_batch_locked(self, now):
+        if not self._buffer_deadline or not self._key_batch_limit:
+            self._key_batch_limit = now + self.MAX_KEY_BATCH_SECONDS
+        self._buffer_deadline = min(now + self.BUFFER_SECONDS, self._key_batch_limit)
+
     def _queue_relative_locked(self, step):
         notify = self._buffer_deadline == 0.0
         self._relative_delta = (self._relative_delta or 0) + step
-        self._buffer_deadline = time.monotonic() + self.BUFFER_SECONDS
+        self._extend_key_batch_locked(time.monotonic())
         if notify:
             self._commands.put(("flush_volume", self._connection_epoch))
 
@@ -2757,6 +2766,7 @@ class VolumeCoordinator:
                     steps = self._relative_delta
                     self._relative_delta = self._buffer_start_volume = None
                     self._buffer_deadline = 0.0
+                    self._key_batch_limit = 0.0
                     request_id = self._menu_request_id
                     if steps == 0 or (steps is None and (target is None or target == start)):
                         self._menu_completed_id = request_id

@@ -249,7 +249,8 @@ left blank.
   are tolerated across macOS updates, while another physical HDMI sink is rejected.
   Volume keys for other HDMI devices, Mac speakers, and headphones never alter TV volume. The bound
   TV output uses its full range from 0 to 100.
-- TV-directed keys are combined until there is a 200 ms gap. With a trustworthy
+- TV-directed keys are combined until there is a 350 ms gap (up to one second
+  per batch while holding a key). With a trustworthy
   starting level, SmartThings receives one absolute target. Otherwise, four
   quick increases travel in one POST containing four relative steps. Opposite
   steps cancel; larger bursts are split at [ten commands per request](https://developer.smartthings.com/docs/getting-started/rate-limits).

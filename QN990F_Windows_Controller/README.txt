@@ -167,9 +167,10 @@ Volume keys:
     INSTALL-ME.cmd to enable or disable it; press Enter to keep the current choice.
     Volume Up -> Windows volume until maximum, then TV volume.
     Volume Down in SmartThings mode -> TV volume down to 10, then Windows.
-    TV-directed steps within 200 ms combine into one target if the level is
+    TV-directed steps within 350 ms combine into one target if the level is
     known, or net relative commands (up to ten per SmartThings request) otherwise.
-    Opposite TV steps cancel. With an unknown level and positive TV floor,
+    Opposite TV steps cancel. Holding a key caps the batch window at one second.
+    With an unknown level and positive TV floor,
     Volume Down stays native unless it cancels an unsent TV increase; the
     controller requests a baseline for subsequent keys.
     The tray tries native HDMI DDC (unique, non-cloned physical monitor),

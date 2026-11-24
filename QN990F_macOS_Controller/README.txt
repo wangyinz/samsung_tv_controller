@@ -230,9 +230,10 @@ Volume keys:
     update; that suffix is intentionally ignored. A different physical UID remains a
     mismatch. Only the confirmed fixed-volume output routes Volume Up and Volume Down to
     the TV across its full 0-100 range. Every other output remains under macOS control.
-    TV-volume steps within 200 ms combine into one target if the starting level
+    TV-volume steps within 350 ms combine into one target if the starting level
     is known, or net relative commands in batches of up to ten per SmartThings
-    request if unknown. Opposite steps cancel without sending a command.
+    request if unknown. Opposite steps cancel. A held key flushes at least once
+    per one-second batch window when the command worker is available.
     The menu tries bound HDMI DDC, pinned LAN UPnP, then fresh SmartThings
     status. Background polls do not request a device refresh. Opening the
     menu can refresh stale cloud data once per five minutes. A volume adjustment

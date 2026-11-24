@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -102,6 +103,36 @@ class KeyboardFeedbackTests(unittest.TestCase):
                     self.assertTrue(vol.handle_key("down"))
                 self.wait_for(lambda: status()["value"] == 10 and status()["source"] == "SmartThings refresh")
                 self.assertEqual(tx.posts[2:], [[("setVolume", [10])], [("refresh", [])]])
+
+    def test_observed_three_tap_cadence_and_continuous_hold(self):
+        for platform in ("macOS", "Windows"):
+            with self.subTest(platform=platform):
+                tx = Transport()
+                cfg, tv = cloud(platform, tx)
+                cfg["tv_volume_floor"] = 0
+                with mock.patch.object(threading.Thread, "start"):
+                    vol = load_worker(platform)(cfg, tv)
+                # Replay the observed gaps with a virtual monotonic clock; under
+                # the old 200 ms window the first flush would fire before tap 2.
+                with mock.patch.object(time, "monotonic") as clock:
+                    def tap(at):
+                        if vol._buffer_deadline and vol._buffer_deadline <= at:
+                            clock.return_value = vol._buffer_deadline
+                            vol._flush_volume_buffer(0)
+                        clock.return_value = at
+                        self.assertTrue(vol.handle_key("down", **(
+                            {"system_is_adjustable": False} if platform == "macOS" else {})))
+                    for at in (1.0, 1.253, 1.470):
+                        tap(at)
+                    clock.return_value = vol._buffer_deadline
+                    vol._flush_volume_buffer(0)
+                    self.assertEqual(tx.posts, [[("volumeDown", [])]*3])
+                    for at in (4.0, 4.2, 4.4, 4.6, 4.8, 4.99):
+                        tap(at)
+                    self.assertLessEqual(vol._buffer_deadline, 5.0)
+                    clock.return_value = 5.0
+                    vol._flush_volume_buffer(0)
+                    self.assertEqual(tx.posts[-1], [("volumeDown", [])]*6)
 
     def test_net_zero_has_no_write_or_refresh_and_slider_supersedes_steps(self):
         for platform in ("macOS", "Windows"):
