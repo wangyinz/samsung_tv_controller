@@ -41,6 +41,39 @@ class ReadbackTests(unittest.TestCase):
         self.upnp.assert_not_called()
         self.refresh.assert_not_called()
 
+    def test_automatic_sync_refreshes_before_get_even_with_working_ddc_and_menu_cooldown(self):
+        calls = []
+        self.ddc.return_value = 99
+        self.r.refresh_after = float("inf")
+        self.refresh.side_effect = lambda allowed: calls.append("refresh") or allowed()
+        self.cloud.side_effect = lambda: calls.append("get") or (7, time.time())
+        self.assertEqual(self.r.read(self.fence, sync_remote=True)[::2], (7, "SmartThings refresh"))
+        self.assertEqual(calls, ["refresh", "get"])
+        self.ddc.assert_not_called()
+
+    def test_stale_remote_sync_falls_back_without_repeating_refresh(self):
+        self.ddc.return_value = 10
+        self.assertEqual(self.r.read(self.fence, True, sync_remote=True)[::2], (10, "HDMI DDC"))
+        self.refresh.assert_called_once()
+        self.assertEqual(self.cloud.call_count, 2)
+
+    def test_refresh_failure_still_reads_attribute_and_keeps_its_timestamp(self):
+        self.refresh.side_effect = RuntimeError("unsupported")
+        stamp = time.time() - 5
+        self.cloud.return_value = (12, stamp)
+        self.assertEqual(self.r.read(self.fence, sync_remote=True), (12, stamp, "SmartThings"))
+        self.cloud.assert_called_once()
+
+    def test_disconnect_during_sync_does_not_get_or_use_the_late_result(self):
+        def unplug(guard):
+            self.assertTrue(guard())
+            self.gate.return_value = False
+            return True
+        self.refresh.side_effect = unplug
+        self.assertIsNone(self.r.read(self.fence, sync_remote=True))
+        self.cloud.assert_not_called()
+        self.ddc.assert_not_called()
+
     def test_ddc_timeout_falls_back_to_lan_and_backs_off_only_failed_path(self):
         self.ddc.side_effect = rb.subprocess.TimeoutExpired("ddc", 2)
         self.upnp.side_effect = [10, 11, 10]

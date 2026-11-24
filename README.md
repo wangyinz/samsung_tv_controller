@@ -255,12 +255,18 @@ left blank.
   quick increases travel in one POST containing four relative steps. Opposite
   steps cancel; larger bursts are split at [ten commands per request](https://developer.smartthings.com/docs/getting-started/rate-limits).
   A partial or ambiguous response is never replayed.
+- When the bound HDMI TV is first detected (including daemon startup) or
+  reconnects, SmartThings mode requests a device refresh, then reads the TV's
+  reported volume. It repeats this sync while connected and awake, by default
+  every 30 seconds (`tv_volume_refresh_seconds` in `config.json`, minimum 30).
+  This picks up changes from the TV's own remote without a keypress or menu open.
 - After a write settles, the controller checks the actual level without waiting
   for the menu to open. If the local readers and cloud status have no fresh
   value, it requests a device refresh and reads back. Further gestures share a
   trailing check (at most one adjustment feedback cycle per 15 seconds).
-  Periodic background polling stays passive; a menu-only refresh retains its
-  five-minute limit. A receipt is not a measured volume.
+  Coincident connect, timer, menu and write requests share a read cycle. The
+  five-minute menu-only cooldown does not delay connection or periodic sync.
+  A refresh requests a report; it never sets the volume.
 - The Samsung LAN remote sends relative volume keys. Optional DDC/UPnP readers
   can display an actual level, but the absolute-write and Windows TV-floor
   features still require SmartThings.
@@ -327,8 +333,11 @@ LAN mode displays an explanation in place of an active slider.
 ### Reading the actual TV volume
 
 The Mac and Windows menus identify the source of a reading. The background
-reader tries these paths for the bound, awake TV, independently of the keyboard
-input loop:
+reader runs independently of keyboard input. For connection and periodic sync,
+it starts with SmartThings refresh/read and falls back to the local readers if
+there is no fresh report. Menu-only and post-write checks try the local paths
+first. Reads are suspended while disconnected or in Picture Off; an overdue
+sync resumes when the bound TV is awake.
 
 1. **HDMI DDC/CI** reads the physical display's speaker-volume control (VCP
    `0x62`). Windows uses its native monitor API and skips ambiguous or cloned
@@ -345,10 +354,12 @@ input loop:
    unavailable, pass `--volume-description http://TV_IP:PORT/PATH` using
    the TV's advertised description. Readers do not trust a different renderer
    at the same IP or alter network routes when a VPN blocks the LAN.
-3. **SmartThings** reads the bound device's timestamped volume attribute. If
-   a menu or adjustment needs feedback and that value is stale, the controller checks
-   for the `refresh` capability, requests it once, then reads back twice at
-   most. A command receipt alone is never taken as a volume measurement.
+3. **SmartThings** reads the bound device's timestamped volume attribute.
+   Each automatic sync requests the advertised `refresh` capability once and
+   allows up to two reads for the new report to arrive. If refresh is unsupported
+   or rejected, it still checks the attribute once. For a menu or adjustment,
+   fresh status can satisfy the check without a refresh. A command receipt
+   alone is never taken as a volume measurement.
 
 A failed direct reader backs off for five minutes. An unchanged direct reading
 which contradicts a later local setting is skipped until it changes or reflects

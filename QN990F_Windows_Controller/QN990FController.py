@@ -2837,7 +2837,9 @@ class VolumeCoordinator:
 
     def _read_loop(self):
         from volume_readback import menu_read_requested
-        next_poll = next_demand = 0.0
+        interval = float(self.config["tv_volume_refresh_seconds"])
+        next_poll = next_demand = retry_sync_at = 0.0
+        synced_session = None
         seen = None
         while not self._stop.is_set():
             demand, seen = menu_read_requested(self._menu_dir, self._menu_session, seen)
@@ -2845,18 +2847,30 @@ class VolumeCoordinator:
             demand = demand and now >= next_demand
             with self._lock:
                 ticket = None
+                session = self._menu_session
+                connected = self._menu_hdmi_connected
                 busy = self._inflight or self._buffer_deadline
                 if (not busy and self._feedback_due
                         and now >= max(self._feedback_due, self._feedback_not_before)):
                     ticket = (self._connection_epoch, self._volume_write_generation)
                     self._feedback_due = 0.0
                 feedback_queued = bool(self._feedback_due)
-            if ticket is not None or (not busy and not feedback_queued and (demand or now >= next_poll)):
+            # The session rotates only on a verified reconnect; the monitor's
+            # repeated positive samples must not each send a device refresh.
+            last_refresh = getattr(self._reader, "last_cloud_refresh", float("-inf"))
+            sync = None
+            if connected and now >= retry_sync_at:
+                if session != synced_session:
+                    sync = "connect"
+                elif now >= max(next_poll, last_refresh + interval):
+                    sync = "periodic"
+            if ticket is not None or (not busy and not feedback_queued and (demand or sync)):
                 if demand:
                     next_demand = now + 5
                 confirmed = False
                 try:
-                    confirmed = self._refresh_volume(demand or ticket is not None, ticket=ticket)
+                    confirmed = self._refresh_volume(demand or ticket is not None, ticket=ticket,
+                                                     sync=(session, sync) if sync else None)
                 except Exception as exc:
                     logger.warning("Volume readback failed: %s", type(exc).__name__)
                 if ticket is not None:
@@ -2868,14 +2882,22 @@ class VolumeCoordinator:
                             else:
                                 self._feedback_state = "" if confirmed else "unconfirmed"
                     self._publish_menu_status()
-                next_poll = time.monotonic() + float(self.config["tv_volume_refresh_seconds"])
+                if sync:
+                    finished = time.monotonic()
+                    retry_sync_at = finished + 2.0  # Keep the latest attach pending across brief flaps.
+                    if confirmed is not None:
+                        # A failed/stale GET also counts as an attempt. A skipped
+                        # or superseded cycle (None) stays due until it's eligible.
+                        synced_session = session
+                        next_poll = finished + interval
+                        self._publish_menu_status()
             self._stop.wait(0.2)
 
-    def _refresh_volume(self, demand=False, *, ticket=None):
+    def _refresh_volume(self, demand=False, *, ticket=None, sync=None):
         with self._lock:
-            if not self._menu_hdmi_connected:
+            if not self._menu_hdmi_connected or (sync and sync[0] != self._menu_session):
                 return
-            if self._inflight or self._buffer_deadline or (not demand and time.monotonic() < self._estimate_valid_until):
+            if self._inflight or self._buffer_deadline or (not (demand or sync) and time.monotonic() < self._estimate_valid_until):
                 return
             epoch = self._connection_epoch
             fence = self._volume_as_of
@@ -2888,13 +2910,15 @@ class VolumeCoordinator:
             report = self.tv.get_volume()
             source = "SmartThings"
         else:
+            if not self._reader.allowed():
+                return
             def still_current():
                 with self._lock:
                     return (not self._stop.is_set() and epoch == self._connection_epoch and fence == self._volume_as_of
                             and write_generation == self._volume_write_generation
                             and not self._inflight and not self._buffer_deadline)
-            sample = self._reader.read(fence, demand, known=known, last_set=last_set,
-                                       valid=still_current, after_write=ticket is not None)
+            sample = self._reader.read(fence, demand, known=known, last_set=last_set, valid=still_current,
+                                       after_write=ticket is not None, sync_remote=sync is not None)
             if self._stop.is_set() or not self._reader.allowed():
                 return
             report, source = (sample[:2], sample[2]) if sample else (None, "")
@@ -2903,11 +2927,13 @@ class VolumeCoordinator:
             if (epoch != self._connection_epoch or self._inflight or self._buffer_deadline
                     or self._volume_write_generation != write_generation or self._volume_as_of != fence):
                 return
-            if (ticket is None and time.monotonic() < self._estimate_valid_until
+            if (not sync and ticket is None and time.monotonic() < self._estimate_valid_until
                     and (not demand or not report or report[0] != self._tv_volume)):
                 return
             if report is None:
-                return
+                if sync and sync[1] == "connect":
+                    logger.info("HDMI connection volume sync: no fresh report yet")
+                return False
             value, reported_at = report
             # A local read may start on the same clock tick as a write receipt;
             # the generation check above handles concurrency. Cloud events must be newer.
@@ -2921,7 +2947,10 @@ class VolumeCoordinator:
                 self._estimate_valid_until = 0.0
                 if ticket is not None:
                     logger.info("Keyboard/slider volume feedback: level=%d source=%s", value, source)
+                if sync:
+                    logger.info("Volume sync (%s): level=%d source=%s", sync[1], value, source)
                 return True
+            return False
 
     def _run(self) -> None:
         refresh_at = 0.0

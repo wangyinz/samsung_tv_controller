@@ -187,16 +187,25 @@ class VolumeReadback:
         self.stop, self.logger = stop, logger
         self.retry_at = {}
         self.refresh_after = 0.0
+        self.last_cloud_refresh = float("-inf")
         self.previous_direct = {}
         self.checked_write = {}
         self.disputed = {}
 
-    def read(self, fence, demand=False, *, known=None, last_set=None, valid=lambda: True, after_write=False):
+    def read(self, fence, demand=False, *, known=None, last_set=None, valid=lambda: True,
+             after_write=False, sync_remote=False):
         def allowed():
             return not self.stop.is_set() and valid() and self.allowed()
         def recent(report):
             now = time.time()
             return report and fence < report[1] <= now and now - report[1] <= 120
+
+        # Connect/periodic sync explicitly asks the bound TV to report first.
+        # A successful local read or a seemingly recent cache must not skip it.
+        if sync_remote and self.cloud and allowed():
+            remote = self._refresh_then_read(allowed, recent, scheduled=True)
+            if remote is not None:
+                return remote
         for name, getter in self.direct:
             if not allowed():
                 return None
@@ -226,7 +235,7 @@ class VolumeReadback:
             except (OSError, ValueError, RuntimeError, ET.ParseError, http.client.HTTPException, subprocess.SubprocessError) as exc:
                 self.retry_at[name] = time.monotonic() + 300
                 self.logger.info("%s volume unavailable (%s); retry in 5 min", name, type(exc).__name__)
-        if not self.cloud or not allowed():
+        if sync_remote or not self.cloud or not allowed():
             return None
         report = self.cloud()
         if recent(report) and allowed():
@@ -237,22 +246,44 @@ class VolumeReadback:
         # feedback schedule. A recent menu open must not suppress that feedback.
         if not (demand and self.refresh and allowed() and (after_write or time.monotonic() >= self.refresh_after)):
             return None
-        self.refresh_after = time.monotonic() + 300
-        requested = time.time()
-        if not self.refresh(allowed):
+        return self._refresh_then_read(allowed, recent, after_write=after_write)
+
+    def _refresh_then_read(self, allowed, recent, *, scheduled=False, after_write=False):
+        if not allowed():
             return None
-        for delay in (1, 2):
+        requested = time.time()
+        refreshed = False
+        if self.refresh:
+            self.refresh_after = time.monotonic() + 300  # Menu opens share the recent attempt.
+            try:
+                refreshed = self.refresh(allowed)
+                if refreshed:
+                    self.last_cloud_refresh = time.monotonic()
+            except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.logger.info("SmartThings volume refresh unavailable: %s", type(exc).__name__)
+        # On an automatic sync, still GET the reported state when the device
+        # does not implement refresh or the refresh failed. Never retry the POST.
+        if not refreshed and not scheduled:
+            return None
+        candidate = None
+        for delay in ((1, 2) if refreshed else (0,)):
             if self.stop.wait(delay) or not allowed():
                 return None
-            report = self.cloud()
+            try:
+                report = self.cloud()
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.logger.info("SmartThings volume GET unavailable: %s", type(exc).__name__)
+                continue
             if recent(report) and allowed():
-                if report[1] >= requested:
+                if refreshed and report[1] >= requested:
                     return (*report, "SmartThings refresh")
                 if after_write:
                     # An update from after the write but just before refresh is
                     # also independent evidence. Do not label it refresh-generated.
                     return (*report, "SmartThings")
-        return None
+                if scheduled and (candidate is None or report[1] > candidate[1]):
+                    candidate = (*report, "SmartThings")
+        return candidate if candidate and allowed() else None
 
 
 def menu_read_requested(directory, session, previous):

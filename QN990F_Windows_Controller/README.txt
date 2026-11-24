@@ -173,9 +173,12 @@ Volume keys:
     With an unknown level and positive TV floor,
     Volume Down stays native unless it cancels an unsent TV increase; the
     controller requests a baseline for subsequent keys.
-    The tray tries native HDMI DDC (unique, non-cloned physical monitor),
-    pinned LAN UPnP, then fresh SmartThings status. Opening the menu can
-    refresh stale cloud data once per five minutes; background polls do not.
+    When the bound TV is detected at startup or reconnects, the controller
+    requests SmartThings refresh and reads the reported volume automatically.
+    It repeats while connected and awake (tv_volume_refresh_seconds: default
+    and minimum 30 seconds). Native HDMI DDC and pinned LAN UPnP provide
+    fallbacks. Menu-only checks try local reads first and can refresh stale
+    cloud data once per five minutes.
     Volume adjustments schedule their own readback after the write. Rapid
     gestures share a trailing check, at most once per 15 seconds.
     Use --bind-volume-upnp TV_IP to confirm the LAN reader (root README)

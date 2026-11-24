@@ -234,9 +234,12 @@ Volume keys:
     is known, or net relative commands in batches of up to ten per SmartThings
     request if unknown. Opposite steps cancel. A held key flushes at least once
     per one-second batch window when the command worker is available.
-    The menu tries bound HDMI DDC, pinned LAN UPnP, then fresh SmartThings
-    status. Background polls do not request a device refresh. Opening the
-    menu can refresh stale cloud data once per five minutes. A volume adjustment
+    When the bound TV is detected at startup or reconnects, the controller
+    requests SmartThings refresh and reads the reported volume automatically.
+    It repeats while connected and awake (tv_volume_refresh_seconds: default
+    and minimum 30 seconds). DDC/UPnP provide fallbacks; an old cloud value
+    never counts as a new measurement. Menu-only checks try local reads first
+    and can refresh stale cloud data once per five minutes. A volume adjustment
     also triggers a separate readback after the write; rapid gestures share a
     trailing check, at most once per 15 seconds. On Apple Silicon
     run Install-DDC.command once to install the optional DDC reader. Use

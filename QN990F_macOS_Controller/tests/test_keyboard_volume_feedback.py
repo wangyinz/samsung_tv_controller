@@ -21,12 +21,14 @@ class Transport:
         self.actual = 10
         self.report = {"value": 17, "timestamp": "2020-11-03T23:26:24Z"}
         self.posts = []
+        self.status_reads = 0
         self.refresh_updates = True
 
     def __call__(self, *, api_request, timeout=None):
         method, path, payload = api_request
         if method == "GET":
             if path.endswith("/status"):
+                self.status_reads += 1
                 return json.dumps({"volume": self.report})
             return json.dumps({"components": [{"id": "main", "capabilities": [{"id": "refresh"}]}]})
         commands = [(cmd["command"], cmd["arguments"]) for cmd in payload["commands"]]
@@ -67,6 +69,9 @@ class KeyboardFeedbackTests(unittest.TestCase):
     @contextlib.contextmanager
     def system(self, platform):
         tx = Transport()
+        # Exercise the cold-key path even on firmware whose connect-time refresh
+        # completes without publishing a new volume report.
+        tx.refresh_updates = False
         cfg, tv = cloud(platform, tx)
         path = ROOT / f"QN990F_{platform}_Controller" / "volume_readback.py"
         spec = importlib.util.spec_from_file_location("volume_readback", path)
@@ -86,6 +91,10 @@ class KeyboardFeedbackTests(unittest.TestCase):
             status_file = directory / "volume-status.json"
             try:
                 self.wait_for(status_file.is_file)
+                self.wait_for(lambda: tx.status_reads == 2)
+                self.assertEqual(tx.posts, [[("refresh", [])]])
+                tx.posts.clear()
+                tx.refresh_updates = True
                 yield tx, vol, lambda: json.loads(status_file.read_bytes())
             finally:
                 vol.stop()
@@ -187,7 +196,7 @@ class KeyboardFeedbackTests(unittest.TestCase):
             self.assertTrue(vol.handle_key("down"))
             self.wait_for(lambda: [("setVolume", [11])] in tx.posts)
 
-    def test_disconnect_discards_pending_feedback(self):
+    def test_disconnect_discards_pending_feedback_and_syncs_new_session(self):
         for platform in ("macOS", "Windows"):
             with self.subTest(platform=platform), self.system(platform) as (tx, vol, status):
                 vol.FEEDBACK_SETTLE = 1
@@ -195,7 +204,7 @@ class KeyboardFeedbackTests(unittest.TestCase):
                 self.wait_for(lambda: "checking" in status()["message"])
                 disconnect = vol.on_hdmi_disconnected if platform == "macOS" else vol.disconnected
                 disconnect()
-                vol.on_hdmi_connected()
-                time.sleep(1.25)
-                self.assertEqual(tx.posts, [[("volumeUp", [])]])
                 self.assertIsNone(status()["value"])
+                vol.on_hdmi_connected()
+                self.wait_for(lambda: status()["value"] == 11)
+                self.assertEqual(tx.posts, [[("volumeUp", [])], [("refresh", [])]])
