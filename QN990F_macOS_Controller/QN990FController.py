@@ -1444,6 +1444,10 @@ class SmartThingsTVClient:
         )
         if method == "POST" and path.endswith("/commands") and not hdmi_tv_connected(self.cfg):
             raise RuntimeError("Bound TV is not connected by HDMI")
+        if method == "POST" and any(cmd.get("capability") == "refresh" for cmd in (payload or {}).get("commands", [])):
+            guard = getattr(self, "_volume_refresh_guard", None)
+            if not guard or not guard():
+                raise RuntimeError("Volume refresh is no longer eligible")
         with urllib_request.urlopen(request, timeout=timeout) as response:
             return response.read().decode("utf-8")
 
@@ -1843,6 +1847,46 @@ class SmartThingsTVClient:
         output = self._run(api_request=("POST", path, payload))
         self._command_receipt(output, "audioVolume." + command)
 
+    def read_cloud_volume(self):
+        # The capability-specific GET returns the attribute's original timestamp.
+        path = "/devices/{}/components/main/capabilities/audioVolume/status".format(
+            urllib_parse.quote(str(self.cfg["smartthings_device_id"]), safe=""))
+        with self._lock:
+            try:
+                output = self._run(api_request=("GET", path, None), timeout=4)
+                return parse_volume_report(json.loads(output).get("volume"))
+            except (OSError, ValueError, RuntimeError) as exc:
+                logger.warning("SmartThings volume read unavailable: %s", type(exc).__name__)
+                return None
+
+    def request_volume_refresh(self, allowed):
+        with self._lock:
+            if not allowed():
+                return False
+            self._volume_refresh_guard = allowed
+            try:
+                device = "/devices/" + urllib_parse.quote(str(self.cfg["smartthings_device_id"]), safe="")
+                if getattr(self, "_volume_can_refresh", None) is None:
+                    info = json.loads(self._run(api_request=("GET", device, None), timeout=4))
+                    self._volume_can_refresh = any(
+                        cap.get("id") == "refresh" for comp in info["components"] if comp["id"] == "main"
+                        for cap in comp["capabilities"])
+                if not self._volume_can_refresh or not allowed():
+                    return False
+                self._ensure_command_budget(1)
+                path = device + "/commands"
+                body = {"commands": [{"component": "main", "capability": "refresh",
+                                      "command": "refresh", "arguments": []}]}
+                self._command_times.append(time.monotonic())
+                result = self._run(api_request=("POST", path, body), timeout=4)
+                self._command_receipt(result, "refresh")
+                return True
+            except (ValueError, OSError, RuntimeError) as exc:
+                logger.info("On-demand SmartThings refresh unavailable: %s", type(exc).__name__)
+                return False
+            finally:
+                self._volume_refresh_guard = None
+
     def get_volume(self):
         with self._lock:
             try:
@@ -1919,7 +1963,10 @@ class VolumeCoordinator:
     BUFFER_SECONDS = 0.2
     MAX_REPORT_AGE = 120.0
 
-    def __init__(self, cfg, tv, menu_dir=None):
+    def __init__(self, cfg, tv, menu_dir=None, *, reader=None):
+        self._reader = reader
+        self._read_source = ""
+        self._last_accepted_volume = None
         self.cfg = cfg
         self.tv = tv
         self._lock = threading.Lock()
@@ -1944,6 +1991,10 @@ class VolumeCoordinator:
             target=self._run, daemon=True, name="QN990F-VolumeControl"
         )
         self._worker.start()
+        self._read_thread = None
+        if self._reader is not None:
+            self._read_thread = threading.Thread(target=self._read_loop, daemon=True, name="TV-VolumeReadback")
+            self._read_thread.start()
 
     def _publish_menu_status(self):
         if self._menu_dir is None:
@@ -1956,6 +2007,8 @@ class VolumeCoordinator:
                 state, message = "stopped", "Controller is stopped."
             elif not supported:
                 state, message = "unavailable", "Exact TV volume requires SmartThings."
+                if self._tv_volume is not None and self._read_source:
+                    message = f"Read via {self._read_source}. " + message
             elif auth_required:
                 state, message = "authorization_required", "Reauthorize SmartThings to control TV volume."
             elif self._menu_error:
@@ -1967,7 +2020,7 @@ class VolumeCoordinator:
             elif self._volume_is_local:
                 state, message = "ready", "Last set here; TV volume not independently confirmed."
             else:
-                state, message = "ready", ""
+                state, message = "ready", (f"Read via {self._read_source}." if self._read_source else "")
             payload = {
                 "session": self._menu_session,
                 "pid": os.getpid(),
@@ -1975,6 +2028,7 @@ class VolumeCoordinator:
                 "state": state,
                 "message": message,
                 "value": self._tv_volume,
+                "source": ("last_set" if self._volume_is_local else self._read_source) if self._tv_volume is not None else "unknown",
                 "request_id": self._menu_completed_id,
             }
             if payload == self._menu_last_status:
@@ -2040,6 +2094,7 @@ class VolumeCoordinator:
             self._volume_as_of = max(time.time(), self._volume_as_of)
             self._volume_is_local = False
             self._relative_pending = 0
+            self._last_accepted_volume = None
             self._buffer_start_volume = None
             self._buffer_deadline = 0.0
             self._estimate_valid_until = 0.0
@@ -2142,6 +2197,7 @@ class VolumeCoordinator:
                 # An older report cannot resolve even a failed or ambiguous send.
                 self._volume_as_of = max(time.time(), self._volume_as_of)
                 self._volume_is_local = bool(success)
+                self._last_accepted_volume = (target, self._volume_as_of) if success else None
                 self._menu_completed_id = request_id
                 self._menu_error = "" if success else "TV volume change failed; check the controller log."
                 if not success and not self._buffer_deadline:
@@ -2153,7 +2209,7 @@ class VolumeCoordinator:
     def _has_key_baseline(self):
         # Never derive a new absolute write from an old estimate. The slider
         # may still show the last accepted target, labelled as such.
-        return self._tv_volume is not None and (
+        return callable(getattr(self.tv, "set_volume", None)) and self._tv_volume is not None and (
             self._buffer_deadline > 0 or (
                 not self._relative_pending and 0 <= time.time() - self._volume_as_of <= self.MAX_REPORT_AGE
             )
@@ -2163,6 +2219,7 @@ class VolumeCoordinator:
         with self._lock:
             if epoch == self._epoch:
                 self._relative_pending -= 1
+                self._last_accepted_volume = None
                 self._volume_as_of = max(time.time(), self._volume_as_of)
                 if not self._buffer_deadline:
                     self._tv_volume = None
@@ -2174,17 +2231,50 @@ class VolumeCoordinator:
                 and now - self._volume_as_of > self.MAX_REPORT_AGE):
             self._tv_volume = None
 
-    def _refresh_volume(self):
+    def _read_loop(self):
+        from volume_readback import menu_read_requested
+        next_poll = next_demand = 0.0
+        seen = None
+        while not self._stop.is_set():
+            demand, seen = menu_read_requested(self._menu_dir, self._menu_session, seen)
+            now = time.monotonic()
+            demand = demand and now >= next_demand
+            if demand or now >= next_poll:
+                if demand:
+                    next_demand = now + 5
+                try:
+                    self._refresh_volume(demand)
+                except Exception as exc:
+                    logger.warning("Volume readback failed: %s", type(exc).__name__)
+                next_poll = time.monotonic() + float(self.cfg["tv_volume_refresh_seconds"])
+            self._stop.wait(0.35)
+
+    def _refresh_volume(self, demand=False):
         with self._lock:
             self._expire_volume_report(time.time())
-            if self._relative_pending or self._buffer_deadline or time.monotonic() < self._estimate_valid_until:
+            if self._relative_pending or self._buffer_deadline or (not demand and time.monotonic() < self._estimate_valid_until):
                 return
             epoch = self._epoch
-        report = self.tv.get_volume()
+            fence = self._volume_as_of
+            known = None if self._volume_is_local else (self._tv_volume, fence)
+            last_set = self._last_accepted_volume
+        if self._reader is None:
+            report = self.tv.get_volume()
+            source = "SmartThings"
+        else:
+            def still_current():
+                with self._lock:
+                    return (not self._stop.is_set() and epoch == self._epoch and fence == self._volume_as_of
+                            and not self._relative_pending and not self._buffer_deadline)
+            sample = self._reader.read(fence, demand, known=known, last_set=last_set, valid=still_current)
+            if self._stop.is_set() or not self._reader.allowed():
+                return
+            report, source = (sample[:2], sample[2]) if sample else (None, "")
         with self._lock:
             now = time.time()
             if (epoch != self._epoch or self._relative_pending or self._buffer_deadline
-                    or time.monotonic() < self._estimate_valid_until):
+                    or self._volume_as_of != fence or (time.monotonic() < self._estimate_valid_until
+                    and (not demand or not report or report[0] != self._tv_volume))):
                 return
             self._expire_volume_report(now)
             if report is None:
@@ -2194,6 +2284,7 @@ class VolumeCoordinator:
                 self._tv_volume = value
                 self._volume_as_of = reported_at
                 self._volume_is_local = False
+                self._read_source = source
 
     def _run(self):
         refresh_at = 0.0
@@ -2203,7 +2294,7 @@ class VolumeCoordinator:
             if getattr(self.tv, "authorization_required", lambda: False)():
                 return
             now = time.monotonic()
-            if now >= refresh_at:
+            if self._reader is None and now >= refresh_at:
                 self._refresh_volume()
                 if getattr(self.tv, "authorization_required", lambda: False)():
                     self._publish_menu_status()
@@ -2237,6 +2328,8 @@ class VolumeCoordinator:
         self._stop.set()
         timeout = float(self.cfg.get("smartthings_command_timeout_seconds", 0.0)) + 1.0
         self._worker.join(timeout=max(1.0, timeout))
+        if self._read_thread is not None:
+            self._read_thread.join(timeout=7)
         self._publish_menu_status()
 
 
@@ -2245,10 +2338,7 @@ class Controller:
         self.cfg = cfg
         self.backend = backend
         self.tv = make_tv_client(cfg)
-        self.volume = (
-            VolumeCoordinator(cfg, self.tv, APP_DIR if volume_menu else None)
-            if cfg["enable_volume_control"] or volume_menu else None
-        )
+        self.volume = None
         self._op_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._input_lock = threading.Lock()
@@ -2287,6 +2377,24 @@ class Controller:
         self._assert_checked = 0.0
         self._hdmi_checked = 0.0
         self._hdmi_connected = None
+        reader = None
+        if volume_menu:
+            from volume_readback import VolumeReadback, helper_number
+            child = [sys.executable, "-B", str(Path(__file__).resolve())]
+            def allowed():
+                return (not self._stop.is_set() and not self._op_lock.locked()
+                        and not self.is_off() and hdmi_tv_connected(cfg))
+            lan = cfg.get("volume_upnp_ip") or cfg.get("tv_ip")
+            reader = VolumeReadback(
+                (lambda: helper_number(child + ["--read-ddc-volume"], 6)) if cfg.get("volume_ddc", True) else None,
+                (lambda: helper_number(child + ["--read-upnp-volume"], 6)) if lan and cfg.get("volume_upnp_udn") else None,
+                getattr(self.tv, "read_cloud_volume", None), getattr(self.tv, "request_volume_refresh", None),
+                allowed, self._stop, logger,
+            )
+        self.volume = (
+            VolumeCoordinator(cfg, self.tv, APP_DIR if volume_menu else None, reader=reader)
+            if cfg["enable_volume_control"] or volume_menu else None
+        )
         self.backend.reset_input_baseline()
         self.update_volume_health(force=True)
 
@@ -2925,6 +3033,13 @@ def main():
     g.add_argument("--check-volume-keys",action="store_true")
     g.add_argument("--audio-output",action="store_true")
     g.add_argument("--hdmi-displays",action="store_true")
+    g.add_argument("--read-ddc-volume", action="store_true")
+    g.add_argument("--probe-volume", action="store_true",
+                      help="Test all configured read paths; request one cloud refresh if stale (awake TV only)")
+    g.add_argument("--read-upnp-volume", action="store_true")
+    g.add_argument("--inspect-upnp", metavar="TV_IP")
+    g.add_argument("--bind-volume-upnp", metavar="TV_IP", help="Confirm and save a LAN volume reader")
+    ap.add_argument("--volume-description", metavar="URL", help="Device description URL for --inspect-upnp")
     g.add_argument("--input-access",action="store_true")
     g.add_argument("--request-input-access",action="store_true")
     g.add_argument("--idle",action="store_true")
@@ -2960,6 +3075,42 @@ def main():
     except Exception as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
+
+    if any((a.probe_volume, a.read_ddc_volume, a.read_upnp_volume, a.inspect_upnp, a.bind_volume_upnp)):
+        from volume_readback import bind_upnp, probe_paths, upnp_volume, mac_ddc
+        try:
+            def allowed():
+                state = json.loads(STATUS_FILE.read_text(encoding="utf-8-sig"))
+                return bool(state.get("running") and state.get("state") == "awake" and hdmi_tv_connected(cfg))
+            if not allowed():
+                raise ValueError("Read deferred until the controller reports the bound HDMI TV awake")
+            if a.bind_volume_upnp:
+                if bind_upnp(CONFIG_FILE, a.bind_volume_upnp, a.volume_description or "", allowed):
+                    print("LAN volume reader bound. Restart the controller when the picture is awake.")
+                return 0
+            if a.probe_volume:
+                client = make_tv_client(cfg)
+                try:
+                    result = probe_paths([sys.executable, "-B", str(Path(__file__).resolve())],
+                                         client, allowed, logger)
+                    print(json.dumps(result))
+                    return 0 if any(row.get("value") is not None for row in result.values()) else 7
+                finally:
+                    client.close()
+            if a.read_ddc_volume:
+                print(mac_ddc(cfg, available_hdmi_tv_bindings, APP_DIR))
+            else:
+                host = a.inspect_upnp or cfg.get("volume_upnp_ip") or cfg.get("tv_ip")
+                description = (a.volume_description if a.inspect_upnp else None) or cfg.get("volume_upnp_description", "")
+                value, udn, url = upnp_volume(host, description,
+                                              "" if a.inspect_upnp else cfg.get("volume_upnp_udn", ""),
+                                              inspect=bool(a.inspect_upnp))
+                print(json.dumps({"value": value, "volume_upnp_ip": host, "volume_upnp_udn": udn,
+                                  "volume_upnp_description": url}) if a.inspect_upnp else value)
+            return 0
+        except Exception as exc:
+            print(f"Volume read unavailable: {exc}", file=sys.stderr)
+            return 7
 
     if a.check_hotkey: return check_hotkey(cfg)
     if a.check_volume_keys: return check_volume_keys()

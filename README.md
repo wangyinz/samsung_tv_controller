@@ -249,10 +249,12 @@ left blank.
   TV output uses its full range from 0 to 100.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
-- The controller reads cloud volume status at most once every 30 seconds; this
-  poll never sends a volume or device refresh command.
-- Direct LAN can send TV volume keys but cannot query the TV's current volume,
-  so the safe TV-first decrease rule is available only in SmartThings mode.
+- Background volume reads run at most once every 30 seconds. Opening the volume
+  menu requests an extra read; only that explicit request can refresh stale cloud
+  status, at most once in five minutes. Neither operation sets the TV volume.
+- The Samsung LAN remote sends relative volume keys. Optional DDC/UPnP readers
+  can display an actual level, but the absolute-write and Windows TV-floor
+  features still require SmartThings.
 
 Pointer movement alone is disabled as a wake source on both platforms by
 default. Advanced users can set `enable_mouse_move_wake` to `true` in
@@ -303,7 +305,7 @@ volume. Some Samsung TVs accept volume commands without updating the public
 API's [volume attribute](https://community.smartthings.com/t/tv-volume-control/261456).
 Both controllers check the [attribute's own update time](https://developer.smartthings.com/docs/service-integrations/query-and-list-devices).
 A report must be newer than the session/connection and last command or report,
-and at most two minutes old. Duplicate, older, undated, or future reports cannot
+and at most two minutes old. Duplicate, older, undated, or future cloud reports cannot
 replace a slider setting. **Last set here** is the accepted target, not an
 independent TV reading. If there is no trustworthy value after a restart or
 reconnection, the slider shows an unknown level and can still set an exact target.
@@ -311,6 +313,60 @@ After two minutes without a reliable baseline, media keys use a relative TV step
 where allowed; Windows leaves Volume Down to the system when it cannot verify
 the TV volume floor. Exact values require SmartThings and the TV's `audioVolume` capability;
 LAN mode displays an explanation in place of an active slider.
+
+### Reading the actual TV volume
+
+The Mac and Windows menus identify the source of a reading. The background
+reader tries these paths for the bound, awake TV, independently of the keyboard
+input loop:
+
+1. **HDMI DDC/CI** reads the physical display's speaker-volume control (VCP
+   `0x62`). Windows uses its native monitor API and skips ambiguous or cloned
+   monitor handles. On Apple Silicon, run `Install-DDC.command` from the Mac
+   distribution once (requires the Command Line Tools), or install
+   [m1ddc](https://github.com/waydabber/m1ddc). The helper selects the uniquely
+   bound display, not a display index. Both platforms require a 0–100 scale.
+   Set `"volume_ddc": false` to disable this path on a TV that misreports it.
+2. **LAN UPnP** issues the read-only RenderingControl `GetVolume` action on
+   the Master channel. To bind it, run the installed controller with
+   `--bind-volume-upnp TV_IP` while the TV is awake. Check the printed IP,
+   renderer UUID and volume against your TV, confirm, then restart the controller.
+   Use `--inspect-upnp TV_IP` for discovery without saving. If discovery is
+   unavailable, pass `--volume-description http://TV_IP:PORT/PATH` using
+   the TV's advertised description. Readers do not trust a different renderer
+   at the same IP or alter network routes when a VPN blocks the LAN.
+3. **SmartThings** reads the bound device's timestamped volume attribute. If
+   the menu needs a fresh reading and that value is stale, the controller checks
+   for the `refresh` capability, requests it once, then reads back twice at
+   most. A command receipt alone is never taken as a volume measurement.
+
+A failed direct reader backs off for five minutes. An unchanged direct reading
+which contradicts a later local setting is skipped until it changes or reflects
+a subsequent setting. If no reader can verify a number, the menu retains the
+labelled last-set estimate or shows unknown. Direct reads can also supply a
+displayed value in LAN mode; setting an absolute slider target still requires
+SmartThings.
+
+For a real-device check, run the installed Python and controller with
+`--probe-volume` while the picture is awake. It reports **each** configured
+path separately, including unsupported/unavailable paths. Compare the output
+against the TV's own volume indicator at two different levels; a single number
+does not establish that the model reports changes. No probe sets volume, sends
+a remote key or powers on a device.
+
+macOS Terminal:
+
+```sh
+tvapp="$HOME/Library/Application Support/QN990FController"
+"$tvapp/venv/bin/python" "$tvapp/QN990FController.py" --probe-volume
+```
+
+Windows PowerShell:
+
+```powershell
+$tvapp = Join-Path $env:LOCALAPPDATA "QN990FController"
+& "$tvapp\venv\Scripts\python.exe" "$tvapp\QN990FController.py" --probe-volume
+```
 
 ## Security and privacy
 

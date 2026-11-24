@@ -232,7 +232,13 @@ Volume keys:
     the TV across its full 0-100 range. Every other output remains under macOS control.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
-    Cloud volume status is read at most once every 30 seconds. Older or undated
+    The menu tries bound HDMI DDC, pinned LAN UPnP, then fresh SmartThings
+    status. Background polls do not request a device refresh. Opening the
+    menu can refresh stale cloud data once per five minutes. On Apple Silicon
+    run Install-DDC.command once to install the optional DDC reader. Use
+    --bind-volume-upnp TV_IP to confirm the LAN reader; see the root README.
+    Use --probe-volume to test each source separately while the TV is awake.
+    Older or undated
     cloud reports cannot roll back a local setting. The slider distinguishes the
     last accepted target from a recent TV report. If neither is known, select
     a level explicitly. After two minutes without a reliable baseline, volume
@@ -243,8 +249,8 @@ Volume keys:
     Keyboard Control and turn off "Listen to native audio keys". BetterDisplay
     may remain running for brightness and its other display features.
 
-Direct LAN can send TV volume keys but cannot read current TV volume. SmartThings mode
-can read and combine the target TV volume before sending an update.
+The LAN remote sends relative volume keys. DDC and UPnP can report a level in
+either mode; only SmartThings can send an absolute volume target.
 
 Wake rules:
 - Pressing modifier keys such as Control, Command, Option, or Shift alone does not wake.

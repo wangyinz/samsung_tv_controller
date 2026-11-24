@@ -205,6 +205,11 @@ end refreshVolumeTimer_
 
 on menuWillOpen_(sender)
     my refreshStatus()
+    -- Separate from a slider write. Opening a menu must never set a volume.
+    if volumeSession is not "" then
+        set sessionText to current application's NSString's stringWithString:volumeSession
+        sessionText's writeToFile:(appDir & "volume-read.request") atomically:true encoding:(current application's NSUTF8StringEncoding) |error|:(missing value)
+    end if
 end menuWillOpen_
 
 on actionItem(itemTitle, selectorName)

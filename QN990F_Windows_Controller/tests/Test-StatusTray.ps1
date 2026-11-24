@@ -74,7 +74,7 @@ Assert-True ($Previous -eq 255) "Fade is bounded and monotonic"
 # Execute the implementation's functions, not copies of the volume protocol.
 foreach ($Name in @(
     "Submit-Volume", "Update-VolumeStatus", "Complete-VolumeDrag", "Set-VolumeFromPointer",
-    "Set-FlyoutTheme", "Set-FlyoutBounds", "Start-FlyoutFade", "Complete-FlyoutFade"
+    "Set-FlyoutTheme", "Set-FlyoutBounds", "Start-FlyoutFade", "Complete-FlyoutFade", "Request-VolumeRead"
 )) {
     $Definition = $Ast.Find({
         param($Node)
@@ -193,6 +193,11 @@ try {
     Update-VolumeStatus $true 123
     Assert-True ($VolumeSlider.IsEnabled -and $VolumeSlider.Value -eq 14) "Initial TV volume"
     Assert-True (-not (Test-Path -LiteralPath $VolumeRequestPath)) "Status synchronization must not submit requests"
+    $AppDir = $TestDir
+    Request-VolumeRead
+    Request-VolumeRead
+    Assert-True ([IO.File]::ReadAllText((Join-Path $AppDir "volume-read.request")) -eq "session-1") "Opening/reopening requests a read for this session"
+    Assert-True (-not (Test-Path -LiteralPath $VolumeRequestPath)) "Opening the flyout must not write a volume target"
 
     foreach ($Value in @(0, 100, 37)) {
         $script:VolumeDragging = $true

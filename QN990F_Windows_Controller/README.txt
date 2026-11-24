@@ -169,7 +169,11 @@ Volume keys:
     Volume Down in SmartThings mode -> TV volume down to 10, then Windows.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
-    Cloud volume status is read at most once every 30 seconds. Older or undated
+    The tray tries native HDMI DDC (unique, non-cloned physical monitor),
+    pinned LAN UPnP, then fresh SmartThings status. Opening the menu can
+    refresh stale cloud data once per five minutes; background polls do not.
+    Use --bind-volume-upnp TV_IP to confirm the LAN reader (root README)
+    and --probe-volume to test each source while the TV is awake. Older or undated
     cloud reports cannot roll back a local setting. The slider distinguishes the
     last accepted target from a recent TV report. If neither is known, select a
     level explicitly. Without a baseline from the last two minutes, Volume Up
@@ -185,8 +189,8 @@ Volume keys:
     transmission. If another app owns these global keys, a dedicated keyboard
     hook is used instead; game routing may then be limited by Windows security.
 
-Direct LAN can send a TV volume key but cannot read the current TV volume, so
-the TV-first Volume Down rule is intentionally limited to SmartThings mode.
+The LAN remote sends relative volume keys. DDC and UPnP can report a level in
+either mode; the TV-first Volume Down rule remains limited to SmartThings mode.
 
 Notification-area icon:
     Left-click the Samsung TV Picture Controller icon for a compact TV-volume

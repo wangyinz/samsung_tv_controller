@@ -211,6 +211,31 @@ class VolumeMenuCases:
                        *({"value": v, "timestamp": stamp} for v in (-1, 101, "17", True, None))):
             self.assertIsNone(parse(report))
 
+    def test_readback_is_single_flight_and_does_not_block_slider_writes(self):
+        self.volume.stop()
+        entered, release = threading.Event(), threading.Event()
+        class SlowReader:
+            def allowed(self): return True
+            def read(self, fence, demand, **options):
+                entered.set()
+                release.wait(3)
+                return 17, time.time(), "HDMI DDC"
+        # These tests execute the standalone coordinator via AST on either OS.
+        import sys
+        with mock.patch.object(sys, "path", [str(ROOT / f"QN990F_{self.platform}_Controller"), *sys.path]):
+            self.volume = self.worker_type(self.config, self.tv, self.directory, reader=SlowReader())
+            self.assertTrue(entered.wait(2))
+        self.addCleanup(self.volume.stop)
+        self.addCleanup(release.set)
+        self.wait_for(lambda: self.status().get("session") != self.session)
+        self.session = self.status()["session"]
+        request_id = self.request(10)
+        self.wait_for(lambda: self.status().get("request_id") == request_id)
+        self.assertEqual(self.tv.targets, [10])
+        release.set()
+        self.volume.stop()
+        self.assertEqual(self.volume._tv_volume, 10)
+
     def test_invalid_and_expired_requests_do_not_change_the_tv(self):
         cases = [
             {"value": -1}, {"value": 101}, {"value": True},

@@ -56,6 +56,10 @@ on run argv
     my assertThat((rebindItem's action() as text) is "rebindHDMITV:", "HDMI rebinding must have its own action")
     set implementation's pendingVolumeID to "pending-test-request"
     set implementation's volumeSession to "test-session"
+    implementation's menuWillOpen_(theMenu)
+    set readMarker to current application's NSString's stringWithContentsOfFile:((item 2 of argv) & "/volume-read.request") encoding:(current application's NSUTF8StringEncoding) |error|:(missing value)
+    my assertThat((readMarker as text) is "test-session", "Opening the menu requests a read for the current daemon")
+    my assertThat(not (current application's NSFileManager's defaultManager()'s fileExistsAtPath:((item 2 of argv) & "/volume-request.json")), "Opening the menu must not set a volume")
     theSlider's setIntegerValue:37
     repeat 20 times
         implementation's prepareStatusMenu(false)

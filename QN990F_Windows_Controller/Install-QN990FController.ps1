@@ -225,6 +225,7 @@ Write-Host "Samsung TV Picture Controller installer for Windows" -ForegroundColo
 
 foreach ($RequiredFile in @(
     "QN990FController.py",
+    "volume_readback.py",
     "Configure-QN990FController.ps1",
     "Rebind-HDMI.ps1",
     "Reauthorize-SmartThings.ps1",
@@ -653,6 +654,7 @@ if ($LASTEXITCODE -ne 0) {
 
 $InstalledFileNames = @(
     "QN990FController.py",
+    "volume_readback.py",
     "Configure-QN990FController.ps1",
     "Rebind-HDMI.ps1",
     "Reauthorize-SmartThings.ps1",
@@ -843,6 +845,7 @@ try {
 
         Write-Step "Copying controller files"
         Copy-Item $SourceControllerPath $ControllerPath -Force
+        Copy-Item (Join-Path $PSScriptRoot "volume_readback.py") (Join-Path $AppDir "volume_readback.py") -Force
         Copy-Item (Join-Path $PSScriptRoot "Configure-QN990FController.ps1") (Join-Path $AppDir "Configure-QN990FController.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "Rebind-HDMI.ps1") (Join-Path $AppDir "Rebind-HDMI.ps1") -Force
         Copy-Item (Join-Path $PSScriptRoot "Reauthorize-SmartThings.ps1") (Join-Path $AppDir "Reauthorize-SmartThings.ps1") -Force

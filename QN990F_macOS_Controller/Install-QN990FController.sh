@@ -129,8 +129,8 @@ echo "Control connection:"
 echo "  1. Direct LAN WebSocket (original mode)"
 echo "  2. SmartThings cloud (for networks where a VPN or policy blocks TV LAN access)"
 
-if [[ ! -f "$SCRIPT_DIR/QN990FController.py" ]]; then
-  echo "QN990FController.py is missing. Keep all extracted files together."
+if [[ ! -f "$SCRIPT_DIR/QN990FController.py" || ! -f "$SCRIPT_DIR/volume_readback.py" ]]; then
+  echo "Controller files are missing. Keep all extracted files together."
   exit 1
 fi
 
@@ -211,6 +211,7 @@ rm -f "$APP_DIR/launchd.out.log" "$APP_DIR/launchd.err.log"
 
 step "Copying controller files"
 cp "$SCRIPT_DIR/QN990FController.py" "$CONTROLLER"
+cp "$SCRIPT_DIR/volume_readback.py" "$APP_DIR/volume_readback.py"
 cp "$SCRIPT_DIR/Configure.command" "$APP_DIR/Configure.command"
 cp "$SCRIPT_DIR/Reauthorize.command" "$APP_DIR/Reauthorize.command"
 cp "$SCRIPT_DIR/RepairInputMonitoring.command" "$APP_DIR/RepairInputMonitoring.command"

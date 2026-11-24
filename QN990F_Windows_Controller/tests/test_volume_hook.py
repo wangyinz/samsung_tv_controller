@@ -70,7 +70,7 @@ class VolumeHookTests(unittest.TestCase):
 
     def test_floor_and_system_maximum_keep_native_behavior(self):
         config = c.DEFAULT_CONFIG.copy()
-        tv = SimpleNamespace(authorization_required=lambda: False)
+        tv = SimpleNamespace(authorization_required=lambda: False, set_volume=mock.Mock())
         with mock.patch.object(c.threading, "Thread", return_value=SimpleNamespace(start=lambda: None)):
             volume = c.VolumeCoordinator(config, tv)
         volume._tv_volume = 11

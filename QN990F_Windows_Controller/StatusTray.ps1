@@ -329,6 +329,19 @@ try {
         [TVFlyoutNative]::Style($WindowHandle, $Dark)
     }
 
+    function Request-VolumeRead {
+        if (-not $script:VolumeSession) { return }
+        try {
+            $ReadPath = Join-Path $AppDir "volume-read.request"
+            [IO.File]::WriteAllText("$ReadPath.tmp", $script:VolumeSession)
+            if ([IO.File]::Exists($ReadPath)) {
+                [IO.File]::Replace("$ReadPath.tmp", $ReadPath, [NullString]::Value)
+            } else {
+                [IO.File]::Move("$ReadPath.tmp", $ReadPath)
+            }
+        } catch { } # The regularly scheduled read still works.
+    }
+
     function Show-Flyout([bool]$FullMenu) {
         $FadeTimer.Stop()
         $script:FlyoutTargetVisible = $true
@@ -339,6 +352,7 @@ try {
         }
         [TVFlyoutNative]::CaptureAnchor()
         Update-TrayStatus
+        Request-VolumeRead
         Set-FlyoutTheme
         $PanelVisibility = if ($FullMenu) { "Visible" } else { "Collapsed" }
         $StatusPanel.Visibility = $PanelVisibility

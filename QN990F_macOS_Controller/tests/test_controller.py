@@ -786,6 +786,23 @@ class SmartThingsTVClientTests(unittest.TestCase):
 
         run.assert_called_once_with("devices:status", DEVICE_ID, "--json")
 
+    def test_on_demand_refresh_is_gated_and_only_uses_advertised_capability(self):
+        from urllib.parse import quote
+        path = "/devices/" + quote(DEVICE_ID, safe="")
+        with mock.patch.object(self.client, "_run") as run:
+            self.assertFalse(self.client.request_volume_refresh(lambda: False))
+            run.assert_not_called()
+            run.return_value = json.dumps({"components": [{"id": "main", "capabilities": []}]})
+            self.assertFalse(self.client.request_volume_refresh(lambda: True))
+            run.assert_called_once_with(api_request=("GET", path, None), timeout=4)
+            self.client._volume_can_refresh = True
+            run.reset_mock()
+            run.return_value = json.dumps({"results": [{"id":"receipt","status":"COMPLETED"}]})
+            self.assertTrue(self.client.request_volume_refresh(lambda: True))
+            run.assert_called_once_with(api_request=("POST", path + "/commands", {"commands": [
+                {"component":"main","capability":"refresh","command":"refresh","arguments":[]}
+            ]}), timeout=4)
+
     def test_set_volume_uses_explicit_audio_volume_target(self):
         receipt = json.dumps({"results": [{"id": "command-2", "status": "COMPLETED"}]})
         with mock.patch.object(self.client, "_run", return_value=receipt) as run:
