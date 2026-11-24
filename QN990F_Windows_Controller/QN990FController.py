@@ -2484,6 +2484,7 @@ class VolumeCoordinator:
         self._buffer_start_volume = None
         self._buffer_deadline = 0.0
         self._menu_dir = menu_dir
+        self._menu_hdmi_connected = hdmi_target_connected(config)
         self._menu_session = uuid.uuid4().hex
         self._menu_request_id = ""
         self._menu_completed_id = ""
@@ -2503,12 +2504,11 @@ class VolumeCoordinator:
             return
         supported = callable(getattr(self.tv, "set_volume", None))
         auth_required = getattr(self.tv, "authorization_required", lambda: False)()
-        hdmi_connected = hdmi_target_connected(self.config)
         with self._lock:
-            available = supported and hdmi_connected and not auth_required and not self._stop.is_set()
+            available = supported and self._menu_hdmi_connected and not auth_required and not self._stop.is_set()
             if self._stop.is_set():
                 state, message = "stopped", "Controller is stopped."
-            elif not hdmi_connected:
+            elif not self._menu_hdmi_connected:
                 state, message = "hdmi_disconnected", "Bound TV is not connected by HDMI; TV volume control is inactive."
             elif not supported:
                 state, message = "unavailable", "Exact TV volume requires SmartThings."
@@ -2556,12 +2556,16 @@ class VolumeCoordinator:
             )
         except (OSError, ValueError):
             return
-        if not isinstance(request, dict) or request.get("session") != self._menu_session:
+        if not isinstance(request, dict):
             return
         request_id = request.get("id")
-        if not isinstance(request_id, str) or not request_id or request_id == self._menu_request_id:
+        if not isinstance(request_id, str) or not request_id:
             return
-        self._menu_request_id = request_id
+        with self._lock:
+            if request.get("session") != self._menu_session or request_id == self._menu_request_id:
+                return
+            self._menu_request_id = request_id
+            epoch = self._connection_epoch
         target = request.get("value")
         created = request.get("created_at")
         error = ""
@@ -2574,8 +2578,14 @@ class VolumeCoordinator:
         elif getattr(self.tv, "authorization_required", lambda: False)():
             error = "Reauthorize SmartThings to control TV volume."
         elif not hdmi_target_connected(self.config):
-            error = "Bound TV is not connected by HDMI."
+            self.disconnected()
+            return
         with self._lock:
+            if epoch != self._connection_epoch or request.get("session") != self._menu_session:
+                return
+            if not self._menu_hdmi_connected:
+                self._menu_completed_id = request_id
+                return
             self._menu_error = error
             if error:
                 self._menu_completed_id = request_id
@@ -2588,7 +2598,6 @@ class VolumeCoordinator:
             now = time.monotonic()
             self._buffer_deadline = now + self.BUFFER_SECONDS
             self._estimate_valid_until = now + 2 * float(self.config["tv_volume_refresh_seconds"])
-            epoch = self._connection_epoch
         if notify:
             self._commands.put(("flush_volume", epoch))
 
@@ -2642,6 +2651,7 @@ class VolumeCoordinator:
 
     def disconnected(self) -> None:
         with self._lock:
+            self._menu_hdmi_connected = False
             self._connection_epoch += 1
             self._tv_volume = None
             self._volume_as_of = max(time.time(), self._volume_as_of)
@@ -2651,9 +2661,25 @@ class VolumeCoordinator:
             self._buffer_deadline = 0.0
             self._buffer_start_volume = None
             self._estimate_valid_until = 0.0
+            self._menu_completed_id = self._menu_request_id
+        self._publish_menu_status()
 
-    def _flush_volume_buffer(self) -> None:
+    def on_hdmi_connected(self) -> None:
+        with self._lock:
+            if self._menu_hdmi_connected:
+                return
+            self._menu_hdmi_connected = True
+            # An old slider release (or read request) must not cross a reconnect.
+            self._menu_session = uuid.uuid4().hex
+            self._menu_request_id = self._menu_completed_id = ""
+            self._volume_as_of = max(self._volume_as_of, time.time())
+        self._publish_menu_status()
+
+    def _flush_volume_buffer(self, epoch: int) -> None:
         while not self._stop.is_set():
+            with self._lock:
+                if epoch != self._connection_epoch:
+                    return
             if not hdmi_target_connected(self.config):
                 self.disconnected()
                 return
@@ -2666,15 +2692,16 @@ class VolumeCoordinator:
                     return
                 continue
             with self._lock:
+                if epoch != self._connection_epoch:
+                    return
                 target = self._tv_volume
                 start = self._buffer_start_volume
                 self._buffer_deadline = 0.0
                 self._buffer_start_volume = None
                 request_id = self._menu_request_id
-                epoch = self._connection_epoch
-            if target is None or target == start:
-                self._menu_completed_id = request_id
-                return
+                if target is None or target == start:
+                    self._menu_completed_id = request_id
+                    return
             with self._lock:
                 if epoch != self._connection_epoch:
                     return
@@ -2703,7 +2730,7 @@ class VolumeCoordinator:
             self.disconnected()
             return
         if command == "flush_volume":
-            self._flush_volume_buffer()
+            self._flush_volume_buffer(epoch)
         else:
             self.tv.send(command)
             self._finish_relative_key(epoch)
@@ -2754,6 +2781,8 @@ class VolumeCoordinator:
 
     def _refresh_volume(self, demand=False):
         with self._lock:
+            if not self._menu_hdmi_connected:
+                return
             self._expire_volume_report(time.time())
             if self._relative_pending or self._buffer_deadline or (not demand and time.monotonic() < self._estimate_valid_until):
                 return
@@ -3293,6 +3322,9 @@ class Controller:
             return self._hdmi_last_connected is True
         self._hdmi_next_check = now + 1.0
         connected = hdmi_target_connected(self.config)
+        # A command guard may have observed a disconnect between monitor polls.
+        if connected and self.volume is not None:
+            self.volume.on_hdmi_connected()
         if connected != self._hdmi_last_connected:
             self._hdmi_last_connected = connected
             logger.info("Bound local HDMI display %s", "connected" if connected else "disconnected")

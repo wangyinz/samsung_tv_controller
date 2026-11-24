@@ -1426,6 +1426,50 @@ class ControllerInputTests(unittest.TestCase):
             self.assertEqual(instance.next_off_attempt, 0.0)
         self.assertEqual(tv.sent, [])
 
+    def test_volume_menu_follows_hdmi_switch_without_a_new_write_or_readback(self):
+        menu = tempfile.TemporaryDirectory()
+        self.addCleanup(menu.cleanup)
+        directory = Path(menu.name)
+        tv = RecordingTV()
+        instance, _ = self.make_controller(tv=tv)
+        volume = instance.volume = controller.VolumeCoordinator(instance.cfg, tv, directory)
+        def status():
+            return json.loads((directory / "volume-status.json").read_bytes())
+        online = [True]
+        with mock.patch.object(controller, "hdmi_tv_connected", side_effect=lambda cfg: online[0]):
+            instance.check_hdmi_connection()
+            online[0] = False
+            instance.check_hdmi_connection()
+            self.assertEqual(status()["state"], "hdmi_disconnected")
+            self.assertFalse(status()["available"])
+            # A slider release which arrives after unplugging must not replay on return.
+            (directory / "volume-request.json").write_text(json.dumps({
+                "session": volume._menu_session, "id": "unplugged", "value": 39,
+                "created_at": time.time(),
+            }))
+            deadline = time.monotonic() + 2
+            while status()["request_id"] != "unplugged" and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(status()["request_id"], "unplugged")
+            online[0] = True
+            instance.check_hdmi_connection()
+            restored = status()
+            self.assertTrue(restored["available"])
+            self.assertEqual(restored["state"], "ready")
+            self.assertIsNone(restored["value"])
+            tv.get_volume = lambda: (10, time.time())
+            volume._refresh_volume()
+            volume._publish_menu_status()
+            self.assertEqual((status()["state"], status()["value"]), ("ready", 10))
+            self.assertEqual(tv.sent, [])
+            self.assertEqual(tv.set_volumes, [])
+
+            # Even a brief guard failure between two positive monitor polls recovers.
+            volume.on_hdmi_disconnected()
+            self.assertFalse(status()["available"])
+            instance.check_hdmi_connection()
+            self.assertTrue(status()["available"])
+
     @staticmethod
     def enable_mouse_move_wake(instance):
         instance.cfg["enable_mouse_move_wake"] = True

@@ -51,8 +51,10 @@ panel is dark. Automatic input wake is active only after a successful off reques
 
 Both LAN and SmartThings commands require the bound TV to be detected on local
 HDMI. Network reachability or a cloud device ID alone does not enable control.
-When a disconnect is detected, queued control operations are cleared;
-reconnecting does not replay them. If display detection fails or the HDMI binding is missing or ambiguous,
+When the controller detects that the bound HDMI TV has disconnected, it disables
+the volume slider. When it detects the same TV again, the disconnect notice clears automatically,
+even if its volume is still unknown. Queued controls and slider releases from
+before reconnection are not replayed. If display detection fails or the HDMI binding is missing or ambiguous,
 the controller blocks commands and leaves volume keys to the operating system.
 
 ## Compatibility

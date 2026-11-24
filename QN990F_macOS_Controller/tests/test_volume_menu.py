@@ -295,9 +295,66 @@ class VolumeMenuCases:
         self.assertIn("SmartThings", self.status()["message"])
 
 
+    def test_pre_reconnect_slider_target_is_not_replayed(self):
+        disconnect = self.volume.on_hdmi_disconnected if self.platform == "macOS" else self.volume.disconnected
+        disconnect()
+        self.volume.on_hdmi_connected()
+        # A delayed old UI process may submit with a *new* time but the old session.
+        self.request(81)
+        self.volume._poll_menu_request()
+        self.volume._publish_menu_status()
+        self.assertEqual(self.status()["request_id"], "")
+        self.assertIsNone(self.status()["value"])
+        self.assertTrue(self.status()["available"])
+        self.assertEqual(self.status()["state"], "ready")
+        self.assertEqual(self.tv.targets, [])
+        self.assertNotEqual(self.status()["session"], self.session)
+        self.session = self.status()["session"]
+        new_id = self.request(10)
+        self.wait_for(lambda: self.status()["request_id"] == new_id)
+        self.assertEqual(self.tv.targets, [10])
+
+    def test_hdmi_status_does_not_erase_an_unrelated_failed_volume_request(self):
+        self.tv.fail = True
+        request_id = self.request(25)
+        self.wait_for(lambda: self.status()["request_id"] == request_id)
+        failed = self.status()
+        self.assertEqual(failed["state"], "error")
+        disconnect = self.volume.on_hdmi_disconnected if self.platform == "macOS" else self.volume.disconnected
+        disconnect()
+        self.assertEqual(self.status()["state"], "hdmi_disconnected")
+        self.volume.on_hdmi_connected()
+        restored = self.status()
+        self.assertTrue(restored["available"])
+        self.assertEqual((restored["state"], restored["message"]), ("error", failed["message"]))
+        self.assertEqual(self.tv.targets, [25])
+
+
 class MacVolumeMenuTests(VolumeMenuCases, unittest.TestCase):
     platform = "macOS"
 
 
 class WindowsVolumeMenuTests(VolumeMenuCases, unittest.TestCase):
     platform = "Windows"
+
+    def test_request_during_hdmi_switch_does_not_leave_tray_in_error(self):
+        # Drive the real Windows monitor and coordinator; only the topology probe
+        # and status.json publisher are mocked, so this also runs on macOS.
+        check = load_definition(self.platform, "Controller")._check_hdmi_connection
+        monitor = mock.Mock(config=self.config, volume=self.volume, _hdmi_next_check=0,
+                            _hdmi_last_connected=True, _state_lock=threading.Lock(),
+                            picture_off=False, off_retry_token=0)
+        online = [False]
+        probe = lambda _cfg: online[0]
+        with mock.patch.dict(check.__globals__, hdmi_target_connected=probe, write_status=mock.Mock()), \
+             mock.patch.dict(self.volume._publish_menu_status.__globals__, hdmi_target_connected=probe):
+            self.assertFalse(check(monitor, 1))
+            self.wait_for(lambda: self.status()["state"] == "hdmi_disconnected")
+            self.assertFalse(self.status()["available"])
+            request_id = self.request(39)
+            self.wait_for(lambda: self.status()["request_id"] == request_id)
+            online[0] = True
+            self.assertTrue(check(monitor, 3))
+            self.wait_for(lambda: self.status()["available"])
+            self.assertEqual(self.status()["state"], "ready")
+            self.assertEqual(self.tv.targets, [])
