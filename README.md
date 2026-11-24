@@ -353,7 +353,9 @@ input loop:
 A failed direct reader backs off for five minutes. An unchanged direct reading
 which contradicts a later local setting is skipped until it changes or reflects
 a subsequent setting. If no reader can verify a number, the menu retains the
-labelled last-set estimate or shows unknown. Direct reads can also supply a
+labelled last-set estimate or last verified reading for this connection, or shows
+unknown if neither is usable. An expired reading is labelled **Last reported**
+and is never used to calculate a new absolute volume. Direct reads can also supply a
 displayed value in LAN mode; setting an absolute slider target still requires
 SmartThings.
 

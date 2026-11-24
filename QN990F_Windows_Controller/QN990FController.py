@@ -2541,6 +2541,8 @@ class VolumeCoordinator:
         auth_required = getattr(self.tv, "authorization_required", lambda: False)()
         with self._lock:
             absolute_pending = self._relative_delta is None and bool(self._buffer_deadline or self._inflight == "absolute")
+            last_report = (self._tv_volume is not None and not self._volume_is_local
+                           and not 0 <= time.time() - self._volume_as_of <= self.MAX_REPORT_AGE)
             available = supported and self._menu_hdmi_connected and not auth_required and not self._stop.is_set()
             if self._stop.is_set():
                 state, message = "stopped", "Controller is stopped."
@@ -2567,6 +2569,8 @@ class VolumeCoordinator:
                 state, message = "ready", "No recent TV volume report. Choose a level with the slider."
             elif self._volume_is_local:
                 state, message = "ready", "Last set here; TV volume not independently confirmed."
+            elif last_report:
+                state, message = "ready", f"Last reported via {self._read_source}; current TV level unconfirmed."
             else:
                 state, message = "ready", (f"Read via {self._read_source}." if self._read_source else "")
             payload = {
@@ -2576,7 +2580,7 @@ class VolumeCoordinator:
                 "state": state,
                 "message": message,
                 "value": self._tv_volume,
-                "source": ("pending" if absolute_pending else "last_set" if self._volume_is_local
+                "source": ("pending" if absolute_pending else "last_set" if self._volume_is_local else "last_report" if last_report
                            else self._read_source) if self._tv_volume is not None else "unknown",
                 "request_id": self._menu_completed_id,
             }
@@ -2831,12 +2835,6 @@ class VolumeCoordinator:
                     )
                 ))
 
-    def _expire_volume_report(self, now):
-        # Under the lock: a last-set estimate is not an aging cloud report.
-        if (not self._volume_is_local and not self._buffer_deadline
-                and now - self._volume_as_of > self.MAX_REPORT_AGE):
-            self._tv_volume = None
-
     def _read_loop(self):
         from volume_readback import menu_read_requested
         next_poll = next_demand = 0.0
@@ -2877,7 +2875,6 @@ class VolumeCoordinator:
         with self._lock:
             if not self._menu_hdmi_connected:
                 return
-            self._expire_volume_report(time.time())
             if self._inflight or self._buffer_deadline or (not demand and time.monotonic() < self._estimate_valid_until):
                 return
             epoch = self._connection_epoch
@@ -2909,7 +2906,6 @@ class VolumeCoordinator:
             if (ticket is None and time.monotonic() < self._estimate_valid_until
                     and (not demand or not report or report[0] != self._tv_volume)):
                 return
-            self._expire_volume_report(now)
             if report is None:
                 return
             value, reported_at = report

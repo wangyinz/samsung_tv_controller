@@ -180,6 +180,18 @@ class VolumeMenuCases:
         self.wait_for(lambda: self.status()["value"] is None)
         self.assertEqual(self.tv.targets, [10])
 
+    def test_verified_read_ages_to_labelled_history_not_an_absolute_key_base(self):
+        self.assertEqual(self.poll_report((7, time.time())), 7)
+        with self.volume._lock:
+            self.volume._volume_as_of = time.time() - 180
+        self.assertEqual(self.poll_report((17, time.time() - 86400)), 7)
+        self.assertEqual(self.status()["source"], "last_report")
+        self.assertIn("Last reported", self.status()["message"])
+        self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+        self.wait_for(lambda: self.tv.keys == ["KEY_VOLUP"])
+        self.assertEqual(self.tv.targets, [])
+        self.wait_for(lambda: self.status()["value"] is None)
+
     def test_read_in_flight_cannot_override_a_key_or_cross_an_hdmi_disconnect(self):
         def key_during_read():
             self.assertTrue(self.volume.handle_key("up", system_is_max=True))
