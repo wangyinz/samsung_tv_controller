@@ -169,7 +169,12 @@ Volume keys:
     Volume Down in SmartThings mode -> TV volume down to 10, then Windows.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
-    Cloud volume state is refreshed no more than once every 30 seconds.
+    Cloud volume status is read at most once every 30 seconds. Older or undated
+    cloud reports cannot roll back a local setting. The slider distinguishes the
+    last accepted target from a recent TV report. If neither is known, select a
+    level explicitly. Without a baseline from the last two minutes, Volume Up
+    at system maximum uses a relative step; Volume Down stays with Windows so
+    that an unknown TV level cannot bypass the configured floor.
     Volume keys use OS global hotkeys with a dedicated Core Audio worker, so an
     elevated foreground game does not require running this controller as admin.
     Each press/repeat either routes to TV or takes one native Windows volume

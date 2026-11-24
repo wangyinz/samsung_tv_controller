@@ -1400,6 +1400,23 @@ class SmartThingsCommandRejected(RuntimeError):
     pass
 
 
+def parse_volume_report(attribute):
+    """The attribute timestamp describes the report; a GET does not refresh it."""
+    if not isinstance(attribute, dict):
+        return None
+    value = attribute.get("value")
+    stamp = attribute.get("timestamp")
+    if type(value) is not int or not 0 <= value <= 100 or not isinstance(stamp, str):
+        return None
+    try:
+        reported = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if reported.tzinfo is None:
+            return None
+        return value, reported.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 class SmartThingsTVClient:
     # Samsung's TV web plugin maps the Accessibility Mode button to
     # KEY_PICTURE_OFF/Click, then maps Click to this OCF pressAndRelease write.
@@ -1833,8 +1850,7 @@ class SmartThingsTVClient:
                     "devices:status", str(self.cfg["smartthings_device_id"]), "--json"
                 )
                 status = json.loads(output)
-                value = status["components"]["main"]["audioVolume"]["volume"]["value"]
-                return min(100, max(0, int(value)))
+                return parse_volume_report(status["components"]["main"]["audioVolume"]["volume"])
             except Exception as exc:
                 logger.warning("SmartThings volume query failed: %r", exc)
                 return None
@@ -1856,7 +1872,7 @@ class SmartThingsTVClient:
                 }]}
                 self._command_times.append(time.monotonic())
                 output = self._run(api_request=("POST", path, payload))
-                self._command_receipt(output, "audioVolume.setVolume")
+                self._command_receipt(output, f"audioVolume.setVolume({target})")
                 return True
             except Exception as exc:
                 logger.warning("SmartThings set volume failed: %r", exc)
@@ -1901,6 +1917,7 @@ def make_tv_client(cfg):
 
 class VolumeCoordinator:
     BUFFER_SECONDS = 0.2
+    MAX_REPORT_AGE = 120.0
 
     def __init__(self, cfg, tv, menu_dir=None):
         self.cfg = cfg
@@ -1910,6 +1927,10 @@ class VolumeCoordinator:
         self._commands = queue.SimpleQueue()
         self._epoch = 0
         self._tv_volume = None
+        # Do not use a previous session's estimate as a new keypress baseline.
+        self._volume_as_of = time.time()
+        self._volume_is_local = False
+        self._relative_pending = 0
         self._estimate_valid_until = 0.0
         self._buffer_start_volume = None
         self._buffer_deadline = 0.0
@@ -1941,6 +1962,10 @@ class VolumeCoordinator:
                 state, message = "error", self._menu_error
             elif self._menu_request_id != self._menu_completed_id:
                 state, message = "pending", "Setting TV volume..."
+            elif self._tv_volume is None:
+                state, message = "ready", "No recent TV volume report. Choose a level with the slider."
+            elif self._volume_is_local:
+                state, message = "ready", "Last set here; TV volume not independently confirmed."
             else:
                 state, message = "ready", ""
             payload = {
@@ -2012,6 +2037,9 @@ class VolumeCoordinator:
         with self._lock:
             self._epoch += 1
             self._tv_volume = None
+            self._volume_as_of = max(time.time(), self._volume_as_of)
+            self._volume_is_local = False
+            self._relative_pending = 0
             self._buffer_start_volume = None
             self._buffer_deadline = 0.0
             self._estimate_valid_until = 0.0
@@ -2036,7 +2064,8 @@ class VolumeCoordinator:
             if not system_is_max:
                 return False
             with self._lock:
-                if self._tv_volume is None:
+                if not self._has_key_baseline():
+                    self._relative_pending += 1
                     self._commands.put((self._epoch, "KEY_VOLUP"))
                     return True
                 if self._tv_volume >= 100:
@@ -2057,8 +2086,9 @@ class VolumeCoordinator:
 
         floor = int(self.cfg["tv_volume_floor"]) if system_is_adjustable else 0
         with self._lock:
-            if self._tv_volume is None:
+            if not self._has_key_baseline():
                 if not system_is_adjustable:
+                    self._relative_pending += 1
                     self._commands.put((self._epoch, "KEY_VOLDOWN"))
                     return True
                 return False
@@ -2107,13 +2137,63 @@ class VolumeCoordinator:
                 return
             success = self.tv.set_volume(target)
             with self._lock:
+                if epoch != self._epoch:
+                    return
+                # An older report cannot resolve even a failed or ambiguous send.
+                self._volume_as_of = max(time.time(), self._volume_as_of)
+                self._volume_is_local = bool(success)
                 self._menu_completed_id = request_id
                 self._menu_error = "" if success else "TV volume change failed; check the controller log."
-                if not success:
+                if not success and not self._buffer_deadline:
                     self._tv_volume = None
                     self._estimate_valid_until = 0.0
             self._publish_menu_status()
             return
+
+    def _has_key_baseline(self):
+        # Never derive a new absolute write from an old estimate. The slider
+        # may still show the last accepted target, labelled as such.
+        return self._tv_volume is not None and (
+            self._buffer_deadline > 0 or (
+                not self._relative_pending and 0 <= time.time() - self._volume_as_of <= self.MAX_REPORT_AGE
+            )
+        )
+
+    def _finish_relative_key(self, epoch):
+        with self._lock:
+            if epoch == self._epoch:
+                self._relative_pending -= 1
+                self._volume_as_of = max(time.time(), self._volume_as_of)
+                if not self._buffer_deadline:
+                    self._tv_volume = None
+                    self._volume_is_local = False
+
+    def _expire_volume_report(self, now):
+        # Under the lock: a last-set estimate is not an aging cloud report.
+        if (not self._volume_is_local and not self._buffer_deadline
+                and now - self._volume_as_of > self.MAX_REPORT_AGE):
+            self._tv_volume = None
+
+    def _refresh_volume(self):
+        with self._lock:
+            self._expire_volume_report(time.time())
+            if self._relative_pending or self._buffer_deadline or time.monotonic() < self._estimate_valid_until:
+                return
+            epoch = self._epoch
+        report = self.tv.get_volume()
+        with self._lock:
+            now = time.time()
+            if (epoch != self._epoch or self._relative_pending or self._buffer_deadline
+                    or time.monotonic() < self._estimate_valid_until):
+                return
+            self._expire_volume_report(now)
+            if report is None:
+                return
+            value, reported_at = report
+            if self._volume_as_of < reported_at <= now and now - reported_at <= self.MAX_REPORT_AGE:
+                self._tv_volume = value
+                self._volume_as_of = reported_at
+                self._volume_is_local = False
 
     def _run(self):
         refresh_at = 0.0
@@ -2124,19 +2204,10 @@ class VolumeCoordinator:
                 return
             now = time.monotonic()
             if now >= refresh_at:
-                with self._lock:
-                    estimate_is_current = now < self._estimate_valid_until
-                if not estimate_is_current:
-                    volume = self.tv.get_volume()
-                    if volume is not None:
-                        with self._lock:
-                            if time.monotonic() >= self._estimate_valid_until:
-                                self._tv_volume = volume
-                    elif getattr(
-                        self.tv, "authorization_required", lambda: False
-                    )():
-                        self._publish_menu_status()
-                        return
+                self._refresh_volume()
+                if getattr(self.tv, "authorization_required", lambda: False)():
+                    self._publish_menu_status()
+                    return
                 refresh_at = time.monotonic() + float(
                     self.cfg["tv_volume_refresh_seconds"]
                 )
@@ -2152,15 +2223,13 @@ class VolumeCoordinator:
                     continue
             if command == "flush_volume":
                 self._flush_volume_buffer(epoch)
-                with self._lock:
-                    if self._tv_volume is None:
-                        refresh_at = 0.0
             else:
                 if hdmi_tv_connected(self.cfg):
                     with self._lock:
                         current = epoch == self._epoch
                     if current:
                         self.tv.send(command)
+                        self._finish_relative_key(epoch)
                 else:
                     self.on_hdmi_disconnected()
 

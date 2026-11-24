@@ -1,5 +1,6 @@
 """Exercise both platform volume workers without OS hooks or a real TV."""
 import ast
+from datetime import datetime
 import json
 import logging
 import os
@@ -9,25 +10,30 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import uuid
 
 
 ROOT = Path(__file__).parents[2]
 
 
-def load_worker(platform):
+def load_definition(platform, name):
     # Windows imports Win32 at module scope. Compile its actual platform-neutral
     # worker so the same behavioral cases can run on either development OS.
     path = ROOT / f"QN990F_{platform}_Controller" / "QN990FController.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "VolumeCoordinator")
+    node = next(n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name == name)
     namespace = dict(
         globals(), logger=logging.getLogger("volume-menu-test"),
         hdmi_tv_connected=lambda _cfg: True,
         hdmi_target_connected=lambda _cfg: True,
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["VolumeCoordinator"]
+    return namespace[name]
+
+
+def load_worker(platform):
+    return load_definition(platform, "VolumeCoordinator")
 
 
 class FakeTV:
@@ -42,7 +48,7 @@ class FakeTV:
         return self.auth_required
 
     def get_volume(self):
-        return self.value
+        return self.value, time.time()
 
     def set_volume(self, target):
         self.targets.append(target)
@@ -123,6 +129,87 @@ class VolumeMenuCases:
         time.sleep(0.3)
         self.assertEqual(self.tv.targets, [])
         self.assertEqual(self.status()["value"], 14)
+
+    def poll_report(self, report):
+        # Advance past the short UI hold, then exercise the real polling path.
+        with self.volume._lock:
+            self.volume._estimate_valid_until = 0
+        with mock.patch.object(self.tv, "get_volume", return_value=report):
+            self.volume._refresh_volume()
+        self.volume._publish_menu_status()
+        return self.status()["value"]
+
+    def test_november_3_report_never_reverts_set_10_or_turns_next_up_into_18(self):
+        old_report = (17, time.time() - 20 * 86400)
+        pre_write = (17, time.time())  # recent but still older than setVolume
+        request_id = self.request(10)
+        self.wait_for(lambda: self.status().get("request_id") == request_id)
+        for report in (old_report, pre_write, old_report, None):
+            self.assertEqual(self.poll_report(report), 10)
+            self.assertIn("Last set", self.status()["message"])
+        self.assertEqual(self.tv.targets, [10], "A poll must never write to the TV")
+        self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+        self.wait_for(lambda: self.tv.targets == [10, 11])
+        external = (22, time.time())
+        self.assertEqual(self.poll_report(external), 22)
+        self.assertEqual(self.poll_report((19, external[1] - 0.1)), 22)
+        self.assertEqual(self.poll_report((18, external[1])), 22)
+        self.assertEqual(self.poll_report((17, time.time() + 600)), 22)
+        self.assertEqual(self.tv.targets, [10, 11])
+
+    def test_restart_with_only_stale_cloud_data_does_not_replay_or_seed_a_keypress(self):
+        self.volume.stop()
+        self.tv.get_volume = lambda: (17, time.time() - 20 * 86400)
+        self.volume = self.worker_type(self.config, self.tv, self.directory)
+        self.addCleanup(self.volume.stop)
+        self.wait_for(lambda: self.status().get("session") != self.session)
+        self.assertIsNone(self.status()["value"])
+        self.assertIn("No recent", self.status()["message"])
+        self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+        self.wait_for(lambda: self.tv.keys == ["KEY_VOLUP"])
+        self.assertEqual(self.tv.targets, [])
+
+    def test_old_last_set_remains_labelled_but_is_not_an_absolute_key_base(self):
+        request_id = self.request(10)
+        self.wait_for(lambda: self.status().get("request_id") == request_id)
+        with self.volume._lock:
+            self.volume._volume_as_of = time.time() - 600
+        self.assertEqual(self.poll_report((17, time.time() - 86400)), 10)
+        self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+        self.wait_for(lambda: self.tv.keys == ["KEY_VOLUP"])
+        self.wait_for(lambda: self.status()["value"] is None)
+        self.assertEqual(self.tv.targets, [10])
+
+    def test_read_in_flight_cannot_override_a_key_or_cross_an_hdmi_disconnect(self):
+        def key_during_read():
+            self.assertTrue(self.volume.handle_key("up", system_is_max=True))
+            return 99, time.time()
+        with mock.patch.object(self.tv, "get_volume", side_effect=key_during_read):
+            self.volume._refresh_volume()
+        self.wait_for(lambda: self.tv.targets == [15])
+        disconnect = (self.volume.on_hdmi_disconnected if self.platform == "macOS"
+                      else self.volume.disconnected)
+        def unplug_during_read():
+            disconnect()
+            return 99, time.time()
+        with self.volume._lock:
+            self.volume._estimate_valid_until = 0
+        with mock.patch.object(self.tv, "get_volume", side_effect=unplug_during_read):
+            self.volume._refresh_volume()
+        self.assertIsNone(self.volume._tv_volume)
+        self.assertEqual(self.tv.targets, [15])
+
+    def test_volume_attribute_requires_its_own_timestamp_and_valid_value(self):
+        parse = load_definition(self.platform, "parse_volume_report")
+        stamp = "2026-11-03T23:26:24.609Z"
+        expected = datetime.fromisoformat("2026-11-03T23:26:24.609+00:00").timestamp()
+        for value in (0, 17, 100):
+            self.assertEqual(parse({"value": value, "timestamp": stamp}), (value, expected))
+        self.assertEqual(parse({"value": 10, "timestamp": "2026-11-03T17:26:24.609-06:00"}), (10, expected))
+        for report in (None, {}, {"value": 17}, {"value": 17, "timestamp": "garbage"},
+                       {"value": 17, "timestamp": "2026-11-03T23:26:24"},
+                       *({"value": v, "timestamp": stamp} for v in (-1, 101, "17", True, None))):
+            self.assertIsNone(parse(report))
 
     def test_invalid_and_expired_requests_do_not_change_the_tv(self):
         cases = [

@@ -232,7 +232,11 @@ Volume keys:
     the TV across its full 0-100 range. Every other output remains under macOS control.
     SmartThings TV-volume steps within 200 ms are combined into one target;
     volume-up and volume-down steps cancel each other within that buffer.
-    Cloud volume state is refreshed no more than once every 30 seconds.
+    Cloud volume status is read at most once every 30 seconds. Older or undated
+    cloud reports cannot roll back a local setting. The slider distinguishes the
+    last accepted target from a recent TV report. If neither is known, select
+    a level explicitly. After two minutes without a reliable baseline, volume
+    keys on the bound fixed-volume output send relative steps.
 
     Native audio keys can have only one exclusive owner. If BetterDisplay is
     installed, open BetterDisplay -> Settings -> Keyboard -> Native (Apple)

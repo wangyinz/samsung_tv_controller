@@ -774,13 +774,15 @@ class SmartThingsTVClientTests(unittest.TestCase):
     def test_volume_status_is_read_from_audio_volume_capability(self):
         status = {
             "components": {
-                "main": {"audioVolume": {"volume": {"value": 17}}}
+                "main": {"audioVolume": {"volume": {
+                    "value": 17, "timestamp": "2026-11-03T23:26:24.609Z"
+                }}}
             }
         }
         with mock.patch.object(
             self.client, "_run", return_value=json.dumps(status)
         ) as run:
-            self.assertEqual(self.client.get_volume(), 17)
+            self.assertEqual(self.client.get_volume(), (17, 1793748384.609))
 
         run.assert_called_once_with("devices:status", DEVICE_ID, "--json")
 

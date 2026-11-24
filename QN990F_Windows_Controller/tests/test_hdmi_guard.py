@@ -94,7 +94,7 @@ class HDMICommandGuardTests(unittest.TestCase):
         sent = []
         fake_tv = SimpleNamespace(send=lambda key: sent.append(("key", key)),
                                   set_volume=lambda value: sent.append(("volume", value)),
-                                  get_volume=lambda: 20)
+                                  get_volume=lambda: (20, controller.time.time()))
         fake_thread = SimpleNamespace(start=lambda: None, join=lambda timeout: None)
         with mock.patch.object(controller.threading, "Thread", return_value=fake_thread), \
              mock.patch.object(controller, "hdmi_target_connected", return_value=True):

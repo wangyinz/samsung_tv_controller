@@ -249,7 +249,8 @@ left blank.
   TV output uses its full range from 0 to 100.
 - SmartThings TV-volume steps received within 200 ms are combined locally. Up
   and down steps cancel each other, and one final target volume is sent.
-- Cloud volume state is refreshed no more than once every 30 seconds.
+- The controller reads cloud volume status at most once every 30 seconds; this
+  poll never sends a volume or device refresh command.
 - Direct LAN can send TV volume keys but cannot query the TV's current volume,
   so the safe TV-first decrease rule is available only in SmartThings mode.
 
@@ -298,7 +299,17 @@ below the keyboard-volume floor. It works even when keyboard volume integration
 is disabled or the computer is using another audio output; on macOS it does not
 need Input Monitoring. Drag to choose a value, then release to apply it. The menu
 shows the pending change or an error, and periodically updates the displayed TV
-volume. Exact values require SmartThings and the TV's `audioVolume` capability;
+volume. Some Samsung TVs accept volume commands without updating the public
+API's [volume attribute](https://community.smartthings.com/t/tv-volume-control/261456).
+Both controllers check the [attribute's own update time](https://developer.smartthings.com/docs/service-integrations/query-and-list-devices).
+A report must be newer than the session/connection and last command or report,
+and at most two minutes old. Duplicate, older, undated, or future reports cannot
+replace a slider setting. **Last set here** is the accepted target, not an
+independent TV reading. If there is no trustworthy value after a restart or
+reconnection, the slider shows an unknown level and can still set an exact target.
+After two minutes without a reliable baseline, media keys use a relative TV step
+where allowed; Windows leaves Volume Down to the system when it cannot verify
+the TV volume floor. Exact values require SmartThings and the TV's `audioVolume` capability;
 LAN mode displays an explanation in place of an active slider.
 
 ## Security and privacy
